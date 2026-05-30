@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# 설정 (실제 API 키 포함)
+config.yaml
+
+# 데이터 / 캐시
+data/
+*.pkl
+*.db
+
+# 문서
+*.xlsx
+*.xls
+
+# 시스템
+.DS_Store
+*.log
+.env

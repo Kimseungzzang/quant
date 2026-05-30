@@ -1,0 +1,40 @@
+mode: mock   # paper | live | mock
+
+kis:
+  app_key: "mock_app_key_1234567890"
+  app_secret: "mock_app_secret_abcdefghijklmnopqrstuvwxyz"
+  account_no: "12345678"
+  account_product_code: "01"
+  # mock 모드 전용 URL (로컬 서버)
+  rest_url: "http://localhost:8000"
+  ws_url: "ws://localhost:8000/ws"
+
+trading:
+  stop_loss_pct: 5.0
+  take_profit_pct: 5.0
+  max_positions: 3
+  position_size_pct: 20.0
+
+universe:
+  domestic:
+    markets: ["J"]
+    top_n: 6         # mock 종목 수만큼
+  overseas:
+    exchanges: ["NAS"]
+    top_n: 3
+
+backtest:
+  candle_minutes: 15
+  lookback_days: 5      # mock 테스트: 빠른 실행을 위해 5일로 단축
+
+schedule:
+  domestic_analysis_time: "08:00"
+  domestic_trading_end_time: "15:20"
+  us_analysis_time: "22:30"
+  us_trading_end_time: "05:00"
+  report_time: "16:00"
+  confirmation_timeout_sec: 30   # mock 테스트용: 30초 후 자동 취소
+
+logging:
+  level: "INFO"
+  file: "data/trading_mock.log"
