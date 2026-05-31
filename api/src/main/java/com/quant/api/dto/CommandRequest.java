@@ -7,6 +7,7 @@ import lombok.NoArgsConstructor;
 @NoArgsConstructor
 public class CommandRequest {
     private String market = "domestic";
+    private String mode;
     private String horizon = "swing";
     private Integer topN = 10;
     private Integer lookbackDays;    // 분석 백테스트 기간 (null이면 서버 기본값)

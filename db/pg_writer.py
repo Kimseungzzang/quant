@@ -173,9 +173,9 @@ class PGWriter:
                 """
                 INSERT INTO trades
                   (stock_code, stock_name, market, side, quantity,
-                   price, amount, commission, mode, strategy, reason,
+                   price, amount, currency, commission, mode, strategy, reason,
                    realized_pnl, pnl_pct, kis_order_no)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                 """,
                 trade["stock_code"],
                 trade.get("stock_name", trade["stock_code"]),
@@ -184,6 +184,7 @@ class PGWriter:
                 trade["quantity"],
                 trade["price"],
                 trade["quantity"] * trade["price"],
+                trade.get("currency", "KRW" if trade.get("market", "domestic") == "domestic" else "USD"),
                 trade.get("commission", 0),
                 trade.get("mode", "paper"),
                 trade.get("strategy"),
@@ -243,6 +244,10 @@ def _market_label(exchange: str) -> str:
     return "domestic" if exchange in ("KRX", "KOSPI", "KOSDAQ") else "overseas"
 
 
+def _currency(exchange: str) -> str:
+    return "KRW" if _market_label(exchange) == "domestic" else "USD"
+
+
 # ── 동기 버전 (OrderManager 등 sync 컨텍스트에서 사용) ─────────────────
 
 import psycopg2
@@ -263,6 +268,7 @@ class PGWriterSync:
     def save_buy(self, stock_code: str, stock_name: str, exchange: str,
                  qty: int, price: float, order_no: str = "", mode: str = "live"):
         market = _market_label(exchange)
+        currency = _currency(exchange)
         amount = qty * price
         try:
             conn = self._conn()
@@ -271,10 +277,10 @@ class PGWriterSync:
                     """
                     INSERT INTO trades
                       (stock_code, stock_name, market, side, quantity,
-                       price, amount, mode, kis_order_no)
-                    VALUES (%s,%s,%s,'BUY',%s,%s,%s,%s,%s)
+                       price, amount, currency, mode, kis_order_no)
+                    VALUES (%s,%s,%s,'BUY',%s,%s,%s,%s,%s,%s)
                     """,
-                    (stock_code, stock_name, market, qty, price, amount, mode, order_no or None),
+                    (stock_code, stock_name, market, qty, price, amount, currency, mode, order_no or None),
                 )
             # 포지션 upsert
             conn2 = self._conn()
@@ -282,14 +288,24 @@ class PGWriterSync:
                 cur.execute(
                     """
                     INSERT INTO positions
-                      (stock_code, stock_name, market, quantity, avg_price, mode)
-                    VALUES (%s,%s,%s,%s,%s,%s)
+                      (stock_code, stock_name, market, quantity, avg_price,
+                       current_price, unrealized_pnl, unrealized_pct, currency, mode)
+                    VALUES (%s,%s,%s,%s,%s,%s,0,0,%s,%s)
                     ON CONFLICT (stock_code, market, mode) DO UPDATE SET
-                      quantity  = EXCLUDED.quantity,
-                      avg_price = EXCLUDED.avg_price,
+                      avg_price      = CASE
+                        WHEN positions.quantity + EXCLUDED.quantity > 0 THEN
+                          ((positions.avg_price * positions.quantity)
+                            + (EXCLUDED.avg_price * EXCLUDED.quantity))
+                          / (positions.quantity + EXCLUDED.quantity)
+                        ELSE EXCLUDED.avg_price
+                      END,
+                      quantity       = positions.quantity + EXCLUDED.quantity,
+                      current_price  = EXCLUDED.current_price,
+                      unrealized_pnl = EXCLUDED.unrealized_pnl,
+                      unrealized_pct = EXCLUDED.unrealized_pct,
                       updated_at = NOW()
                     """,
-                    (stock_code, stock_name, market, qty, price, mode),
+                    (stock_code, stock_name, market, qty, price, price, currency, mode),
                 )
         except Exception as e:
             import logging
@@ -297,8 +313,10 @@ class PGWriterSync:
 
     def save_sell(self, stock_code: str, stock_name: str, exchange: str,
                   qty: int, entry_price: float, exit_price: float,
-                  pnl_pct: float, order_no: str = "", mode: str = "live"):
+                  pnl_pct: float, order_no: str = "", mode: str = "live",
+                  close_position: bool = True):
         market = _market_label(exchange)
+        currency = _currency(exchange)
         amount = qty * exit_price
         realized_pnl = qty * (exit_price - entry_price)
         try:
@@ -308,19 +326,29 @@ class PGWriterSync:
                     """
                     INSERT INTO trades
                       (stock_code, stock_name, market, side, quantity,
-                       price, amount, mode, realized_pnl, pnl_pct, kis_order_no)
-                    VALUES (%s,%s,%s,'SELL',%s,%s,%s,%s,%s,%s,%s)
+                       price, amount, currency, mode, realized_pnl, pnl_pct, kis_order_no)
+                    VALUES (%s,%s,%s,'SELL',%s,%s,%s,%s,%s,%s,%s,%s)
                     """,
                     (stock_code, stock_name, market, qty, exit_price, amount,
-                     mode, realized_pnl, pnl_pct, order_no or None),
+                     currency, mode, realized_pnl, pnl_pct, order_no or None),
                 )
-            # 포지션 제거
             conn2 = self._conn()
             with conn2, conn2.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM positions WHERE stock_code=%s AND market=%s AND mode=%s",
-                    (stock_code, market, mode),
-                )
+                if close_position:
+                    cur.execute(
+                        "DELETE FROM positions WHERE stock_code=%s AND market=%s AND mode=%s",
+                        (stock_code, market, mode),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE positions
+                           SET quantity = GREATEST(quantity - %s, 0),
+                               updated_at = NOW()
+                         WHERE stock_code=%s AND market=%s AND mode=%s
+                        """,
+                        (qty, stock_code, market, mode),
+                    )
         except Exception as e:
             import logging
             logging.getLogger(__name__).error("PGWriterSync.save_sell 실패: %s", e)

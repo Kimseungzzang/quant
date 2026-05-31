@@ -56,6 +56,7 @@ export interface Trade {
   quantity: number;
   price: number;
   amount: number;
+  currency: string;
   mode: string;
   strategy: string | null;
   realizedPnl: number | null;
@@ -69,6 +70,41 @@ export interface TradePage {
   number: number;
 }
 
+export interface Position {
+  id: number | string;
+  stockCode: string;
+  stockName: string;
+  market: string;
+  quantity: number;
+  avgPrice: number;
+  currency: string;
+  currentPrice: number;
+  marketValue: number;
+  unrealizedPnl: number | null;
+  unrealizedPct: number | null;
+  mode: string;
+  openedAt: string;
+  updatedAt: string;
+}
+
+export interface PendingOrder {
+  id: string;
+  orderNo: string;
+  side: "BUY" | "SELL";
+  stockCode: string;
+  stockName: string;
+  market: string;
+  quantity: number;
+  filledQuantity: number;
+  remainingQuantity: number;
+  requestedPrice: number;
+  currency: string;
+  mode: string;
+  strategy: string;
+  reason: string;
+  createdAt: string;
+}
+
 export interface PnlSummary {
   totalRealizedPnl: number;
   totalTrades: number;
@@ -77,11 +113,45 @@ export interface PnlSummary {
   avgPnlPerTrade: number;
 }
 
+export interface AccountBalance {
+  market: string;
+  mode: string;
+  currency: string;
+  cash: number;
+  totalAssets: number;
+  positionValue: number;
+  positionCount: number;
+  updatedAt: string;
+}
+
 export interface PnlChart {
   date: string;
   totalValue: number;
   cumulativePnl: number;
   dailyPnl: number;
+}
+
+export interface StockPerformance {
+  stockCode: string;
+  stockName: string;
+  tradePairs: number;
+  wins: number;
+  winRate: number;
+  totalPnl: number;
+  avgPnl: number;
+  maxPnl: number;
+  minPnl: number;
+}
+
+export interface DailyReport {
+  date: string;
+  tradePairs: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  totalPnl: number;
+  maxPnl: number;
+  minPnl: number;
 }
 
 export interface BacktestResult {
@@ -110,12 +180,21 @@ export const api = {
       get<AnalysisResult[]>(`/api/analysis/run/${runId}`),
   },
   trades: {
-    list: (mode = "paper", page = 0) =>
-      get<TradePage>(`/api/trades?mode=${mode}&page=${page}&size=20`),
+    list: (mode = "paper", page = 0, period = "all", stockCode = "") =>
+      get<TradePage>(
+        `/api/trades?mode=${mode}&page=${page}&size=20&period=${period}` +
+        `${stockCode ? `&stockCode=${encodeURIComponent(stockCode)}` : ""}`,
+      ),
     pnlSummary: (mode = "paper") =>
       get<PnlSummary>(`/api/trades/pnl/summary?mode=${mode}`),
     pnlChart: (mode = "paper", days = 30) =>
       get<PnlChart[]>(`/api/trades/pnl/chart?mode=${mode}&days=${days}`),
+    positions: (mode = "paper") =>
+      get<Position[]>(`/api/trades/positions?mode=${mode}`),
+    stockPerformance: (mode = "paper", period = "month") =>
+      get<StockPerformance[]>(`/api/trades/performance/stocks?mode=${mode}&period=${period}`),
+    dailyReports: (mode = "paper", period = "month") =>
+      get<DailyReport[]>(`/api/trades/reports/daily?mode=${mode}&period=${period}`),
   },
   backtest: {
     list: (market = "domestic", limit = 20) =>
@@ -124,9 +203,13 @@ export const api = {
   command: {
     analyze: (market = "domestic", horizon = "swing") =>
       post<{ run_id: number; status: string }>("/api/command/analyze", { market, horizon }),
-    tradeStart: (market = "domestic") =>
-      post("/api/command/trade/start", { market }),
+    tradeStart: (market = "domestic", mode?: string) =>
+      post("/api/command/trade/start", { market, mode }),
     tradeStop: () => post("/api/command/trade/stop"),
-    health: () => get<{ status: string; trading_active: boolean }>("/api/command/health"),
+    setMode: (mode: "paper" | "live") =>
+      post<{ status: string; mode: string }>("/api/command/mode", { mode }),
+    health: () => get<{ status: string; trading_active: boolean; mode?: string }>("/api/command/health"),
+    accountBalance: (market = "domestic", mode = "paper") =>
+      get<AccountBalance>(`/api/command/account/balance?market=${market}&mode=${mode}`),
   },
 };

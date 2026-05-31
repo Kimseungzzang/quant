@@ -109,6 +109,30 @@ def _next_order_no() -> str:
     return str(_order_counter)
 
 
+def _is_buy_tr(tr_id: str) -> bool:
+    return tr_id in ("TTTC0012U", "VTTC0012U", "TTTT1002U", "VTTT1002U")
+
+
+def _fill_tr_id(order: dict) -> str:
+    tr_id = order.get("tr_id", "")
+    if order.get("type") == "domestic":
+        return "H0STCNI9" if tr_id.startswith("V") else "H0STCNI0"
+    return "H0GSCNI9" if tr_id.startswith("V") else "H0GSCNI0"
+
+
+def _order_fill_price(order: dict) -> str:
+    raw = str(order.get("price") or "0")
+    try:
+        price = float(raw)
+    except ValueError:
+        price = 0.0
+    if price <= 0:
+        price = _latest_price(order.get("code", ""))
+    if order.get("type") == "domestic":
+        return str(int(price))
+    return f"{price:.2f}"
+
+
 # ── 공통 응답 헬퍼 ────────────────────────────────────────────────────
 
 def _ok(output=None, **kwargs) -> dict:
@@ -283,7 +307,7 @@ async def domestic_order(req: web.Request) -> web.Response:
     body = await req.json()
     order_no = _next_order_no()
     now = datetime.now()
-    _orders.append({
+    order = {
         "type": "domestic",
         "tr_id": req.headers.get("tr_id", ""),
         "code": body.get("PDNO"),
@@ -291,7 +315,9 @@ async def domestic_order(req: web.Request) -> web.Response:
         "price": body.get("ORD_UNPR"),
         "order_no": order_no,
         "time": now.strftime("%H%M%S"),
-    })
+    }
+    _orders.append(order)
+    asyncio.create_task(_broadcast_fill_notice(order))
     logger.info("주문 접수: %s %s주 @ %s (번호:%s)",
                 body.get("PDNO"), body.get("ORD_QTY"), body.get("ORD_UNPR"), order_no)
     return _json(_ok(output={
@@ -382,15 +408,18 @@ async def overseas_order(req: web.Request) -> web.Response:
     body = await req.json()
     order_no = _next_order_no()
     now = datetime.now()
-    _orders.append({
+    order = {
         "type": "overseas",
         "tr_id": req.headers.get("tr_id", ""),
         "code": body.get("PDNO"),
         "qty":  body.get("ORD_QTY"),
         "price": body.get("OVRS_ORD_UNPR"),
+        "exchange": body.get("OVRS_EXCG_CD"),
         "order_no": order_no,
         "time": now.strftime("%H%M%S"),
-    })
+    }
+    _orders.append(order)
+    asyncio.create_task(_broadcast_fill_notice(order))
     logger.info("해외 주문: %s %s주 @ %s (번호:%s)",
                 body.get("PDNO"), body.get("ORD_QTY"), body.get("OVRS_ORD_UNPR"), order_no)
     return _json(_ok(output={"ODNO": order_no, "ORD_TMD": now.strftime("%H%M%S")}))
@@ -410,6 +439,7 @@ async def overseas_balance(req: web.Request) -> web.Response:
 
 # 구독 정보: ws_id → [(tr_id, stock_code)]
 _ws_subscriptions: dict[int, list[tuple[str, str]]] = {}
+_ws_clients: dict[int, web.WebSocketResponse] = {}
 _ws_id_counter = 0
 
 
@@ -421,6 +451,7 @@ async def websocket_handler(req: web.Request) -> web.WebSocketResponse:
     ws_id = _ws_id_counter
     _ws_id_counter += 1
     _ws_subscriptions[ws_id] = []
+    _ws_clients[ws_id] = ws
     logger.info("WebSocket 연결 [%d]", ws_id)
 
     # 실시간 가격 전송 태스크
@@ -435,6 +466,7 @@ async def websocket_handler(req: web.Request) -> web.WebSocketResponse:
     finally:
         price_task.cancel()
         _ws_subscriptions.pop(ws_id, None)
+        _ws_clients.pop(ws_id, None)
         logger.info("WebSocket 종료 [%d]", ws_id)
 
     return ws
@@ -509,14 +541,15 @@ async def _price_sender(ws: web.WebSocketResponse, ws_id: int):
         sim_minute += 1
 
         for tr_id, code in list(_ws_subscriptions.get(ws_id, [])):
-            price_base = _latest_price(code)
+            symbol = _handler_symbol(tr_id, code)
+            price_base = _latest_price(symbol)
             if price_base <= 0:
                 continue
 
-            count = tick_count.get(code, 0)
-            tick_count[code] = count + 1
+            count = tick_count.get(symbol, 0)
+            tick_count[symbol] = count + 1
 
-            prev_price = price_state.get(code, price_base)
+            prev_price = price_state.get(symbol, price_base)
 
             # 처음 20틱: 완만한 상승 (진입 조건 형성)
             # 20~50틱: 강한 상승 (돌파/눌림 진입 유도)
@@ -533,12 +566,12 @@ async def _price_sender(ws: web.WebSocketResponse, ws_id: int):
 
             price = prev_price * (1 + drift)
             price = max(price, price_base * 0.88)
-            price_state[code] = price
+            price_state[symbol] = price
 
             if tr_id == "H0STCNT0":
-                fields = _make_domestic_tick(code, price, price_base, sim_dt)
+                fields = _make_domestic_tick(symbol, price, price_base, sim_dt)
             elif tr_id == "HDFSCNT0":
-                fields = _make_overseas_tick(code, price, price_base, sim_dt)
+                fields = _make_overseas_tick(symbol, price, price_base, sim_dt)
             else:
                 continue
 
@@ -555,6 +588,105 @@ async def _price_sender(ws: web.WebSocketResponse, ws_id: int):
             except Exception:
                 return
 
+
+def _handler_symbol(tr_id: str, tr_key: str) -> str:
+    if tr_id == "HDFSCNT0" and len(tr_key) > 4 and tr_key[0] in ("D", "R"):
+        return tr_key[4:]
+    return tr_key
+
+
+async def _broadcast_fill_notice(order: dict):
+    await asyncio.sleep(0.1)
+    tr_id = _fill_tr_id(order)
+    payload = (
+        _make_domestic_fill(order)
+        if order.get("type") == "domestic"
+        else _make_overseas_fill(order)
+    )
+    data_msg = f"0|{tr_id}|1|{payload}"
+
+    for ws_id, ws in list(_ws_clients.items()):
+        if ws.closed:
+            continue
+        subscribed = any(t == tr_id for t, _ in _ws_subscriptions.get(ws_id, []))
+        if not subscribed:
+            continue
+        try:
+            await ws.send_str(data_msg)
+            logger.info("체결통보 전송 [%d]: %s %s %s주 @ %s",
+                        ws_id, tr_id, order.get("code"), order.get("qty"), _order_fill_price(order))
+        except Exception:
+            logger.exception("체결통보 전송 실패 [%d]", ws_id)
+
+
+def _make_domestic_fill(order: dict) -> str:
+    side_code = "02" if _is_buy_tr(order.get("tr_id", "")) else "01"
+    code = order.get("code", "")
+    name = next((s["name"] for s in DOMESTIC_STOCKS if s["code"] == code), code)
+    fields = [
+        "mockuser",                 # 0 CUST_ID
+        "1234567801",              # 1 ACNT_NO
+        order.get("order_no", ""), # 2 ODER_NO
+        "",                        # 3 OODER_NO
+        side_code,                 # 4 SELN_BYOV_CLS
+        "00",                      # 5 RCTF_CLS
+        "01",                      # 6 ODER_KIND
+        "",                        # 7 ODER_COND
+        code,                      # 8 STCK_SHRN_ISCD
+        str(order.get("qty") or "0"),       # 9 CNTG_QTY
+        _order_fill_price(order),           # 10 CNTG_UNPR
+        order.get("time", datetime.now().strftime("%H%M%S")),  # 11 STCK_CNTG_HOUR
+        "N",                       # 12 RFUS_YN
+        "2",                       # 13 CNTG_YN
+        "Y",                       # 14 ACPT_YN
+        "06010",                   # 15 BRNC_NO
+        str(order.get("qty") or "0"),       # 16 ODER_QTY
+        "mock",                    # 17 ACNT_NAME
+        "",                        # 18 ORD_COND_PRC
+        "KRX",                     # 19 ORD_EXG_GB
+        "N",                       # 20 POPUP_YN
+        "",                        # 21 FILLER
+        "",                        # 22 CRDT_CLS
+        "",                        # 23 CRDT_LOAN_DATE
+        name,                      # 24 CNTG_ISNM40
+        _order_fill_price(order),  # 25 ODER_PRC
+    ]
+    return "^".join(fields)
+
+
+def _make_overseas_fill(order: dict) -> str:
+    side_code = "02" if _is_buy_tr(order.get("tr_id", "")) else "01"
+    code = order.get("code", "")
+    name = next((s["name"] for s in OVERSEAS_STOCKS if s["code"] == code), code)
+    fill_price = _order_fill_price(order)
+    fields = [
+        "mockuser",                 # 0 CUST_ID
+        "1234567801",              # 1 ACNT_NO
+        order.get("order_no", ""), # 2 ODER_NO
+        "",                        # 3 OODER_NO
+        side_code,                 # 4 SELN_BYOV_CLS
+        "00",                      # 5 RCTF_CLS
+        "01",                      # 6 ODER_KIND2
+        code,                      # 7 STCK_SHRN_ISCD
+        str(order.get("qty") or "0"),       # 8 CNTG_QTY
+        fill_price,                # 9 CNTG_UNPR
+        order.get("time", datetime.now().strftime("%H%M%S")),  # 10 STCK_CNTG_HOUR
+        "N",                       # 11 RFUS_YN
+        "2",                       # 12 CNTG_YN
+        "Y",                       # 13 ACPT_YN
+        "06010",                   # 14 BRNC_NO
+        "",                        # 15 filler
+        str(order.get("qty") or "0"),       # 16 ODER_QTY
+        name,                      # 17 CNTG_ISNM
+        "",                        # 18 ODER_COND
+        "",                        # 19 DEBT_GB
+        "",                        # 20 DEBT_DATE
+        "",                        # 21 START_TM
+        "",                        # 22 END_TM
+        "",                        # 23 TM_DIV_TP
+        fill_price,                # 24 CNTG_UNPR12
+    ]
+    return "^".join(fields)
 
 def _make_domestic_tick(code: str, price: float, base: float, now: datetime) -> list[str]:
     change = int(price - base)

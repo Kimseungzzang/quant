@@ -219,14 +219,76 @@ def test_websocket():
     logger.info("  → WebSocket 전체 통과\n")
 
 
-# ── 테스트 4: 매매 루프 E2E (실제 주문 발생 확인) ─────────────────────
+# ── 테스트 4: WebSocket 체결통보 수신 ─────────────────────────────────
+
+async def _ws_fill_notice_test():
+    approval = _post("/oauth2/Approval", {}).get("approval_key", "mock_key")
+
+    async with websockets.connect(MOCK_WS, ping_interval=None) as ws:
+        msg = {
+            "header": {
+                "approval_key": approval,
+                "custtype": "P",
+                "tr_type": "1",
+                "content-type": "utf-8",
+            },
+            "body": {"input": {"tr_id": "H0STCNI9", "tr_key": "mock_hts"}},
+        }
+        await ws.send(json.dumps(msg))
+
+        # 구독 성공 응답 소비
+        await asyncio.wait_for(ws.recv(), timeout=2)
+
+        d = _post(
+            "/uapi/domestic-stock/v1/trading/order-cash",
+            {"PDNO": "005930", "ORD_QTY": "3", "ORD_UNPR": "0", "ORD_DVSN": "01",
+             "CANO": "12345678", "ACNT_PRDT_CD": "01"},
+            headers={"tr_id": "VTTC0012U"},
+        )
+        order_no = d["output"]["ODNO"]
+
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            raw = await asyncio.wait_for(ws.recv(), timeout=1)
+            if not raw or raw[0] not in ("0", "1"):
+                continue
+            parts = raw.split("|", 3)
+            if len(parts) < 4 or parts[1] != "H0STCNI9":
+                continue
+            fields = parts[3].split("^")
+            return {
+                "order_no": fields[2],
+                "stock_code": fields[8],
+                "filled_qty": fields[9],
+                "filled_price": fields[10],
+                "filled": fields[13],
+                "expected_order_no": order_no,
+            }
+    return {}
+
+
+def test_fill_notice_websocket():
+    logger.info("=== TEST 4: WebSocket 체결통보 수신 ===")
+    fill = asyncio.run(_ws_fill_notice_test())
+    assert fill, "체결통보 수신 없음"
+    assert fill["order_no"] == fill["expected_order_no"], f"주문번호 불일치: {fill}"
+    assert fill["stock_code"] == "005930", f"종목코드 불일치: {fill}"
+    assert fill["filled_qty"] == "3", f"체결수량 불일치: {fill}"
+    assert fill["filled"] == "2", f"CNTG_YN 체결값 아님: {fill}"
+    assert float(fill["filled_price"]) > 0, f"체결가 오류: {fill}"
+    logger.info("  ✅ 체결통보 OK (주문번호=%s, 수량=%s, 가격=%s)",
+                fill["order_no"], fill["filled_qty"], fill["filled_price"])
+    logger.info("  → WebSocket 체결통보 통과\n")
+
+
+# ── 테스트 5: 매매 루프 E2E (실제 주문 발생 확인) ─────────────────────
 
 def test_trading_loop_e2e():
     """
     main.py --mode trade를 실행해 실제 주문이 mock 서버에 도달하는지 확인.
     시뮬레이션 클록(200ms/분)으로 breakout 신호 발생 기대.
     """
-    logger.info("=== TEST 4: 매매 루프 E2E ===")
+    logger.info("=== TEST 5: 매매 루프 E2E ===")
 
     orders_before = _get("/test/orders")["count"]
 
@@ -269,15 +331,12 @@ def test_trading_loop_e2e():
     orders_after = _get("/test/orders")["count"]
     new_orders = orders_after - orders_before
 
-    if new_orders > 0:
-        orders = _get("/test/orders")["orders"]
-        recent = orders[-new_orders:]
-        logger.info("  ✅ 주문 %d건 발생:", new_orders)
-        for o in recent:
-            logger.info("    - %s %s주 @ %s (%s)", o["code"], o["qty"], o["price"], o["tr_id"])
-    else:
-        logger.warning("  ⚠️  주문 0건 — 전략 진입 조건 미충족 (더 긴 실행 시간 필요)")
-        logger.warning("     (breakout: resistance 돌파 + 거래량 필요 / pullback: EMA20 필요)")
+    assert new_orders > 0, "주문 0건 — mock 장세/가격 패턴이 전략 진입 조건을 만들지 못함"
+    orders = _get("/test/orders")["orders"]
+    recent = orders[-new_orders:]
+    logger.info("  ✅ 주문 %d건 발생:", new_orders)
+    for o in recent:
+        logger.info("    - %s %s주 @ %s (%s)", o["code"], o["qty"], o["price"], o["tr_id"])
 
     # 최소한 WebSocket 연결 + 틱 수신은 확인
     assert "WebSocket 연결됨" in output or "모니터링 시작" in output, \
@@ -305,6 +364,7 @@ def main():
         ("REST endpoints",    test_rest_endpoints),
         ("주문 REST",         test_order_rest),
         ("WebSocket 틱 수신", test_websocket),
+        ("WebSocket 체결통보", test_fill_notice_websocket),
         ("매매 루프 E2E",     test_trading_loop_e2e),
     ]
 

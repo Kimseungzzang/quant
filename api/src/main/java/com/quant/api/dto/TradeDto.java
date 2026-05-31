@@ -20,6 +20,7 @@ public class TradeDto {
     private Integer quantity;
     private BigDecimal price;
     private BigDecimal amount;
+    private String currency;
     private String mode;
     private String strategy;
     private BigDecimal realizedPnl;
@@ -36,6 +37,7 @@ public class TradeDto {
             .quantity(t.getQuantity())
             .price(t.getPrice())
             .amount(t.getAmount())
+            .currency(t.getCurrency())
             .mode(t.getMode())
             .strategy(t.getStrategy())
             .realizedPnl(t.getRealizedPnl())

@@ -150,6 +150,10 @@ class WebSocketTRID(StrEnum):
     DOMESTIC_PRICE  = "H0STCNT0"   # 국내주식 실시간체결가 (KRX)
     DOMESTIC_ASKBID = "H0STASP0"   # 국내주식 실시간호가
     OVERSEAS_PRICE  = "HDFSCNT0"   # 해외주식 실시간지연체결가
+    DOMESTIC_FILL_LIVE  = "H0STCNI0"   # 국내주식 실시간 체결통보
+    DOMESTIC_FILL_PAPER = "H0STCNI9"   # 국내주식 모의 실시간 체결통보
+    OVERSEAS_FILL_LIVE  = "H0GSCNI0"   # 해외주식 실시간 체결통보
+    OVERSEAS_FILL_PAPER = "H0GSCNI9"   # 해외주식 모의 실시간 체결통보
 
 
 # ── API 경로 (KIS 스펙 고정) ──────────────────────────────────────────

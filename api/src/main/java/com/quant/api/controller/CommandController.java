@@ -35,9 +35,32 @@ public class CommandController {
         return pythonEngineClient.stopTrading();
     }
 
+    @PostMapping("/mode")
+    public Map<?, ?> setMode(@RequestBody CommandRequest req) {
+        return pythonEngineClient.setMode(req);
+    }
+
     @GetMapping("/health")
     public Map<?, ?> engineHealth() {
         return pythonEngineClient.health();
+    }
+
+    @GetMapping("/account/balance")
+    public Map<?, ?> accountBalance(
+        @RequestParam(defaultValue = "domestic") String market,
+        @RequestParam(defaultValue = "paper") String mode
+    ) {
+        return pythonEngineClient.getAccountBalance(market, mode);
+    }
+
+    @GetMapping("/trade/positions/live")
+    public Object livePositions(@RequestParam(defaultValue = "paper") String mode) {
+        return pythonEngineClient.getLivePositions(mode);
+    }
+
+    @GetMapping("/trade/orders/pending")
+    public Object pendingOrders(@RequestParam(defaultValue = "paper") String mode) {
+        return pythonEngineClient.getPendingOrders(mode);
     }
 
     @GetMapping("/analyze/{runId}/progress")

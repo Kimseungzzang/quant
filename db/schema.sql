@@ -81,8 +81,9 @@ CREATE TABLE trades (
     quantity        INT          NOT NULL,
     price           NUMERIC(18,4) NOT NULL,
     amount          NUMERIC(18,4) NOT NULL,  -- quantity * price
+    currency        VARCHAR(3)    NOT NULL DEFAULT 'KRW',
     commission      NUMERIC(18,4) DEFAULT 0,
-    mode            VARCHAR(10)  NOT NULL DEFAULT 'paper' CHECK (mode IN ('paper', 'live')),
+    mode            VARCHAR(10)  NOT NULL DEFAULT 'paper' CHECK (mode IN ('paper', 'live', 'mock')),
     strategy        VARCHAR(50),
     reason          TEXT,
     -- SELL 시 손익 (매수 평균가 기준)
@@ -107,6 +108,7 @@ CREATE TABLE positions (
     market          VARCHAR(10)  NOT NULL CHECK (market IN ('domestic', 'overseas')),
     quantity        INT          NOT NULL DEFAULT 0,
     avg_price       NUMERIC(18,4) NOT NULL,
+    currency        VARCHAR(3)    NOT NULL DEFAULT 'KRW',
     current_price   NUMERIC(18,4),
     unrealized_pnl  NUMERIC(18,4),
     unrealized_pct  NUMERIC(8,4),

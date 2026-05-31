@@ -96,8 +96,9 @@ class OverseasAPI:
         exchange: ExchangeCode,
         qty: int,
         price: float,
-        order_type: OrderDivision = OrderDivision.LIMIT,
+        order_type: OrderDivision = OrderDivision.MARKET,
     ) -> dict:
+        order_price = 0 if order_type == OrderDivision.MARKET else price
         tr_id = OverseasTRID.BUY_PAPER if self.is_paper else OverseasTRID.BUY_LIVE
         body = {
             "CANO":            self.account_no,
@@ -106,7 +107,7 @@ class OverseasAPI:
             "PDNO":            stock_code,
             "ORD_DVSN":        order_type,
             "ORD_QTY":         str(qty),
-            "OVRS_ORD_UNPR":   str(price),
+            "OVRS_ORD_UNPR":   str(order_price),
             "ORD_SVR_DVSN_CD": "0",
         }
         data = self.client.post(OverseasPath.ORDER, tr_id, body)
@@ -119,8 +120,9 @@ class OverseasAPI:
         exchange: ExchangeCode,
         qty: int,
         price: float,
-        order_type: OrderDivision = OrderDivision.LIMIT,
+        order_type: OrderDivision = OrderDivision.MARKET,
     ) -> dict:
+        order_price = 0 if order_type == OrderDivision.MARKET else price
         tr_id = OverseasTRID.SELL_PAPER if self.is_paper else OverseasTRID.SELL_LIVE
         body = {
             "CANO":            self.account_no,
@@ -129,7 +131,7 @@ class OverseasAPI:
             "PDNO":            stock_code,
             "ORD_DVSN":        order_type,
             "ORD_QTY":         str(qty),
-            "OVRS_ORD_UNPR":   str(price),
+            "OVRS_ORD_UNPR":   str(order_price),
             "ORD_SVR_DVSN_CD": "0",
             "SLL_TYPE":        "00",
         }

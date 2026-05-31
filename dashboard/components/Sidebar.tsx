@@ -2,12 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { BarChart2, TrendingUp, History, FlaskConical, LayoutDashboard } from "lucide-react";
+import { TrendingUp, History, FlaskConical, LayoutDashboard, BriefcaseBusiness, FileText } from "lucide-react";
 
 const nav = [
   { href: "/",          label: "대시보드",   icon: LayoutDashboard },
   { href: "/analysis",  label: "추천 종목",  icon: TrendingUp },
+  { href: "/positions", label: "포지션",     icon: BriefcaseBusiness },
   { href: "/trades",    label: "매매 이력",  icon: History },
+  { href: "/report",    label: "리포트",     icon: FileText },
   { href: "/backtest",  label: "백테스트",   icon: FlaskConical },
 ];
 

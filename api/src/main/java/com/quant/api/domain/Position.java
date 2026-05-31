@@ -6,19 +6,16 @@ import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
-import java.util.UUID;
 
 @Entity
-@Table(name = "trades")
+@Table(name = "positions")
 @Getter
 @NoArgsConstructor
-public class Trade {
+public class Position {
 
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
-
-    private OffsetDateTime tradedAt;
 
     @Column(nullable = false, length = 20)
     private String stockCode;
@@ -29,36 +26,27 @@ public class Trade {
     @Column(nullable = false, length = 10)
     private String market;
 
-    @Column(nullable = false, length = 4)
-    private String side;          // BUY | SELL
-
     @Column(nullable = false)
     private Integer quantity;
 
     @Column(nullable = false, precision = 18, scale = 4)
-    private BigDecimal price;
-
-    @Column(nullable = false, precision = 18, scale = 4)
-    private BigDecimal amount;
+    private BigDecimal avgPrice;
 
     @Column(nullable = false, length = 3)
     private String currency;
 
     @Column(precision = 18, scale = 4)
-    private BigDecimal commission;
-
-    @Column(nullable = false, length = 10)
-    private String mode;          // paper | live
-
-    private String strategy;
-    private String reason;
+    private BigDecimal currentPrice;
 
     @Column(precision = 18, scale = 4)
-    private BigDecimal realizedPnl;
+    private BigDecimal unrealizedPnl;
 
     @Column(precision = 8, scale = 4)
-    private BigDecimal pnlPct;
+    private BigDecimal unrealizedPct;
 
-    private UUID orderGroupId;
-    private String kisOrderNo;
+    @Column(nullable = false, length = 10)
+    private String mode;
+
+    private OffsetDateTime openedAt;
+    private OffsetDateTime updatedAt;
 }

@@ -68,10 +68,19 @@ public class PythonEngineClient {
     }
 
     public Map<?, ?> startTrading(CommandRequest req) {
-        log.info("Python /trade/start 호출: market={}", req.getMarket());
-        Map<String, Object> body = Map.of("market", req.getMarket());
-        ResponseEntity<Map> resp = restTemplate.postForEntity(baseUrl + "/trade/start", body, Map.class);
-        return resp.getBody();
+        log.info("Python /trade/start 호출: market={} mode={}", req.getMarket(), req.getMode());
+        var body = new java.util.HashMap<String, Object>();
+        body.put("market", req.getMarket());
+        if (req.getMode() != null) {
+            body.put("mode", req.getMode());
+        }
+        try {
+            ResponseEntity<Map> resp = restTemplate.postForEntity(baseUrl + "/trade/start", body, Map.class);
+            return resp.getBody();
+        } catch (org.springframework.web.client.HttpClientErrorException e) {
+            String detail = extractDetail(e.getResponseBodyAsString());
+            throw new org.springframework.web.server.ResponseStatusException(e.getStatusCode(), detail);
+        }
     }
 
     public Map<?, ?> stopTrading() {
@@ -80,8 +89,38 @@ public class PythonEngineClient {
         return resp.getBody();
     }
 
+    public Map<?, ?> setMode(CommandRequest req) {
+        log.info("Python /mode 호출: mode={}", req.getMode());
+        Map<String, Object> body = Map.of("mode", req.getMode());
+        try {
+            ResponseEntity<Map> resp = restTemplate.postForEntity(baseUrl + "/mode", body, Map.class);
+            return resp.getBody();
+        } catch (org.springframework.web.client.HttpClientErrorException e) {
+            String detail = extractDetail(e.getResponseBodyAsString());
+            throw new org.springframework.web.server.ResponseStatusException(e.getStatusCode(), detail);
+        }
+    }
+
     public Map<?, ?> health() {
         ResponseEntity<Map> resp = restTemplate.getForEntity(baseUrl + "/health", Map.class);
+        return resp.getBody();
+    }
+
+    public Map<?, ?> getAccountBalance(String market, String mode) {
+        ResponseEntity<Map> resp = restTemplate.getForEntity(
+            baseUrl + "/account/balance?market=" + market + "&mode=" + mode, Map.class);
+        return resp.getBody();
+    }
+
+    public Object getLivePositions(String mode) {
+        ResponseEntity<Object> resp = restTemplate.getForEntity(
+            baseUrl + "/trade/positions/live?mode=" + mode, Object.class);
+        return resp.getBody();
+    }
+
+    public Object getPendingOrders(String mode) {
+        ResponseEntity<Object> resp = restTemplate.getForEntity(
+            baseUrl + "/trade/orders/pending?mode=" + mode, Object.class);
         return resp.getBody();
     }
 

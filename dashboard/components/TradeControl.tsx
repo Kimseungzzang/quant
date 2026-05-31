@@ -8,18 +8,27 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 interface EngineStatus {
   status: string;
   trading_active: boolean;
+  mode?: string;
 }
 
-export default function TradeControl() {
+interface TradeControlProps {
+  mode: "paper" | "live";
+}
+
+export default function TradeControl({ mode }: TradeControlProps) {
   const [engine, setEngine]   = useState<EngineStatus | null>(null);
   const [market, setMarket]   = useState<"domestic" | "overseas">("domestic");
   const [loading, setLoading] = useState(false);
   const [msg, setMsg]         = useState<string | null>(null);
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
 
   const fetchStatus = useCallback(async () => {
     try {
       const res = await fetch(`${API}/api/command/health`, { cache: "no-store" });
-      if (res.ok) setEngine(await res.json());
+      if (res.ok) {
+        setEngine(await res.json());
+        setUpdatedAt(new Date());
+      }
     } catch {
       setEngine(null);
     }
@@ -27,7 +36,7 @@ export default function TradeControl() {
 
   useEffect(() => {
     fetchStatus();
-    const id = setInterval(fetchStatus, 5000);
+    const id = setInterval(fetchStatus, 2000);
     return () => clearInterval(id);
   }, [fetchStatus]);
 
@@ -38,11 +47,11 @@ export default function TradeControl() {
       const res = await fetch(`${API}/api/command/trade/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ market }),
+        body: JSON.stringify({ market, mode }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        setMsg(err.detail ?? "시작 실패");
+        setMsg(err.detail ?? err.message ?? "시작 실패");
       } else {
         setMsg("매매 시작됨");
         fetchStatus();
@@ -61,7 +70,7 @@ export default function TradeControl() {
       const res = await fetch(`${API}/api/command/trade/stop`, { method: "POST" });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        setMsg(err.detail ?? "중단 실패");
+        setMsg(err.detail ?? err.message ?? "중단 실패");
       } else {
         setMsg("매매 중단 중...");
         fetchStatus();
@@ -73,8 +82,33 @@ export default function TradeControl() {
     }
   }
 
+  async function handleModeSwitch() {
+    setLoading(true);
+    setMsg(null);
+    try {
+      const res = await fetch(`${API}/api/command/mode`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setMsg(err.detail ?? err.message ?? "전환 실패");
+      } else {
+        setMsg(`엔진을 ${mode === "paper" ? "모의" : "실전"} 모드로 전환했습니다.`);
+        fetchStatus();
+      }
+    } catch {
+      setMsg("서버 연결 실패");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   const active = engine?.trading_active ?? false;
   const online = engine?.status === "ok";
+  const modeMatched = !engine?.mode || engine.mode === mode;
+  const canStart = online && modeMatched;
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-4">
@@ -88,6 +122,11 @@ export default function TradeControl() {
         </div>
       </div>
 
+      <div className="flex items-center justify-between text-xs text-gray-500">
+        <span>상태 2초 갱신</span>
+        <span>{updatedAt ? updatedAt.toLocaleTimeString("ko-KR") : "확인 중"}</span>
+      </div>
+
       {/* 상태 배지 */}
       <div className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium ${
         active
@@ -96,6 +135,15 @@ export default function TradeControl() {
       }`}>
         <Activity size={14} className={active ? "animate-pulse" : ""} />
         {active ? "매매 실행 중" : "대기 중"}
+      </div>
+
+      <div className={`flex items-center justify-between px-3 py-2 rounded-lg border text-xs ${
+        modeMatched
+          ? "bg-gray-800/60 border-gray-700 text-gray-400"
+          : "bg-red-950/40 border-red-900 text-red-300"
+      }`}>
+        <span>화면 {mode === "paper" ? "모의" : "실전"}</span>
+        <span>엔진 {engine?.mode === "paper" ? "모의" : engine?.mode === "live" ? "실전" : "확인 중"}</span>
       </div>
 
       {/* 시장 선택 */}
@@ -122,7 +170,7 @@ export default function TradeControl() {
         {!active ? (
           <button
             onClick={handleStart}
-            disabled={loading || !online}
+            disabled={loading || !canStart}
             className="flex-1 flex items-center justify-center gap-2 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 text-white text-sm py-2 rounded-lg transition-colors"
           >
             {loading ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
@@ -142,6 +190,24 @@ export default function TradeControl() {
 
       {msg && (
         <p className="text-xs text-gray-400 text-center">{msg}</p>
+      )}
+      {!active && online && !modeMatched && (
+        <div className="space-y-2">
+          <p className="text-xs text-red-300 text-center">
+            엔진 모드와 화면 모드가 달라 시작할 수 없습니다.
+          </p>
+          <button
+            onClick={handleModeSwitch}
+            disabled={loading}
+            className={`w-full text-xs py-2 rounded-lg border transition-colors disabled:opacity-40 ${
+              mode === "live"
+                ? "border-red-800 text-red-200 bg-red-950/40 hover:bg-red-900/40"
+                : "border-indigo-800 text-indigo-200 bg-indigo-950/40 hover:bg-indigo-900/40"
+            }`}
+          >
+            엔진을 {mode === "paper" ? "모의" : "실전"} 모드로 전환
+          </button>
+        </div>
       )}
     </div>
   );

@@ -479,7 +479,7 @@ class Screener:
                 logger.info("[%s] ④ 뉴스 | 기사=%d개 | 감성=%+.2f", code, len(articles), sentiment)
 
                 # ⑤ 최종
-                trading_value = _resolve_trading_value(item, price)
+                trading_value = _resolve_trading_value(item, price) * 1300
                 cand = Candidate(
                     code, name, exchange, price, change, bt, sentiment,
                     trading_value=trading_value, horizon=horizon

@@ -37,18 +37,36 @@ class KISWebSocket:
 
         # tr_id → {columns, encrypt, key, iv}
         self._data_map: dict[str, dict] = {}
-        # "{tr_id}:{stock_code}" → Callable
+        # "{tr_id}:{stock_code}" 또는 "{tr_id}:*" → Callable
         self._handlers: dict[str, Callable] = {}
         # 구독 목록: [(tr_id, stock_code)]
         self._subscriptions: list[tuple[str, str]] = []
 
     def subscribe(self, tr_id: WebSocketTRID | str, stock_code: str, handler: Callable):
         """실시간 데이터 구독 등록. handler(tr_id, fields: list[str])"""
-        key = f"{tr_id}:{stock_code}"
+        handler_code = self._handler_code(tr_id, stock_code)
+        key = f"{tr_id}:{handler_code}"
         if key not in self._handlers:
             self._subscriptions.append((tr_id, stock_code))
         self._handlers[key] = handler
         self._data_map.setdefault(tr_id, {"columns": [], "encrypt": "N", "key": None, "iv": None, "field_count": None})
+
+    def subscribe_global(self, tr_id: WebSocketTRID | str, tr_key: str, handler: Callable):
+        """종목코드가 첫 필드가 아닌 계좌 단위 통보 구독."""
+        key = f"{tr_id}:*"
+        if key not in self._handlers:
+            self._subscriptions.append((tr_id, tr_key))
+        self._handlers[key] = handler
+        self._data_map.setdefault(tr_id, {"columns": [], "encrypt": "N", "key": None, "iv": None, "field_count": None})
+
+    @staticmethod
+    def _handler_code(tr_id: WebSocketTRID | str, stock_code: str) -> str:
+        # 해외 실시간 구독키는 D/R + 거래소 3자리 + 심볼(DNASAAPL) 형식이고,
+        # 수신 payload의 첫 필드는 심볼(AAPL)이다.
+        if str(tr_id) == str(WebSocketTRID.OVERSEAS_PRICE):
+            if len(stock_code) > 4 and stock_code[0] in ("D", "R"):
+                return stock_code[4:]
+        return stock_code
 
     def unsubscribe(self, tr_id: WebSocketTRID | str, stock_code: str):
         self._subscriptions = [
@@ -134,6 +152,8 @@ class KISWebSocket:
                     continue
                 stock_code = fields[0]
                 handler = self._handlers.get(f"{tr_id}:{stock_code}")
+                if handler is None:
+                    handler = self._handlers.get(f"{tr_id}:*")
                 if handler:
                     handler(tr_id, fields)
         else:
@@ -228,4 +248,54 @@ def parse_overseas_price(fields: list[str]) -> dict:
         "change_pct": get(6),
         "vol":        get(7),
         "acml_val":   get(8),
+    }
+
+
+def parse_domestic_fill_notice(fields: list[str]) -> dict:
+    """H0STCNI0/H0STCNI9 국내주식 체결통보 파싱."""
+    get = lambda i, d="": fields[i] if len(fields) > i else d
+    return {
+        "cust_id": get(0),
+        "account_no": get(1),
+        "order_no": get(2),
+        "original_order_no": get(3),
+        "side_code": get(4),
+        "receipt_code": get(5),
+        "order_kind": get(6),
+        "order_condition": get(7),
+        "stock_code": get(8),
+        "filled_qty": get(9),
+        "filled_price": get(10),
+        "filled_time": get(11),
+        "rejected": get(12),
+        "filled": get(13),  # 2=체결, 1=접수/정정/취소/거부 접수
+        "accepted": get(14),
+        "order_qty": get(16),
+        "stock_name": get(24),
+        "order_price": get(25),
+    }
+
+
+def parse_overseas_fill_notice(fields: list[str]) -> dict:
+    """H0GSCNI0/H0GSCNI9 해외주식 체결통보 파싱."""
+    get = lambda i, d="": fields[i] if len(fields) > i else d
+    return {
+        "cust_id": get(0),
+        "account_no": get(1),
+        "order_no": get(2),
+        "original_order_no": get(3),
+        "side_code": get(4),
+        "receipt_code": get(5),
+        "order_kind": get(6),
+        "stock_code": get(7),
+        "filled_qty": get(8),
+        "filled_price": get(9),
+        "filled_time": get(10),
+        "rejected": get(11),
+        "filled": get(12),  # 2=체결, 1=접수/정정/취소/거부 접수
+        "accepted": get(13),
+        "order_qty": get(16),
+        "stock_name": get(17),
+        "order_condition": get(18),
+        "filled_price_12": get(24),
     }

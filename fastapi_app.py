@@ -3,9 +3,12 @@ Python FastAPI — 계산 엔진 서버 (포트 8000)
 Spring Boot가 이 서버를 HTTP 호출로 사용.
 """
 import asyncio
+import copy
 import logging
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime
 
 import yaml
 from fastapi import FastAPI, BackgroundTasks, HTTPException
@@ -33,6 +36,7 @@ logging.basicConfig(level=logging.INFO)
 
 _components: dict = {}
 _analysis_progress: dict[int, dict] = {}   # run_id → {done, total, current, status}
+_components_lock = threading.Lock()
 
 
 def _load_config() -> dict:
@@ -73,6 +77,7 @@ class BacktestRequest(BaseModel):
     stock_code: str
     stock_name: str = ""
     market: str = "domestic"
+    exchange: str | None = None
     period_days: int = 60          # start_date 미지정 시 오늘 기준 N일 전
     start_date: str | None = None  # YYYY-MM-DD
     end_date: str | None = None    # YYYY-MM-DD (미지정 시 오늘)
@@ -80,13 +85,102 @@ class BacktestRequest(BaseModel):
 
 class TradeStartRequest(BaseModel):
     market: str = "domestic"
+    mode: str | None = None
+
+
+class ModeRequest(BaseModel):
+    mode: str
 
 
 # ── 헬스체크 ──────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "trading_active": _main._is_trading_active()}
+    config = _components.get("config") or {}
+    return {
+        "status": "ok",
+        "trading_active": _main._is_trading_active(),
+        "mode": config.get("mode"),
+    }
+
+
+@app.get("/account/balance")
+def account_balance(market: str = "domestic", mode: str | None = None):
+    config = _components.get("config") or {}
+    engine_mode = config.get("mode")
+    if mode and engine_mode and mode != engine_mode:
+        raise HTTPException(
+            status_code=400,
+            detail=f"현재 엔진은 {engine_mode} 모드입니다. {mode} 잔고를 조회할 수 없습니다.",
+        )
+
+    try:
+        if market == "overseas":
+            balance = _components["overseas"].get_balance()
+            summary = balance.get("summary") or {}
+            cash = _to_float(summary.get("frcr_dncl_amt_2"))
+            total = _to_float(summary.get("tot_asst_amt"))
+            positions = balance.get("positions") or []
+            return {
+                "market": "overseas",
+                "mode": engine_mode,
+                "currency": "USD",
+                "cash": cash,
+                "totalAssets": total,
+                "positionValue": max(total - cash, 0),
+                "positionCount": len(positions),
+                "summary": summary,
+                "updatedAt": datetime.now().isoformat(),
+            }
+
+        balance = _components["domestic"].get_balance()
+        summary = balance.get("summary") or {}
+        cash = _to_float(summary.get("dnca_tot_amt"))
+        total = _to_float(summary.get("tot_evlu_amt") or summary.get("nass_amt"))
+        position_value = _to_float(summary.get("evlu_amt_smtl_amt"))
+        positions = balance.get("positions") or []
+        return {
+            "market": "domestic",
+            "mode": engine_mode,
+            "currency": "KRW",
+            "cash": cash,
+            "totalAssets": total,
+            "positionValue": position_value,
+            "positionCount": len(positions),
+            "summary": summary,
+            "updatedAt": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        logger.exception("계좌 잔고 조회 실패")
+        raise HTTPException(status_code=502, detail=f"KIS 계좌 잔고 조회 실패: {e}")
+
+
+def _to_float(value) -> float:
+    try:
+        return float(str(value or "0").replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@app.post("/mode")
+def set_mode(req: ModeRequest):
+    global _components
+    if req.mode not in {"paper", "live"}:
+        raise HTTPException(status_code=400, detail="mode는 paper/live 중 하나여야 합니다.")
+    if _main._is_trading_active():
+        raise HTTPException(status_code=409, detail="매매 실행 중에는 엔진 모드를 바꿀 수 없습니다.")
+
+    with _components_lock:
+        current_config = _components.get("config") or _load_config()
+        if current_config.get("mode") == req.mode:
+            return {"status": "ok", "mode": req.mode}
+
+        next_config = copy.deepcopy(current_config)
+        next_config["mode"] = req.mode
+        _components = _main.build_components(next_config)
+
+    logger.info("엔진 모드 전환 완료: %s", req.mode)
+    return {"status": "ok", "mode": req.mode}
 
 
 @app.get("/regime")
@@ -242,10 +336,11 @@ async def backtest(req: BacktestRequest):
             )
         else:
             from kis.constants import ExchangeCode
+            exchange = ExchangeCode(req.exchange or "NAS")
             df = await loop.run_in_executor(
                 None,
                 lambda: overseas.get_daily_ohlcv(
-                    req.stock_code, ExchangeCode.NASDAQ, fetch_start, end_date
+                    req.stock_code, exchange, fetch_start, end_date
                 ),
             )
             result = await loop.run_in_executor(
@@ -275,8 +370,15 @@ async def backtest(req: BacktestRequest):
 def trade_start(req: TradeStartRequest):
     if _main._is_trading_active():
         raise HTTPException(status_code=409, detail="이미 매매 중입니다.")
-    _main._start_trading_thread(_components)
-    return {"status": "started", "market": req.market}
+    config = _components.get("config") or {}
+    engine_mode = config.get("mode")
+    if req.mode and engine_mode and req.mode != engine_mode:
+        raise HTTPException(
+            status_code=400,
+            detail=f"현재 엔진은 {engine_mode} 모드입니다. {req.mode} 화면에서는 시작할 수 없습니다.",
+        )
+    _main._start_trading_thread(_components, req.market)
+    return {"status": "started", "market": req.market, "mode": engine_mode}
 
 
 @app.post("/trade/stop")
@@ -291,3 +393,27 @@ def trade_stop():
 async def get_positions():
     pg = PGWriter()
     return await pg.get_positions()
+
+
+@app.get("/trade/positions/live")
+def get_live_positions(mode: str | None = None):
+    config = _components.get("config") or {}
+    engine_mode = config.get("mode")
+    if mode and engine_mode and mode != engine_mode:
+        return []
+    order_mgr = _components.get("order_mgr")
+    if order_mgr is None:
+        raise HTTPException(status_code=503, detail="엔진 초기화 중")
+    return order_mgr.get_live_positions()
+
+
+@app.get("/trade/orders/pending")
+def get_pending_orders(mode: str | None = None):
+    config = _components.get("config") or {}
+    engine_mode = config.get("mode")
+    if mode and engine_mode and mode != engine_mode:
+        return []
+    order_mgr = _components.get("order_mgr")
+    if order_mgr is None:
+        raise HTTPException(status_code=503, detail="엔진 초기화 중")
+    return order_mgr.get_pending_order_rows()

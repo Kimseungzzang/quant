@@ -1,11 +1,13 @@
 import asyncio
 import argparse
 import logging
+import os
 import threading
 import schedule
 import time
 import yaml
 from pathlib import Path
+from datetime import datetime
 
 from kis.auth import KISAuth
 from kis.rest import KISRestClient
@@ -14,7 +16,9 @@ from kis.overseas import OverseasAPI
 from kis.websocket import (
     KISWebSocket,
     parse_domestic_price,
+    parse_domestic_fill_notice,
     parse_overseas_price,
+    parse_overseas_fill_notice,
 )
 from kis.constants import WebSocketTRID, TradeSignal, TradingMode, CloseReason
 from analysis.screener import Screener
@@ -127,7 +131,7 @@ def build_components(config: dict) -> dict:
     trade_logger = TradeLogger()
     risk         = RiskManager(config)
     strategy     = DayTradingStrategy(config)
-    order_mgr    = OrderManager(domestic, overseas, risk, trade_logger, pg=PGWriterSync())
+    order_mgr    = OrderManager(domestic, overseas, risk, trade_logger, pg=PGWriterSync(), mode=config["mode"])
     screener     = Screener(domestic, overseas, config)
     reporter     = ReportGenerator(trade_logger)
     ws           = KISWebSocket(auth)
@@ -261,7 +265,7 @@ def _load_candidates(market: str) -> list[dict]:
 # 실전 매매 상수
 _LIVE_ENTRY_LIMITS   = {"gap": 1, "breakout": 2, "pullback": 3}
 _REGIME_REFRESH_SEC  = 30 * 60   # 30분마다 장세 재감지
-_CLOSE_HOUR, _CLOSE_MIN = 15, 20 # 장마감 자동 청산 시각
+_CLOSE_HOUR, _CLOSE_MIN = 15, 20 # 국내 장마감 자동 청산 시각
 _MAX_HOLD_DAYS       = {"gap": 0, "breakout": 1, "pullback": 2}  # 전략별 최대 오버나잇
 _INTRADAY_ONLY       = {"gap"}    # 15:20 당일 강제 청산 전략
 
@@ -291,7 +295,59 @@ def _build_initial_context(comp: dict, stock_code: str, exchange: str) -> dict:
         return {}
 
 
-async def _run_trading_loop(comp: dict):
+def _parse_hhmm(value: str, fallback: tuple[int, int]) -> tuple[int, int]:
+    try:
+        hour, minute = value.split(":", 1)
+        return int(hour), int(minute)
+    except Exception:
+        return fallback
+
+
+def _is_between_cross_midnight(now: datetime, start: tuple[int, int], end: tuple[int, int]) -> bool:
+    current = now.hour * 60 + now.minute
+    start_min = start[0] * 60 + start[1]
+    end_min = end[0] * 60 + end[1]
+    if start_min <= end_min:
+        return start_min <= current < end_min
+    return current >= start_min or current < end_min
+
+
+def _overseas_regime(now: datetime, config: dict):
+    from analysis.market_regime import (
+        MarketRegime, MarketTrend, MarketVolatility, MarketSession,
+    )
+    sched = config.get("schedule", {})
+    start = _parse_hhmm(sched.get("us_analysis_time", "22:30"), (22, 30))
+    end = _parse_hhmm(sched.get("us_trading_end_time", "05:00"), (5, 0))
+    tradeable = _is_between_cross_midnight(now, start, end)
+    start_minutes = start[0] * 60 + start[1]
+    current = now.hour * 60 + now.minute
+    minutes_from_open = (current - start_minutes) % (24 * 60)
+    if not tradeable:
+        session = MarketSession.CLOSING
+        strategies = []
+        reason = "미국장 거래 시간 외"
+    elif minutes_from_open < 30:
+        session = MarketSession.OPENING
+        strategies = ["gap", "breakout"]
+        reason = ""
+    else:
+        session = MarketSession.MORNING
+        strategies = ["breakout", "pullback"]
+        reason = ""
+    return MarketRegime(
+        trend=MarketTrend.UP,
+        trend_strength=50.0,
+        volatility=MarketVolatility.NORMAL,
+        session=session,
+        index_change_pct=0.0,
+        preferred_strategies=strategies,
+        tradeable=tradeable,
+        reason=reason,
+    )
+
+
+async def _run_trading_loop(comp: dict, market: str = "both"):
     """WebSocket 구독 설정 후 실시간 매매 루프 실행."""
     from datetime import datetime, date as _date
     import pandas as _pd
@@ -303,7 +359,12 @@ async def _run_trading_loop(comp: dict):
     detector  = comp.get("regime_detector")
     mode      = TradingMode(comp["config"]["mode"])
 
-    all_candidates = _load_candidates("domestic") + _load_candidates("overseas")
+    if market == "domestic":
+        all_candidates = _load_candidates("domestic")
+    elif market == "overseas":
+        all_candidates = _load_candidates("overseas")
+    else:
+        all_candidates = _load_candidates("domestic") + _load_candidates("overseas")
     if not all_candidates:
         logger.warning("추천 종목 없음")
         return
@@ -314,24 +375,11 @@ async def _run_trading_loop(comp: dict):
     if detector:
         try:
             r = detector.detect()
-            if not r.tradeable:
-                if mode == TradingMode.MOCK:
-                    # mock 모드: 세션/추세 제약 무시하고 본장 상승장으로 고정
-                    from analysis.market_regime import (
-                        MarketRegime, MarketTrend, MarketVolatility, MarketSession,
-                    )
-                    r = MarketRegime(
-                        trend=MarketTrend.UP,
-                        trend_strength=60.0,
-                        volatility=MarketVolatility.NORMAL,
-                        session=MarketSession.MORNING,
-                        index_change_pct=0.5,
-                        preferred_strategies=["breakout", "pullback"],
-                        tradeable=True,
-                        reason="mock_override",
-                    )
+            if market != "overseas":
+                if mode == TradingMode.MOCK and (not r.tradeable or not r.preferred_strategies):
+                    r = _mock_regime()
                     logger.info("Mock 모드: 장세 강제 설정 — %s", r)
-                else:
+                elif not r.tradeable:
                     logger.warning("매매 불가 장세: %s → 매매 시작 취소", r.reason)
                     return
             regime_state["regime"]     = r
@@ -347,13 +395,43 @@ async def _run_trading_loop(comp: dict):
 
     logger.info("%d개 종목 실시간 모니터링 시작", len(all_candidates))
 
+    hts_id = _get_hts_id(comp["config"])
+    if mode != TradingMode.MOCK and hts_id:
+        def domestic_fill_handler(recv_tr_id: str, fields: list[str]):
+            order_mgr.on_order_notice(parse_domestic_fill_notice(fields))
+
+        def overseas_fill_handler(recv_tr_id: str, fields: list[str]):
+            order_mgr.on_order_notice(parse_overseas_fill_notice(fields))
+
+        domestic_fill_tr = (
+            WebSocketTRID.DOMESTIC_FILL_PAPER
+            if mode == TradingMode.PAPER else WebSocketTRID.DOMESTIC_FILL_LIVE
+        )
+        overseas_fill_tr = (
+            WebSocketTRID.OVERSEAS_FILL_PAPER
+            if mode == TradingMode.PAPER else WebSocketTRID.OVERSEAS_FILL_LIVE
+        )
+        if market in ("domestic", "both"):
+            ws.subscribe_global(domestic_fill_tr, hts_id, domestic_fill_handler)
+        if market in ("overseas", "both"):
+            ws.subscribe_global(overseas_fill_tr, hts_id, overseas_fill_handler)
+        logger.info("KIS 체결통보 구독 등록: hts_id=%s market=%s", hts_id, market)
+    elif mode != TradingMode.MOCK:
+        logger.error(
+            "kis.hts_id 또는 KIS_HTS_ID가 없어 체결통보 WebSocket을 구독하지 않습니다. "
+            "접수 응답만으로 포지션을 확정하지 않기 위해 매매 시작을 취소합니다."
+        )
+        return
+
     for c in all_candidates:
         code     = c["stock_code"]
         exchange = c["exchange"]
         # 일봉에서 resistance/prev_close/gap_open 초기 로드 (전략 진입 조건용)
         context  = c.get("context") or _build_initial_context(comp, code, exchange)
-        tr_id    = WebSocketTRID.DOMESTIC_PRICE if exchange == _KRX \
+        is_overseas = exchange != _KRX
+        tr_id    = WebSocketTRID.DOMESTIC_PRICE if not is_overseas \
             else WebSocketTRID.OVERSEAS_PRICE
+        subscribe_key = code if not is_overseas else f"D{exchange}{code}"
         parse_fn = parse_domestic_price if exchange == _KRX else parse_overseas_price
 
         def make_handler(stock_code, name, exch, _parse_fn, _base_ctx,
@@ -423,17 +501,26 @@ async def _run_trading_loop(comp: dict):
                     if upd is None or (now - upd).total_seconds() >= _REGIME_REFRESH_SEC:
                         try:
                             new_r = detector.detect()
+                            if mode == TradingMode.MOCK and exch == _KRX and (
+                                not new_r.tradeable or not new_r.preferred_strategies
+                            ):
+                                new_r = _mock_regime()
                             _regime_state["regime"]     = new_r
                             _regime_state["updated_at"] = now
                             logger.info("[장세 재감지] %s", new_r)
                         except Exception as e:
                             logger.warning("장세 재감지 실패: %s", e)
 
-                regime = _regime_state.get("regime")
+                regime = _overseas_regime(now, comp["config"]) if exch != _KRX else _regime_state.get("regime")
 
-                # ── 마감 자동 청산 (15:20 이후) ───────────────────────
-                is_closing = (now.hour > _CLOSE_HOUR or
-                              (now.hour == _CLOSE_HOUR and now.minute >= _CLOSE_MIN))
+                # ── 국내 마감 자동 청산 (15:20 이후) ─────────────────
+                is_closing = (
+                    exch == _KRX and (
+                        now.hour > _CLOSE_HOUR or
+                        (now.hour == _CLOSE_HOUR and now.minute >= _CLOSE_MIN)
+                    )
+                )
+                order_mgr.record_price(stock_code, price)
                 positions = order_mgr.get_open_positions()
 
                 if is_closing:
@@ -486,7 +573,7 @@ async def _run_trading_loop(comp: dict):
 
             return handler
 
-        ws.subscribe(tr_id, code,
+        ws.subscribe(tr_id, subscribe_key,
                      make_handler(code, c["name"], exchange, parse_fn,
                                   context, regime_state, live_shared))
 
@@ -494,7 +581,33 @@ async def _run_trading_loop(comp: dict):
     await ws.run()
 
 
-def _start_trading_thread(comp: dict):
+def _get_hts_id(config: dict) -> str:
+    kis_cfg = config.get("kis", {}) or {}
+    return str(
+        kis_cfg.get("hts_id")
+        or kis_cfg.get("my_htsid")
+        or os.getenv("KIS_HTS_ID")
+        or ""
+    ).strip()
+
+
+def _mock_regime():
+    from analysis.market_regime import (
+        MarketRegime, MarketTrend, MarketVolatility, MarketSession,
+    )
+    return MarketRegime(
+        trend=MarketTrend.UP,
+        trend_strength=60.0,
+        volatility=MarketVolatility.NORMAL,
+        session=MarketSession.MORNING,
+        index_change_pct=0.5,
+        preferred_strategies=["breakout", "pullback"],
+        tradeable=True,
+        reason="mock_override",
+    )
+
+
+def _start_trading_thread(comp: dict, market: str = "both"):
     """별도 스레드에서 asyncio 이벤트 루프로 매매 실행."""
     global _trading_thread
 
@@ -507,7 +620,7 @@ def _start_trading_thread(comp: dict):
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(_run_trading_loop(comp))
+                loop.run_until_complete(_run_trading_loop(comp, market))
             finally:
                 loop.close()
 

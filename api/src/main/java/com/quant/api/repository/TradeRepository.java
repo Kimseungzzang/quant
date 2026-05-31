@@ -30,6 +30,12 @@ public interface TradeRepository extends JpaRepository<Trade, Long> {
         """)
     List<Trade> findRecentByMode(String mode, OffsetDateTime since);
 
+    List<Trade> findBySideAndModeOrderByTradedAtDesc(String side, String mode);
+
+    List<Trade> findBySideAndModeAndTradedAtGreaterThanEqualOrderByTradedAtDesc(
+        String side, String mode, OffsetDateTime since
+    );
+
     @Query("""
         SELECT COUNT(t) FROM Trade t
         WHERE t.side = 'SELL' AND t.mode = :mode AND t.realizedPnl > 0
