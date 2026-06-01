@@ -18,6 +18,7 @@ from kis.overseas import OverseasAPI
 from kis.websocket import (
     KISWebSocket,
     parse_domestic_price,
+    parse_domestic_askbid,
     parse_domestic_fill_notice,
     parse_overseas_price,
     parse_overseas_fill_notice,
@@ -115,6 +116,9 @@ _trading_market: str | None = None  # 현재 매매 중인 market
 # 종목별 실시간 신호 상태 (대시보드 표시용)
 _signal_state: dict[str, dict] = {}
 _signal_state_lock = threading.Lock()
+
+# 종목별 최신 호가 상태 {stock_code: {imbalance, total_bid, total_ask, ask1, bid1}}
+_askbid_state: dict[str, dict] = {}
 _MAX_CANDLES = 120  # 최대 120개 봉 보관
 
 def _update_signal_state(stock_code: str, price: float, dfs: dict, ctx: dict):
@@ -692,6 +696,7 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
                 # ── 진입 판단 ─────────────────────────────────────────
                 if stock_code not in positions:
                     if router and regime and regime.tradeable:
+                        _ctx["askbid"] = _askbid_state.get(stock_code)
                         stock_entries = _shared["daily_entries"].setdefault(stock_code, {})
                         should_enter, strat_name, reason = router.check_entry(
                             regime, dfs, tick, _ctx,
@@ -731,6 +736,15 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
                      make_handler(code, c["name"], exchange, parse_fn,
                                   context, regime_state, live_shared,
                                   _pre=_preloaded))
+
+        # 국내 종목은 호가(H0STASP0)도 구독
+        if not is_overseas:
+            def _make_askbid_handler(sc):
+                def _askbid_handler(recv_tr_id: str, fields: list[str]):
+                    data = parse_domestic_askbid(fields)
+                    _askbid_state[sc] = data
+                return _askbid_handler
+            ws.subscribe(WebSocketTRID.DOMESTIC_ASKBID, code, _make_askbid_handler(code))
 
     comp["ws"] = ws
     await ws.run()

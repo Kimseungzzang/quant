@@ -17,6 +17,7 @@ _MSG_REALTIME = ("0", "1")
 # KIS WebSocket TR별 레코드당 필드 수 (공식 문서 기준)
 _KNOWN_FIELD_COUNTS: dict[str, int] = {
     "H0STCNT0": 46,   # 국내주식 실시간체결가
+    "H0STASP0": 57,   # 국내주식 실시간호가
     "HDFSCNT0": 26,   # 해외주식 실시간체결가
 }
 
@@ -237,6 +238,35 @@ def parse_domestic_price(fields: list[str]) -> dict:
         "vol":          get(12),
         "acml_vol":     get(13),
         "acml_val":     get(14),
+    }
+
+
+def parse_domestic_askbid(fields: list[str]) -> dict:
+    """H0STASP0 국내주식 실시간호가 파싱."""
+    get = lambda i, d="0": fields[i] if len(fields) > i else d
+    def _f(i): return float(get(i) or 0)
+
+    ask_prices  = [_f(3+i)  for i in range(10)]   # 매도호가 1~10
+    bid_prices  = [_f(13+i) for i in range(10)]   # 매수호가 1~10
+    ask_volumes = [_f(23+i) for i in range(10)]   # 매도호가잔량 1~10
+    bid_volumes = [_f(33+i) for i in range(10)]   # 매수호가잔량 1~10
+    total_ask   = _f(43)
+    total_bid   = _f(44)
+    total       = total_ask + total_bid
+    imbalance   = total_bid / total if total > 0 else 0.5
+
+    return {
+        "stock_code":   get(0),
+        "time":         get(1),
+        "ask1":         ask_prices[0],
+        "bid1":         bid_prices[0],
+        "ask_prices":   ask_prices,
+        "bid_prices":   bid_prices,
+        "ask_volumes":  ask_volumes,
+        "bid_volumes":  bid_volumes,
+        "total_ask":    total_ask,
+        "total_bid":    total_bid,
+        "imbalance":    round(imbalance, 4),  # 0~1, >0.55=매수우위 <0.45=매도우위
     }
 
 

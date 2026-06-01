@@ -82,9 +82,16 @@ class PullbackStrategy(BaseStrategy):
         if buying_score < 2:
             return EntrySignal(False, f"매수세 부족 (score={buying_score}/3)")
 
+        # ⑦ 호가 불균형: 실시간 bid 잔량 우위 확인 (데이터 있을 때만)
+        askbid = context.get("askbid")
+        imbalance = askbid["imbalance"] if askbid else None
+        if imbalance is not None and imbalance < 0.55:
+            return EntrySignal(False, f"호가 매도우위 (imbalance={imbalance:.2f})")
+
+        imb_str = f", 호가={imbalance:.2f}" if imbalance is not None else ""
         return EntrySignal(
             True,
-            f"눌림목 반등 @ {price:,.0f} (EMA20={ema20:,.0f}, vol={vol_ratio:.2f}x, 매수세={buying_score}/3)"
+            f"눌림목 반등 @ {price:,.0f} (EMA20={ema20:,.0f}, vol={vol_ratio:.2f}x, 매수세={buying_score}/3{imb_str})"
         )
 
     def check_exit(self, df: pd.DataFrame, tick: dict, position: dict) -> ExitSignal:
