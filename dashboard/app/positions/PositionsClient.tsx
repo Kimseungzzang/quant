@@ -37,7 +37,7 @@ function holdingTime(openedAt: string) {
 
 export default function PositionsClient({ initial, mode }: { initial: Position[]; mode: string }) {
   const [positions, setPositions] = useState(initial);
-  const [updatedAt, setUpdatedAt] = useState(new Date());
+  const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
@@ -90,7 +90,7 @@ export default function PositionsClient({ initial, mode }: { initial: Position[]
         <div className="flex items-center gap-2 text-xs text-gray-500">
           <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
           2초 갱신
-          {updatedAt.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+          {updatedAt ? updatedAt.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "-"}
         </div>
       </div>
 
