@@ -231,7 +231,9 @@ class Screener:
         try:
             result = self.overseas.get_volume_ranking(exchange)
             if result:
-                logger.info("해외 거래량순위 API (%s): %d개 종목", exchange, len(result))
+                # 거래대금(tamt) 기준 재정렬 — 주식 수(tvol) 기준이면 페니주가 상위 점령
+                result.sort(key=lambda x: float(x.get("tamt") or 0), reverse=True)
+                logger.info("해외 거래대금순위 (%s): %d개 종목", exchange, len(result))
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 cache_path.write_text(json.dumps({"date": today_str, "stocks": result}, ensure_ascii=False))
                 return result
