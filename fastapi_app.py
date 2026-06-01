@@ -255,6 +255,85 @@ def get_regime():
 
 # ── 분석 ──────────────────────────────────────────────────────────────
 
+@app.post("/analyze/rerank")
+async def rerank(market: str = "domestic", horizon: str = "daytrade"):
+    """
+    장 시작 후 수동 재정렬.
+    DB의 최근 분석 결과를 실시간 거래량 순위 + 갭 크기로 재정렬해서 반환.
+    DB를 갱신하지 않고 응답만 반환 — 화면 표시·WebSocket 구독 순서에만 사용.
+    """
+    pg     = PGWriter()
+    loop   = asyncio.get_event_loop()
+    domestic: DomesticAPI   = _components.get("domestic")
+    overseas: OverseasAPI   = _components.get("overseas")
+
+    if domestic is None:
+        raise HTTPException(status_code=503, detail="엔진 초기화 중")
+
+    # 1) DB에서 최근 분석 결과 로드
+    saved = await pg.get_analysis_run_status_latest(market, horizon)
+    if not saved:
+        raise HTTPException(status_code=404, detail="분석 결과 없음. 먼저 분석을 실행하세요.")
+
+    run_id   = saved["id"]
+    results  = await pg.get_results_by_run(run_id)
+    if not results:
+        raise HTTPException(status_code=404, detail="분석 결과 없음.")
+
+    # 2) 실시간 거래량 순위 조회
+    try:
+        from kis.constants import ExchangeCode
+        if market == "domestic":
+            vol_rank = await loop.run_in_executor(None, domestic.get_volume_ranking)
+            vol_map  = {r["mksc_shrn_iscd"]: idx for idx, r in enumerate(vol_rank)}
+        else:
+            exch     = ExchangeCode.NASDAQ
+            vol_rank = await loop.run_in_executor(None, lambda: overseas.get_volume_ranking(exch))
+            vol_map  = {r.get("symb", ""): idx for idx, r in enumerate(vol_rank)}
+    except Exception as e:
+        logger.warning("거래량순위 조회 실패: %s → 거래량 가중치 없이 반환", e)
+        vol_map = {}
+
+    # 3) 갭 + 거래량 기반 재정렬 점수 계산
+    reranked = []
+    for r in results:
+        code      = r["stock_code"]
+        base_score = float(r.get("final_score") or 0)
+
+        # 거래량 순위 보너스: 1위=+30, 10위=+20, 50위=+5, 없음=0
+        vol_idx   = vol_map.get(code)
+        if vol_idx is not None:
+            vol_bonus = max(30 - vol_idx * 0.5, 0)
+        else:
+            vol_bonus = 0
+
+        # 갭 보너스: 현재가 vs 전일종가 (갭 1% 당 +2점, 최대 +20)
+        gap_bonus = 0
+        try:
+            if market == "domestic":
+                price_data = await loop.run_in_executor(None, lambda c=code: domestic.get_price(c))
+                cur   = float(price_data.get("stck_prpr") or 0)
+                prev  = float(price_data.get("bstp_kor_isnm") or 0)   # 전일 종가는 별도 필드
+                # 전일 종가는 일봉 마지막 close 사용
+                prev  = float(price_data.get("stck_prdy_clpr") or price_data.get("prdy_vrss") or 0)
+                if cur > 0 and prev > 0:
+                    gap_pct   = (cur - prev) / prev * 100
+                    gap_bonus = min(abs(gap_pct) * 2, 20)
+        except Exception:
+            pass
+
+        reranked.append({
+            **r,
+            "volRank":    vol_idx if vol_idx is not None else 9999,
+            "volBonus":   round(vol_bonus, 1),
+            "gapBonus":   round(gap_bonus, 1),
+            "rerankScore": round(base_score + vol_bonus + gap_bonus, 1),
+        })
+
+    reranked.sort(key=lambda x: x["rerankScore"], reverse=True)
+    return {"market": market, "horizon": horizon, "results": reranked}
+
+
 @app.post("/analyze")
 async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks):
     pg = PGWriter()

@@ -106,6 +106,43 @@ class PGWriter:
         finally:
             await conn.close()
 
+    async def get_analysis_run_status_latest(self, market: str, horizon: str) -> dict | None:
+        """market+horizon 기준 가장 최근 completed run."""
+        conn = await _conn()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT id, status, top_n
+                FROM analysis_runs
+                WHERE market=$1 AND horizon=$2 AND status='completed'
+                ORDER BY run_at DESC LIMIT 1
+                """,
+                market, horizon,
+            )
+            return dict(row) if row else None
+        finally:
+            await conn.close()
+
+    async def get_results_by_run(self, run_id: int) -> list[dict]:
+        """run_id에 속한 분석 결과 전체."""
+        conn = await _conn()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT rank, stock_code, stock_name, market, horizon,
+                       current_price, change_pct, trading_value,
+                       final_score, win_rate_pct, backtest_return,
+                       max_drawdown, trade_count, exchange
+                FROM analysis_results
+                WHERE run_id=$1
+                ORDER BY rank
+                """,
+                run_id,
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
     async def save_analysis_results(self, run_id: int, candidates: list):
         """Candidate 리스트를 analysis_results 테이블에 저장."""
         if not candidates:

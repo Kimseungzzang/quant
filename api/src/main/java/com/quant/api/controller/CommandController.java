@@ -20,6 +20,14 @@ public class CommandController {
         return pythonEngineClient.triggerAnalyze(req != null ? req : new CommandRequest());
     }
 
+    @PostMapping("/analyze/rerank")
+    public Map<?, ?> rerank(
+        @RequestParam(defaultValue = "domestic") String market,
+        @RequestParam(defaultValue = "daytrade") String horizon
+    ) {
+        return pythonEngineClient.rerankAnalysis(market, horizon);
+    }
+
     @PostMapping("/backtest")
     public Map<?, ?> backtest(@RequestBody CommandRequest req) {
         return pythonEngineClient.triggerBacktest(req);

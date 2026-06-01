@@ -136,6 +136,14 @@ public class PythonEngineClient {
         return resp.getBody();
     }
 
+    public Map<?, ?> rerankAnalysis(String market, String horizon) {
+        log.info("Python /analyze/rerank 호출: market={} horizon={}", market, horizon);
+        ResponseEntity<Map> resp = restTemplate.postForEntity(
+            baseUrl + "/analyze/rerank?market=" + market + "&horizon=" + horizon,
+            null, Map.class);
+        return resp.getBody();
+    }
+
     public Object getSignals() {
         ResponseEntity<Object> resp = restTemplate.getForEntity(baseUrl + "/signals", Object.class);
         return resp.getBody();

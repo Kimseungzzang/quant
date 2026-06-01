@@ -1,5 +1,6 @@
 import { api } from "@/lib/api";
 import AnalyzeButton from "./AnalyzeButton";
+import RerankButton from "./RerankButton";
 import Link from "next/link";
 
 const HORIZONS = [
@@ -73,6 +74,11 @@ export default async function AnalysisPage({
           <AnalyzeButton market={market} horizon={horizon} />
         </div>
       </div>
+
+      {/* 단타일 때만 장시작 재정렬 버튼 노출 */}
+      {horizon === "daytrade" && (
+        <RerankButton market={market} horizon={horizon} />
+      )}
 
       <nav className="grid grid-cols-3 gap-2">
         {HORIZONS.map((h) => (
