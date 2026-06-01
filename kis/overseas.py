@@ -292,9 +292,15 @@ class OverseasAPI:
                 "CTX_AREA_NK200":"",
             },
         )
+        # output2: 잔고 없을 때 dict, 있을 때 list[dict] — 둘 다 처리
+        raw2 = data.get("output2", {})
+        if isinstance(raw2, list):
+            summary = raw2[0] if raw2 else {}
+        else:
+            summary = raw2 or {}
         return {
             "positions": data.get("output1", []),
-            "summary":   data.get("output2", [{}])[0] if data.get("output2") else {},
+            "summary":   summary,
         }
 
     # ── 내부 ────────────────────────────────────────────────────────────

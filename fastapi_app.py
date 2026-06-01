@@ -138,9 +138,13 @@ def account_balance(market: str = "domestic", mode: str | None = None):
         if market == "overseas":
             balance = _components["overseas"].get_balance()
             summary = balance.get("summary") or {}
-            cash = _to_float(summary.get("frcr_dncl_amt_2"))
-            total = _to_float(summary.get("tot_asst_amt"))
             positions = balance.get("positions") or []
+            cash  = _to_float(summary.get("frcr_dncl_amt_2") or summary.get("frcr_dncl_amt1"))
+            total = _to_float(
+                summary.get("tot_asst_amt")
+                or summary.get("tot_evlu_pfls_amt")
+                or sum(_to_float(p.get("ovrs_stck_evlu_amt")) for p in positions)
+            )
             result = {
                 "market": "overseas",
                 "mode": engine_mode,

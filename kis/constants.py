@@ -135,7 +135,7 @@ class OverseasTRID(StrEnum):
     # 주문/계좌 (실전 — 야간 정규장)
     BUY_LIVE          = "TTTT1002U"
     SELL_LIVE         = "TTTT1006U"
-    BALANCE_LIVE      = "TTTS2012R"
+    BALANCE_LIVE      = "TTTS3012R"
     DAILY_ORDERS_LIVE = "TTTS2003R"
 
     # 주문/계좌 (실전 — 주간거래 10:00~22:00)
@@ -145,7 +145,7 @@ class OverseasTRID(StrEnum):
     # 주문/계좌 (모의 — 야간/주간 공용)
     BUY_PAPER          = "VTTT1002U"
     SELL_PAPER         = "VTTT1001U"
-    BALANCE_PAPER      = "VTTS2012R"
+    BALANCE_PAPER      = "VTTS3012R"
     DAILY_ORDERS_PAPER = "VTTS2003R"
 
 
