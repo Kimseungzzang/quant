@@ -147,6 +147,7 @@ class OverseasTRID(StrEnum):
     SELL_PAPER         = "VTTT1001U"
     BALANCE_PAPER      = "VTTS3012R"
     DAILY_ORDERS_PAPER = "VTTS2003R"
+    FOREIGN_MARGIN     = "TTTC2101R"   # 해외증거금 통화별조회 (live only)
 
 
 # ── WebSocket TR_ID ───────────────────────────────────────────────────
@@ -179,7 +180,8 @@ class DomesticPath(StrEnum):
 
 class OverseasPath(StrEnum):
     ORDER        = "/uapi/overseas-stock/v1/trading/order"
-    BALANCE      = "/uapi/overseas-stock/v1/trading/inquire-balance"
+    BALANCE         = "/uapi/overseas-stock/v1/trading/inquire-balance"
+    FOREIGN_MARGIN  = "/uapi/overseas-stock/v1/trading/foreign-margin"
     DAILY_ORDERS = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
     PRICE        = "/uapi/overseas-price/v1/quotations/price"
     DAILY_CHART  = "/uapi/overseas-price/v1/quotations/dailyprice"

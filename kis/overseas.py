@@ -303,6 +303,23 @@ class OverseasAPI:
             "summary":   summary,
         }
 
+    def get_foreign_margin_usd(self) -> float:
+        """USD 외화예수금 조회 (해외증거금 통화별조회, live 전용)."""
+        if self.is_paper:
+            return 0.0  # 모의투자 미지원
+        try:
+            data = self.client.get(
+                OverseasPath.FOREIGN_MARGIN,
+                OverseasTRID.FOREIGN_MARGIN,
+                {"CANO": self.account_no, "ACNT_PRDT_CD": self.acnt_prdt_cd},
+            )
+            for item in data.get("output", []):
+                if item.get("crcy_cd") == "USD" and item.get("natn_name") == "미국":
+                    return float(item.get("frcr_dncl_amt1") or 0)
+        except Exception as e:
+            logger.warning("USD 예수금 조회 실패: %s", e)
+        return 0.0
+
     # ── 내부 ────────────────────────────────────────────────────────────
 
     @staticmethod

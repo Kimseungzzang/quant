@@ -144,7 +144,8 @@ def account_balance(market: str = "domestic", mode: str | None = None):
             purchase_amt = _to_float(summary.get("frcr_buy_amt_smtl1"))
             evlu_pfls    = _to_float(summary.get("tot_evlu_pfls_amt"))
             total = stock_value if stock_value > 0 else purchase_amt + evlu_pfls
-            cash  = 0.0  # 예수금은 별도 API 필요 (해외증거금 통화별조회)
+            cash  = _components["overseas"].get_foreign_margin_usd()
+            total = total + cash  # 주식평가금액 + 현금예수금
             result = {
                 "market": "overseas",
                 "mode": engine_mode,
