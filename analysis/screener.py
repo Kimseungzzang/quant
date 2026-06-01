@@ -28,6 +28,7 @@ class Candidate:
     news_sentiment: float  # -1.0 ~ 1.0
     trading_value: float = 0.0
     horizon: str = "swing"
+    atr_pct: float = 0.0   # 단타용: 5일 평균 일중 변동폭 (%)
     final_score: float = 0.0
     context: dict = None   # 전략 진입 시 참조 (저항선, 전일 종가 등)
 
@@ -35,6 +36,13 @@ class Candidate:
         self.final_score = self._calc_final_score()
 
     def _calc_final_score(self) -> float:
+        if self.horizon == "daytrade":
+            # 백테스트 없음 — 기술적 상태 + 유동성 + 변동폭으로만 평가
+            score  = self.backtest.signal_score * 0.35   # EMA·RSI·MACD 기술적 상태
+            score += _liquidity_score(self.trading_value) * 0.45  # 거래대금 (슬리피지 직결)
+            score += _atr_score(self.atr_pct) * 0.20    # 일중 변동폭 (수익 가능성)
+            return round(score, 1)
+
         adjusted_win_rate = _adjusted_win_rate(
             self.backtest.win_rate_pct, self.backtest.total_trades, self.horizon
         )
@@ -45,13 +53,7 @@ class Candidate:
             score += max(min(self.backtest.total_return_pct, 50), -50) * 0.2
             score += _liquidity_score(self.trading_value) * 0.05
             score += self.news_sentiment * 20 * 0.1
-        elif self.horizon == "daytrade":
-            score = self.backtest.signal_score * 0.20
-            score += adjusted_win_rate * 0.25
-            score += return_score * 0.20
-            score += _liquidity_score(self.trading_value) * 0.25
-            score += _momentum_score(self.change_pct) * 0.10
-        else:
+        else:  # swing
             score = self.backtest.signal_score * 0.35
             score += adjusted_win_rate * 0.20
             score += _liquidity_score(self.trading_value) * 0.10
@@ -79,6 +81,8 @@ class Screener:
 
     def run_domestic(self, top_n: int = 10, lookback_days: int | None = None,
                      on_progress=None, regime=None, horizon: str = "swing") -> list[Candidate]:
+        if horizon == "daytrade":
+            top_n = max(top_n, 30)   # 단타는 재정렬 여유분 위해 최소 30개 저장
         logger.info("국내주식 유니버스 스크리닝 시작...")
         if regime:
             logger.info("장세 적용: %s", regime)
@@ -95,6 +99,8 @@ class Screener:
 
     def run_overseas(self, top_n: int = 10, lookback_days: int | None = None,
                      on_progress=None, horizon: str = "swing") -> list[Candidate]:
+        if horizon == "daytrade":
+            top_n = max(top_n, 30)
         logger.info("해외주식 유니버스 스크리닝 시작...")
         ohlcv_days = lookback_days if lookback_days is not None else 30
         candidates = []
@@ -297,24 +303,10 @@ class Screener:
                 context = self._build_context(df_ind, preferred)
 
                 if horizon == "daytrade":
-                    # ③ 단타 백테스트 (1분봉 원본 → 전략별 1/5/15분봉 리샘플링)
-                    df_min = self.domestic.get_historical_minute_ohlcv(
-                        code, lookback_days=self._daytrade_bt_days, candle_minutes=1)
-                    if not df_min.empty:
-                        bt = run_strategy_backtest(
-                            code,
-                            df_min,
-                            context=context,
-                            stop_loss_pct=self.stop_loss,
-                            take_profit_pct=self.take_profit,
-                        )
-                    else:
-                        logger.info("[%s] 분봉 데이터 없음 → 단타 백테스트 스킵", code)
-                        bt = BacktestResult(stock_code=code)
-                    logger.info("[%s] ③ 단타 백테스트(1/5/15분봉/%d일) | 거래=%d회 | 승률=%.1f%% | 수익률=%+.2f%% | MDD=%.2f%% | Sharpe=%.2f",
-                                code, self._daytrade_bt_days,
-                                bt.total_trades, bt.win_rate_pct,
-                                bt.total_return_pct, bt.max_drawdown_pct, bt.sharpe_ratio)
+                    # ③ 단타: 백테스트 없음 — ATR(일중 변동폭)만 계산
+                    atr_pct = _calc_atr_pct(df)
+                    bt = BacktestResult(stock_code=code, signal_score=round(signal_score, 1))
+                    logger.info("[%s] ③ 단타 ATR=%.2f%% (5일 평균 일중 변동폭)", code, atr_pct)
                 else:
                     # ③ 장타/스윙 백테스트 (일봉 기반)
                     bt = run_backtest(
@@ -344,15 +336,22 @@ class Screener:
                 # ⑥ 최종 점수
                 cand = Candidate(
                     code, name, exchange, price, change, bt, sentiment,
-                    trading_value=trading_value, horizon=horizon
+                    trading_value=trading_value, horizon=horizon,
+                    atr_pct=atr_pct if horizon == "daytrade" else 0.0,
                 )
                 cand.context = context  # 매매 루프에서 전략 진입 시 사용
-                logger.info("[%s] ⑥ 최종점수=%.1f | signal=%.1f | 보정승률=%.1f | 거래대금점수=%.1f | 수익=%.1f",
-                            code, cand.final_score,
-                            bt.signal_score,
-                            _adjusted_win_rate(bt.win_rate_pct, bt.total_trades, horizon),
-                            _liquidity_score(trading_value),
-                            return_score if (return_score := max(min(bt.total_return_pct, 30), -30)) else 0.0)
+                if horizon == "daytrade":
+                    logger.info("[%s] ⑥ 최종점수=%.1f | signal=%.1f | 유동성=%.1f | ATR점수=%.1f (%.2f%%)",
+                                code, cand.final_score, bt.signal_score,
+                                _liquidity_score(trading_value),
+                                _atr_score(atr_pct), atr_pct)
+                else:
+                    logger.info("[%s] ⑥ 최종점수=%.1f | signal=%.1f | 보정승률=%.1f | 거래대금점수=%.1f | 수익=%.1f",
+                                code, cand.final_score,
+                                bt.signal_score,
+                                _adjusted_win_rate(bt.win_rate_pct, bt.total_trades, horizon),
+                                _liquidity_score(trading_value),
+                                max(min(bt.total_return_pct, 30), -30))
                 logger.info("─" * 60)
                 candidates.append(cand)
             except Exception as e:
@@ -459,24 +458,10 @@ class Screener:
                             f"{row.get('vol_ratio'):.2f}" if row.get('vol_ratio') else "N/A")
 
                 if horizon == "daytrade":
-                    context = self._build_context(df_ind, ["breakout", "pullback"])
-                    df_min = self.overseas.get_historical_minute_ohlcv(
-                        code, ExchangeCode(str(exchange)),
-                        lookback_days=self._daytrade_bt_days, candle_minutes=1,
-                    )
-                    if not df_min.empty:
-                        bt = run_strategy_backtest(
-                            code, df_min,
-                            context=context,
-                            stop_loss_pct=self.stop_loss,
-                            take_profit_pct=self.take_profit,
-                        )
-                    else:
-                        logger.info("[%s] 해외 분봉 데이터 없음 → 단타 백테스트 스킵", code)
-                        bt = BacktestResult(stock_code=code)
-                    logger.info("[%s] ③ 단타 백테스트(1/5/15분봉/%d일) | 거래=%d회 | 승률=%.1f%% | 수익률=%+.2f%%",
-                                code, self._daytrade_bt_days,
-                                bt.total_trades, bt.win_rate_pct, bt.total_return_pct)
+                    # 해외 단타도 백테스트 없음 — ATR만 계산
+                    atr_pct = _calc_atr_pct(df)
+                    bt = BacktestResult(stock_code=code, signal_score=round(signal_score, 1))
+                    logger.info("[%s] ③ 단타 ATR=%.2f%% (5일 평균 일중 변동폭)", code, atr_pct)
                 else:
                     bt = run_backtest(
                         code,
@@ -498,9 +483,15 @@ class Screener:
                 trading_value = _resolve_trading_value(item, price) * 1300
                 cand = Candidate(
                     code, name, exchange, price, change, bt, sentiment,
-                    trading_value=trading_value, horizon=horizon
+                    trading_value=trading_value, horizon=horizon,
+                    atr_pct=atr_pct if horizon == "daytrade" else 0.0,
                 )
-                logger.info("[%s] ⑤ 최종점수=%.1f", code, cand.final_score)
+                if horizon == "daytrade":
+                    logger.info("[%s] ⑤ 최종점수=%.1f | signal=%.1f | 유동성=%.1f | ATR점수=%.1f (%.2f%%)",
+                                code, cand.final_score, bt.signal_score,
+                                _liquidity_score(trading_value), _atr_score(atr_pct), atr_pct)
+                else:
+                    logger.info("[%s] ⑤ 최종점수=%.1f", code, cand.final_score)
                 logger.info("─" * 60)
                 candidates.append(cand)
             except Exception as e:
@@ -570,6 +561,37 @@ def _momentum_score(change_pct: float) -> float:
     if change_pct <= 15:
         return 60.0
     return 25.0
+
+
+def _atr_score(atr_pct: float) -> float:
+    """5일 평균 일중 변동폭(%) 기반 단타 적합도 (0~100).
+    너무 안 움직이면 수익 불가, 너무 많이 움직이면 리스크 과다.
+    스윗스팟: 2~4%
+    """
+    if atr_pct <= 0:
+        return 0.0
+    if atr_pct < 1.0:
+        return 10.0
+    if atr_pct < 2.0:
+        return 50.0
+    if atr_pct <= 4.0:
+        return 100.0
+    if atr_pct <= 6.0:
+        return 65.0
+    return 30.0
+
+
+def _calc_atr_pct(df) -> float:
+    """일봉 DataFrame에서 최근 5일 평균 일중 변동폭(%) 계산."""
+    try:
+        import pandas as pd
+        if df is None or df.empty or len(df) < 5:
+            return 0.0
+        recent = df.tail(5).copy()
+        recent["range_pct"] = (recent["high"] - recent["low"]) / recent["close"] * 100
+        return round(float(recent["range_pct"].mean()), 2)
+    except Exception:
+        return 0.0
 
 
 def _is_product_name(name: str) -> bool:
