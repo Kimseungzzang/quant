@@ -68,7 +68,11 @@ class OrderManager:
         return self.mode != "mock"
 
     def start_fill_timeout_poller(self):
-        """WebSocket 체결통보 미수신 시 타임아웃 후 접수가로 자동 확정하는 백그라운드 스레드."""
+        """체결통보 누락 감시. paper/live에서는 접수만으로 포지션을 확정하지 않는다."""
+        if self._uses_fill_confirmation():
+            logger.info("체결통보 대기 모드: 접수 주문은 체결통보 수신 전까지 미체결로 유지")
+            return
+
         def _poll():
             while True:
                 time.sleep(5)
@@ -92,6 +96,37 @@ class OrderManager:
         t = threading.Thread(target=_poll, daemon=True)
         t.start()
         logger.info("체결 타임아웃 폴러 시작 (타임아웃: %d초)", self._FILL_TIMEOUT_SEC)
+
+    def start_fill_reconciliation_poller(self, interval_sec: int = 10):
+        """WebSocket 체결통보 누락 시 KIS 주문체결내역으로 pending 주문을 보정한다."""
+        if self.mode == "mock":
+            return
+
+        def _poll():
+            while True:
+                time.sleep(interval_sec)
+                with self._lock:
+                    pending_snapshot = list(self._pending_orders.values())
+                if not pending_snapshot:
+                    continue
+
+                rows: list[dict] = []
+                try:
+                    if any(p.exchange == _KRX for p in pending_snapshot):
+                        rows.extend(self.domestic.get_daily_orders())
+                except Exception as e:
+                    logger.warning("국내 체결조회 보정 실패: %s", e)
+                try:
+                    if any(p.exchange != _KRX for p in pending_snapshot):
+                        rows.extend(self.overseas.get_daily_orders())
+                except Exception as e:
+                    logger.warning("해외 체결조회 보정 실패: %s", e)
+
+                self.reconcile_order_rows(rows)
+
+        t = threading.Thread(target=_poll, daemon=True, name="fill-reconciliation")
+        t.start()
+        logger.info("체결조회 보정 폴러 시작 (간격: %d초)", interval_sec)
 
     # ── 매수 ────────────────────────────────────────────────────────────
 
@@ -243,6 +278,37 @@ class OrderManager:
             })
         return rows
 
+    def restore_position(
+        self,
+        stock_code: str,
+        name: str,
+        exchange: str,
+        qty: int,
+        entry_price: float,
+        current_price: float | None = None,
+        order_no: str = "",
+        strategy: str = "breakout",
+    ):
+        """서버 재시작 후 실제 계좌/DB 보유분을 인메모리 포지션으로 복원."""
+        if qty <= 0 or entry_price <= 0:
+            return
+        with self._lock:
+            pos = Position(
+                stock_code=stock_code,
+                name=name,
+                exchange=exchange,
+                qty=qty,
+                entry_price=entry_price,
+                order_no=order_no,
+                strategy=strategy,
+            )
+            self._positions[stock_code] = pos
+            self._last_prices[stock_code] = current_price or entry_price
+        logger.info(
+            "[포지션복원] %s(%s) %d주 @ %.2f strategy=%s",
+            name, stock_code, qty, entry_price, strategy,
+        )
+
     def record_price(self, stock_code: str, current_price: float):
         self._last_prices[stock_code] = current_price  # float 대입은 GIL로 안전
 
@@ -327,14 +393,89 @@ class OrderManager:
                             pending.filled_qty, pending.qty)
         return True
 
+    def reconcile_order_rows(self, rows: list[dict]) -> int:
+        """KIS 주문체결내역 rows를 pending 주문에 반영한다."""
+        matched = 0
+        for row in rows:
+            order_no = str(
+                row.get("odno")
+                or row.get("ODNO")
+                or row.get("odno_no")
+                or ""
+            ).strip()
+            if not order_no:
+                continue
+            with self._lock:
+                pending = self._pending_orders.get(order_no)
+            if not pending:
+                continue
+
+            filled_qty = (
+                row.get("ft_ccld_qty")
+                or row.get("tot_ccld_qty")
+                or row.get("CCLD_QTY")
+                or row.get("filled_qty")
+                or "0"
+            )
+            filled_price = (
+                row.get("ft_ccld_unpr3")
+                or row.get("avg_prvs")
+                or row.get("CCLD_UNPR")
+                or row.get("filled_price")
+                or pending.requested_price
+            )
+            rejected_reason = row.get("rjct_rson") or row.get("rjct_rson_name") or ""
+            status = str(row.get("prcs_stat_name") or row.get("ord_stat_name") or "")
+
+            if rejected_reason:
+                event = {"order_no": order_no, "rejected": "Y"}
+            elif self._to_int(filled_qty, 0) > 0:
+                event = {
+                    "order_no": order_no,
+                    "filled": "2",
+                    "rejected": "N",
+                    "filled_qty": str(filled_qty),
+                    "filled_price": str(filled_price),
+                }
+            elif "완료" in status:
+                with self._lock:
+                    self._pending_orders.pop(order_no, None)
+                logger.warning("완료 상태이나 체결수량 0: %s %s", order_no, pending.stock_code)
+                matched += 1
+                continue
+            else:
+                continue
+
+            if self.on_order_notice(event):
+                matched += 1
+                logger.info("체결조회 보정 반영: %s %s", order_no, pending.stock_code)
+        return matched
+
     def _get_account_value(self, exchange: str) -> float:
         try:
             if exchange == _KRX:
                 balance = self.domestic.get_balance()
                 return float(balance["summary"].get("dnca_tot_amt", 0) or 0)
-            else:
-                balance = self.overseas.get_balance()
-                return float(balance["summary"].get("tot_asst_amt", 0) or 0)
+
+            cash = float(self.overseas.get_foreign_margin_usd() or 0)
+            if cash > 0:
+                return cash
+
+            balance = self.overseas.get_balance()
+            summary = balance.get("summary") or {}
+            for key in (
+                "tot_asst_amt",
+                "frcr_dncl_amt1",
+                "frcr_buy_amt_smtl1",
+                "ord_psbl_cash",
+                "ovrs_ord_psbl_amt",
+            ):
+                value = summary.get(key)
+                if value not in (None, ""):
+                    amount = float(value or 0)
+                    if amount > 0:
+                        return amount
+            return 0.0
         except Exception as e:
             logger.error("계좌 조회 실패: %s", e)
             return 0.0

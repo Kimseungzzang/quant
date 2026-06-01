@@ -9,7 +9,7 @@ import schedule
 import time
 import yaml
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date
 
 from kis.auth import KISAuth
 from kis.rest import KISRestClient
@@ -26,7 +26,6 @@ from kis.websocket import (
 from kis.constants import WebSocketTRID, TradeSignal, TradingMode, CloseReason
 from analysis.screener import Screener
 from trading.risk import RiskManager
-from trading.strategy import DayTradingStrategy
 from trading.order_manager import OrderManager
 from report.logger import TradeLogger
 from report.report_gen import ReportGenerator
@@ -61,12 +60,20 @@ class CandleAggregator:
             return False
 
         slot = (h * 60 + m) // self.period
+        bucket_minute = slot * self.period
+        candle_dt = datetime.now().replace(
+            hour=bucket_minute // 60,
+            minute=bucket_minute % 60,
+            second=0,
+            microsecond=0,
+        )
         completed = False
 
         if self._current is None or self._current["slot"] != slot:
             if self._current is not None:
                 c = self._current
                 self._completed.append({
+                    "datetime": c["datetime"],
                     "open": c["open"], "high": c["high"],
                     "low":  c["low"],  "close": c["close"], "volume": c["volume"],
                 })
@@ -74,7 +81,7 @@ class CandleAggregator:
                     self._completed.pop(0)
                 completed = True
             self._current = {
-                "slot": slot, "open": price, "high": price,
+                "slot": slot, "datetime": candle_dt, "open": price, "high": price,
                 "low": price, "close": price, "volume": vol,
             }
         else:
@@ -99,9 +106,10 @@ class CandleAggregator:
         needed = ["open", "high", "low", "close", "volume"]
         if not all(c in df.columns for c in needed):
             return
-        rows = df[needed].tail(self.max_candles).to_dict("records")
+        cols = (["datetime"] if "datetime" in df.columns else []) + needed
+        rows = df[cols].tail(self.max_candles).to_dict("records")
         self._completed = [
-            {"open": float(r["open"]), "high": float(r["high"]),
+            {"datetime": r.get("datetime"), "open": float(r["open"]), "high": float(r["high"]),
              "low":  float(r["low"]),  "close": float(r["close"]),
              "volume": float(r["volume"])}
             for r in rows
@@ -196,7 +204,6 @@ def build_components(config: dict) -> dict:
     overseas     = OverseasAPI(client, config)
     trade_logger = TradeLogger()
     risk         = RiskManager(config)
-    strategy     = DayTradingStrategy(config)
     order_mgr    = OrderManager(domestic, overseas, risk, trade_logger, pg=PGWriterSync(), mode=config["mode"])
     screener     = Screener(domestic, overseas, config)
     reporter     = ReportGenerator(trade_logger)
@@ -206,7 +213,7 @@ def build_components(config: dict) -> dict:
     return dict(
         auth=auth, config=config,
         domestic=domestic, overseas=overseas,
-        trade_logger=trade_logger, risk=risk, strategy=strategy,
+        trade_logger=trade_logger, risk=risk,
         order_mgr=order_mgr, screener=screener, reporter=reporter, ws=ws,
         regime_detector=regime_detector, strategy_router=strategy_router,
     )
@@ -288,21 +295,28 @@ def _save_candidates(candidates, market: str):
 _RERANK_CACHE_FILE = Path("data/candidates_reranked.json")
 
 
-def _load_candidates(market: str) -> list[dict]:
+def _load_candidates(market: str, top_n: int = 10) -> list[dict]:
     """
     재정렬 캐시 → PostgreSQL 순서로 로드.
     재정렬 버튼을 누른 경우 캐시 파일이 존재하며, 해당 순서가 WebSocket 구독 순서가 됨.
+    top_n: 최대 반환 종목 수 (재정렬/DB 모두 적용).
     """
     import json as _json
     logger = logging.getLogger("main")
 
-    # 재정렬 캐시가 있으면 우선 사용
+    # 재정렬 캐시가 있으면 우선 사용 (당일 유효)
     if _RERANK_CACHE_FILE.exists():
         try:
             cached = _json.loads(_RERANK_CACHE_FILE.read_text())
-            if cached.get("market") == market:
+            cache_date = cached.get("date", "")
+            today_str  = str(date.today())
+            if cache_date != today_str:
+                _RERANK_CACHE_FILE.unlink(missing_ok=True)
+                logger.info("재정렬 캐시 만료 (저장일: %s) — 삭제", cache_date)
+            elif cached.get("market") == market:
                 results = cached.get("results", [])
                 if results:
+                    results = results[:top_n]
                     logger.info("재정렬 캐시 사용: %s %d개 (재정렬 점수 기준)", market, len(results))
                     return [
                         {
@@ -350,7 +364,7 @@ def _load_candidates(market: str) -> list[dict]:
                 "current_price": float(r[3]),
                 "final_score":   float(r[4]),
             }
-            for r in rows
+            for r in rows[:top_n]
         ]
     except Exception as e:
         logger.error("PostgreSQL 로드 실패: %s", e)
@@ -362,6 +376,7 @@ def _load_candidates(market: str) -> list[dict]:
 # 실전 매매 상수
 _LIVE_ENTRY_LIMITS   = {"gap": 1, "breakout": 2, "pullback": 3}
 _REGIME_REFRESH_SEC  = 30 * 60   # 30분마다 장세 재감지
+_OVERSEAS_WS_LIMIT   = 2         # KIS HDFSCNT0 세션당 구독 한도
 _CLOSE_HOUR, _CLOSE_MIN = 15, 20 # 국내 장마감 자동 청산 시각
 _MAX_HOLD_DAYS       = {"gap": 0, "breakout": 1, "pullback": 2}  # 전략별 최대 오버나잇
 _INTRADAY_ONLY       = {"gap"}    # 15:20 당일 강제 청산 전략
@@ -422,8 +437,10 @@ def _overseas_regime(now: datetime, config: dict):
     us_end   = _parse_hhmm(sched.get("us_trading_end_time", "05:00"), (5, 0))
     in_us_session = _is_between_cross_midnight(now, us_start, us_end)
 
-    # KIS 주간거래: 10:00~22:00
-    in_daytime = (10, 0) <= (now.hour, now.minute) < (22, 0)
+    # KIS 주간거래: config 기준 (기본 10:00~16:00)
+    dt_start = _parse_hhmm(sched.get("us_daytime_start", "10:00"), (10, 0))
+    dt_end   = _parse_hhmm(sched.get("us_daytime_end",   "16:00"), (16, 0))
+    in_daytime = dt_start <= (now.hour, now.minute) < dt_end
 
     tradeable = in_us_session or in_daytime
 
@@ -460,6 +477,71 @@ def _overseas_regime(now: datetime, config: dict):
     )
 
 
+_ACCOUNT_EXCHANGE_TO_INTERNAL = {
+    "NASD": "NAS",
+    "NYSE": "NYS",
+    "AMEX": "AMS",
+}
+
+
+def _hydrate_positions_from_account(comp: dict, market: str) -> list[dict]:
+    """실제 계좌 보유분을 OrderManager 메모리에 복원하고 감시용 후보를 반환."""
+    import logging as _logging
+    from kis.constants import ExchangeCode
+
+    logger = _logging.getLogger("main.trading")
+    order_mgr: OrderManager = comp["order_mgr"]
+    config = comp["config"]
+    restored: list[dict] = []
+
+    if market not in ("overseas", "both"):
+        return restored
+
+    exchanges = (
+        config.get("universe", {})
+        .get("overseas", {})
+        .get("exchanges", ["NAS", "NYS", "AMS"])
+    )
+    seen: set[str] = set()
+    for exch in exchanges:
+        try:
+            balance = comp["overseas"].get_balance(ExchangeCode(exch))
+        except Exception as e:
+            logger.warning("해외 보유분 조회 실패 (%s): %s", exch, e)
+            continue
+        for row in balance.get("positions") or []:
+            code = str(row.get("ovrs_pdno") or "").strip()
+            if not code or code in seen:
+                continue
+            qty = int(float(row.get("ovrs_cblc_qty") or 0))
+            if qty <= 0:
+                continue
+            seen.add(code)
+            account_exchange = str(row.get("ovrs_excg_cd") or "").strip()
+            internal_exchange = _ACCOUNT_EXCHANGE_TO_INTERNAL.get(account_exchange, exch)
+            name = row.get("ovrs_item_name") or code
+            entry_price = float(row.get("pchs_avg_pric") or 0)
+            current_price = float(row.get("now_pric2") or entry_price or 0)
+            order_mgr.restore_position(
+                stock_code=code,
+                name=name,
+                exchange=internal_exchange,
+                qty=qty,
+                entry_price=entry_price,
+                current_price=current_price,
+                strategy="breakout",
+            )
+            restored.append({
+                "stock_code": code,
+                "name": name,
+                "exchange": internal_exchange,
+                "current_price": current_price,
+                "final_score": 0.0,
+                "context": {},
+            })
+    return restored
+
+
 async def _run_trading_loop(comp: dict, market: str = "both"):
     """WebSocket 구독 설정 후 실시간 매매 루프 실행."""
     from datetime import datetime, date as _date
@@ -471,24 +553,27 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
     router    = comp.get("strategy_router")
     detector  = comp.get("regime_detector")
     mode      = TradingMode(comp["config"]["mode"])
+    trade_top_n = int(comp["config"].get("trading", {}).get("trade_top_n", 10))
 
     if market == "domestic":
-        all_candidates = _load_candidates("domestic")
+        all_candidates = _load_candidates("domestic", trade_top_n)
     elif market == "overseas":
-        all_candidates = _load_candidates("overseas")
+        all_candidates = _load_candidates("overseas", trade_top_n)
     else:
-        all_candidates = _load_candidates("domestic") + _load_candidates("overseas")
-
-    # 재정렬 캐시를 사용한 경우 로드 후 삭제 (다음 날 재사용 방지)
-    if _RERANK_CACHE_FILE.exists():
-        try:
-            _RERANK_CACHE_FILE.unlink()
-            logger.info("재정렬 캐시 소비 완료 — 삭제")
-        except Exception:
-            pass
+        all_candidates = _load_candidates("domestic", trade_top_n) + _load_candidates("overseas", trade_top_n)
 
     if not all_candidates:
         logger.warning("추천 종목 없음")
+
+    restored_candidates = _hydrate_positions_from_account(comp, market)
+    existing_codes = {c["stock_code"] for c in all_candidates}
+    for c in restored_candidates:
+        if c["stock_code"] not in existing_codes:
+            all_candidates.append(c)
+            existing_codes.add(c["stock_code"])
+
+    if not all_candidates:
+        logger.warning("추천 종목/보유 종목 없음")
         return
 
     # ── 초기 장세 감지 ───────────────────────────────────────────────
@@ -558,6 +643,10 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
         )
 
     order_mgr.start_fill_timeout_poller()
+    order_mgr.start_fill_reconciliation_poller()
+
+    _overseas_ws_count = 0
+    _poll_list: list[tuple] = []   # (code, exchange, handler) — WebSocket 한도 초과 종목
 
     for c in all_candidates:
         code     = c["stock_code"]
@@ -598,28 +687,14 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
                     logger.info("[%s] 분봉 프리로드 완료: 1분봉 %d봉", code, len(df_1m))
             except Exception as e:
                 logger.warning("[%s] 분봉 프리로드 실패 (무시): %s", code, e)
-        else:
-            try:
-                from kis.constants import ExchangeCode as _EC
-                cache_path = Path(f"data/cache/{code}_{exchange}_1min.pkl")
-                if cache_path.exists():
-                    # 캐시 있을 때만 프리로드 — 없으면 스킵하고 WebSocket 먼저 연결
-                    df_1m = comp["overseas"].get_historical_minute_ohlcv(
-                        code, _EC(exchange), lookback_days=2, candle_minutes=1,
-                    )
-                    if not df_1m.empty:
-                        _preloaded[1]  = df_1m
-                        _preloaded[5]  = comp["overseas"].get_historical_minute_ohlcv(
-                            code, _EC(exchange), lookback_days=2, candle_minutes=5,
-                        )
-                        _preloaded[15] = comp["overseas"].get_historical_minute_ohlcv(
-                            code, _EC(exchange), lookback_days=2, candle_minutes=15,
-                        )
-                        logger.info("[%s] 해외 분봉 프리로드 완료: 1분봉 %d봉", code, len(df_1m))
-                else:
-                    logger.info("[%s] 해외 분봉 캐시 없음 → 프리로드 스킵 (WebSocket 우선)", code)
-            except Exception as e:
-                logger.warning("[%s] 해외 분봉 프리로드 실패 (무시): %s", code, e)
+
+            # 프리로드 데이터로 신호 상태 즉시 초기화
+            if _preloaded.get(1) is not None:
+                try:
+                    _update_signal_state(code, float(c.get("current_price", 0) or 0), _preloaded, context)
+                except Exception:
+                    pass
+        # 해외 종목은 프리로드 없음 — 폴링 틱이 쌓이면서 자연스럽게 EMA 구성
 
         def make_handler(stock_code, name, exch, _parse_fn, _base_ctx,
                          _regime_state, _shared, _pre=None):
@@ -777,10 +852,15 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
 
             return handler
 
-        ws.subscribe(tr_id, subscribe_key,
-                     make_handler(code, c["name"], exchange, parse_fn,
-                                  context, regime_state, live_shared,
-                                  _pre=_preloaded))
+        _handler = make_handler(code, c["name"], exchange, parse_fn,
+                                context, regime_state, live_shared,
+                                _pre=_preloaded)
+        if is_overseas and _overseas_ws_count >= _OVERSEAS_WS_LIMIT:
+            _poll_list.append((code, exchange, _handler))
+        else:
+            ws.subscribe(tr_id, subscribe_key, _handler)
+            if is_overseas:
+                _overseas_ws_count += 1
 
         # 국내 종목은 호가(H0STASP0)도 구독
         if not is_overseas:
@@ -792,7 +872,41 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
             ws.subscribe(WebSocketTRID.DOMESTIC_ASKBID, code, _make_askbid_handler(code))
 
     comp["ws"] = ws
-    await ws.run()
+
+    async def _poll_overseas(overseas_api, entries, interval_sec: int = 60):
+        """WebSocket 한도 초과 종목 REST 폴링 (60초 간격)."""
+        from kis.constants import ExchangeCode as _EC
+        _plog = logging.getLogger("main.trading.poll")
+        while True:
+            for poll_code, poll_exch, poll_handler in entries:
+                try:
+                    data = overseas_api.get_price(poll_code, _EC(poll_exch))
+                    price_str = str(data.get("last", "") or data.get("close", "") or "")
+                    if not price_str:
+                        continue
+                    now = datetime.now()
+                    fields = [
+                        poll_code,
+                        now.strftime("%Y%m%d"),
+                        now.strftime("%H%M%S"),
+                        price_str,
+                        data.get("sign", ""),
+                        data.get("diff", ""),
+                        data.get("rate", ""),
+                        str(data.get("evol", "0") or "0"),
+                        str(data.get("tamt", "0") or "0"),
+                    ]
+                    poll_handler("HDFSCNT0", fields)
+                except Exception as e:
+                    _plog.warning("[%s] 가격 폴링 실패: %s", poll_code, e)
+                await asyncio.sleep(0.1)  # 종목 간 rate-limit 간격
+            await asyncio.sleep(interval_sec)
+
+    if _poll_list:
+        logger.info("REST 폴링 등록: %d개 종목 (60초 간격)", len(_poll_list))
+        await asyncio.gather(ws.run(), _poll_overseas(comp["overseas"], _poll_list))
+    else:
+        await ws.run()
 
 
 def _get_hts_id(config: dict) -> str:

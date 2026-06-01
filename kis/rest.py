@@ -43,7 +43,12 @@ class KISRestClient:
         return self._handle(resp)
 
     def _handle(self, resp: requests.Response) -> dict:
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            body = resp.text[:1000] if resp.text else ""
+            logger.error("KIS HTTP 오류 [%s] %s: %s", resp.status_code, resp.url, body)
+            raise e
         data = resp.json()
         if data.get("rt_cd") != "0":
             logger.error("KIS API 오류 [%s]: %s", data.get("msg_cd"), data.get("msg1"))

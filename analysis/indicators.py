@@ -4,39 +4,45 @@ import pandas_ta as ta
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """OHLCV DataFrame에 기술적 지표를 추가하여 반환."""
-    if df.empty or len(df) < 20:
+    if df.empty:
         return df
 
     df = df.copy()
 
-    # 이동평균
-    df["ema5"] = ta.ema(df["close"], length=5)
-    df["ema20"] = ta.ema(df["close"], length=20)
-    df["ema60"] = ta.ema(df["close"], length=60)
+    close = df["close"].astype(float)
+
+    # 이동평균은 실시간 차트/초반 전략 판단에서도 보여야 하므로 첫 봉부터 계산한다.
+    df["ema5"] = close.ewm(span=5, adjust=False).mean()
+    df["ema20"] = close.ewm(span=20, adjust=False).mean()
+    df["ema60"] = close.ewm(span=60, adjust=False).mean()
 
     # MACD (12, 26, 9)
-    macd = ta.macd(df["close"], fast=12, slow=26, signal=9)
-    if macd is not None:
-        df["macd"] = macd.get("MACD_12_26_9")
-        df["macd_signal"] = macd.get("MACDs_12_26_9")
-        df["macd_hist"] = macd.get("MACDh_12_26_9")
+    if len(df) >= 26:
+        macd = ta.macd(close, fast=12, slow=26, signal=9)
+        if macd is not None:
+            df["macd"] = macd.get("MACD_12_26_9")
+            df["macd_signal"] = macd.get("MACDs_12_26_9")
+            df["macd_hist"] = macd.get("MACDh_12_26_9")
 
     # RSI (14)
-    df["rsi"] = ta.rsi(df["close"], length=14)
+    if len(df) >= 14:
+        df["rsi"] = ta.rsi(close, length=14)
 
     # Bollinger Band (20, 2)
-    bb = ta.bbands(df["close"], length=20, std=2)
-    if bb is not None:
-        df["bb_upper"] = bb.get("BBU_20_2.0")
-        df["bb_mid"] = bb.get("BBM_20_2.0")
-        df["bb_lower"] = bb.get("BBL_20_2.0")
-        df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+    if len(df) >= 20:
+        bb = ta.bbands(close, length=20, std=2)
+        if bb is not None:
+            df["bb_upper"] = bb.get("BBU_20_2.0")
+            df["bb_mid"] = bb.get("BBM_20_2.0")
+            df["bb_lower"] = bb.get("BBL_20_2.0")
+            df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
 
     # ATR (14)
-    df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+    if len(df) >= 14:
+        df["atr"] = ta.atr(df["high"], df["low"], close, length=14)
 
     # OBV
-    df["obv"] = ta.obv(df["close"], df["volume"])
+    df["obv"] = ta.obv(close, df["volume"])
 
     # 거래량 이동평균 및 비율
     df["vol_ma20"] = df["volume"].rolling(20).mean()

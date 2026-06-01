@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, date
 
 import yaml
 from fastapi import FastAPI, BackgroundTasks, HTTPException
@@ -26,7 +26,6 @@ from analysis import backtester as bt_module
 from analysis.indicators import calculate_indicators
 from trading.order_manager import OrderManager
 from trading.risk import RiskManager
-from trading.strategy import DayTradingStrategy
 from report.logger import TradeLogger
 from db.pg_writer import PGWriter, PGWriterSync
 
@@ -47,6 +46,81 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _auto_scheduler(config: dict):
+    """서버 시작 시 백그라운드에서 자동 분析→재정렬→매매시작→중단 스케줄링."""
+    import schedule as _sched
+    import time
+    import requests as _req
+
+    BASE = "http://localhost:8000"
+    sched_cfg = config.get("schedule", {})
+    analysis_offset = int(sched_cfg.get("analysis_offset_min", 30))
+    rerank_offset   = int(sched_cfg.get("rerank_offset_min",   10))
+
+    def _minus(t: str, mins: int) -> str:
+        h, m = map(int, t.split(":"))
+        total = (h * 60 + m - mins) % 1440
+        return f"{total // 60:02d}:{total % 60:02d}"
+
+    dom_start = sched_cfg.get("domestic_analysis_time",    "09:00")
+    dom_end   = sched_cfg.get("domestic_trading_end_time", "15:20")
+    us_start  = sched_cfg.get("us_analysis_time",          "22:30")
+    us_end    = sched_cfg.get("us_trading_end_time",        "05:00")
+
+    def _analyze(market: str):
+        try:
+            _req.post(f"{BASE}/analyze",
+                      json={"market": market, "top_n": 30, "horizon": "daytrade"},
+                      timeout=10)
+            logger.info("[자동스케줄] %s 분析 요청", market)
+        except Exception as e:
+            logger.warning("[자동스케줄] 분析 요청 실패: %s", e)
+
+    def _rerank(market: str):
+        try:
+            _req.post(f"{BASE}/analyze/rerank?market={market}&horizon=daytrade", timeout=60)
+            logger.info("[자동스케줄] %s 재정렬 완료", market)
+        except Exception as e:
+            logger.warning("[자동스케줄] 재정렬 실패: %s", e)
+
+    def _trade_start(market: str):
+        try:
+            _req.post(f"{BASE}/trade/start", json={"market": market}, timeout=10)
+            logger.info("[자동스케줄] %s 매매 시작", market)
+        except Exception as e:
+            logger.warning("[자동스케줄] 매매 시작 실패: %s", e)
+
+    def _trade_stop():
+        try:
+            _req.post(f"{BASE}/trade/stop", timeout=10)
+            logger.info("[자동스케줄] 매매 중단")
+        except Exception as e:
+            logger.warning("[자동스케줄] 매매 중단 실패: %s", e)
+
+    # 국장 (domestic)
+    _sched.every().day.at(_minus(dom_start, analysis_offset)).do(_analyze, market="domestic")
+    _sched.every().day.at(_minus(dom_start, rerank_offset)).do(_rerank,    market="domestic")
+    _sched.every().day.at(dom_start).do(_trade_start,                      market="domestic")
+    _sched.every().day.at(dom_end).do(_trade_stop)
+
+    # 미장 야간 (overseas)
+    _sched.every().day.at(_minus(us_start, analysis_offset)).do(_analyze,  market="overseas")
+    _sched.every().day.at(_minus(us_start, rerank_offset)).do(_rerank,     market="overseas")
+    _sched.every().day.at(us_start).do(_trade_start,                       market="overseas")
+    _sched.every().day.at(us_end).do(_trade_stop)
+
+    logger.info(
+        "[자동스케줄] 등록 완료\n"
+        "  국장: 분析 %s → 재정렬 %s → 매매 %s → 중단 %s\n"
+        "  미장: 분析 %s → 재정렬 %s → 매매 %s → 중단 %s",
+        _minus(dom_start, analysis_offset), _minus(dom_start, rerank_offset), dom_start, dom_end,
+        _minus(us_start,  analysis_offset), _minus(us_start,  rerank_offset), us_start,  us_end,
+    )
+
+    while True:
+        _sched.run_pending()
+        time.sleep(10)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _components
@@ -62,6 +136,18 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("stuck analysis 정리 실패 (무시): %s", e)
     logger.info("FastAPI 엔진 초기화 완료")
+    schedule_cfg = config.get("schedule", {})
+    mode = str(config.get("mode", "")).lower()
+    if schedule_cfg.get("auto", False) and mode == "live" and not schedule_cfg.get("allow_live_auto_trading", False):
+        logger.warning(
+            "자동 스케줄러 비활성화: live 모드는 schedule.allow_live_auto_trading=true 필요"
+        )
+    elif schedule_cfg.get("auto", False):
+        t = threading.Thread(
+            target=_auto_scheduler, args=(config,), daemon=True, name="auto-scheduler"
+        )
+        t.start()
+        logger.info("자동 스케줄러 시작")
     yield
     logger.info("FastAPI 엔진 종료")
 
@@ -117,7 +203,7 @@ def health():
     }
 
 
-_balance_cache: dict = {}  # key: market → {data, ts}
+_balance_cache: dict = {}  # key: "{mode}:{market}" → {data, ts}
 _BALANCE_CACHE_SEC = 30
 
 @app.get("/account/balance")
@@ -130,36 +216,60 @@ def account_balance(market: str = "domestic", mode: str | None = None):
             detail=f"현재 엔진은 {engine_mode} 모드입니다. {mode} 잔고를 조회할 수 없습니다.",
         )
 
-    cached = _balance_cache.get(market)
+    cache_key = f"{engine_mode}:{market}"
+    cached = _balance_cache.get(cache_key)
     if cached and (datetime.now().timestamp() - cached["ts"]) < _BALANCE_CACHE_SEC:
         return cached["data"]
 
     try:
         if market == "overseas":
-            balance  = _components["overseas"].get_balance()
-            summary  = balance.get("summary") or {}
-            positions = balance.get("positions") or []
+            from kis.constants import ExchangeCode
+
+            configured = (
+                config.get("universe", {})
+                .get("overseas", {})
+                .get("exchanges", ["NAS", "NYS", "AMS"])
+            )
+            positions = []
+            summaries = []
+            seen = set()
+            for exch in configured:
+                try:
+                    balance = _components["overseas"].get_balance(ExchangeCode(exch))
+                except Exception:
+                    continue
+                summaries.append(balance.get("summary") or {})
+                for pos in balance.get("positions") or []:
+                    key = (pos.get("ovrs_excg_cd"), pos.get("ovrs_pdno"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    positions.append(pos)
             # output2에 현금 예수금 없음 — 보유 주식 평가금액 합산
             stock_value  = sum(_to_float(p.get("ovrs_stck_evlu_amt")) for p in positions)
-            purchase_amt = _to_float(summary.get("frcr_buy_amt_smtl1"))
-            evlu_pfls    = _to_float(summary.get("tot_evlu_pfls_amt"))
-            total = stock_value if stock_value > 0 else purchase_amt + evlu_pfls
-            cash  = _components["overseas"].get_foreign_margin_usd()
-            total = total + cash  # 주식평가금액 + 현금예수금
+            purchase_amt = sum(_to_float(s.get("frcr_pchs_amt1")) for s in summaries)
+            evlu_pfls    = sum(_to_float(s.get("ovrs_tot_pfls")) for s in summaries)
+            raw_cash = _components["overseas"].get_foreign_margin_usd()
+            # foreign-margin은 체결 직후에도 원 예수금처럼 내려오는 경우가 있어
+            # 보유 매입금액을 차감한 값을 대시보드용 가용 현금으로 표시한다.
+            cash = max(raw_cash - purchase_amt, 0) if purchase_amt > 0 else raw_cash
+            total = (stock_value if stock_value > 0 else purchase_amt + evlu_pfls) + cash
             result = {
                 "market": "overseas",
                 "mode": engine_mode,
                 "currency": "USD",
                 "cash": cash,
+                "rawCash": raw_cash,
                 "totalAssets": total,
                 "positionValue": stock_value,
                 "positionCount": len(positions),
-                "totalPnl":  _to_float(summary.get("ovrs_tot_pfls")),
-                "totalPnlPct": _to_float(summary.get("tot_pftrt")),
-                "summary": summary,
+                "totalPnl": evlu_pfls,
+                "totalPnlPct": round(evlu_pfls / purchase_amt * 100, 4) if purchase_amt > 0 else 0,
+                "summary": summaries[0] if summaries else {},
+                "positions": positions,
                 "updatedAt": datetime.now().isoformat(),
             }
-            _balance_cache[market] = {"data": result, "ts": datetime.now().timestamp()}
+            _balance_cache[cache_key] = {"data": result, "ts": datetime.now().timestamp()}
             return result
 
         balance = _components["domestic"].get_balance()
@@ -179,7 +289,7 @@ def account_balance(market: str = "domestic", mode: str | None = None):
             "summary": summary,
             "updatedAt": datetime.now().isoformat(),
         }
-        _balance_cache[market] = {"data": result, "ts": datetime.now().timestamp()}
+        _balance_cache[cache_key] = {"data": result, "ts": datetime.now().timestamp()}
         return result
     except Exception as e:
         logger.exception("계좌 잔고 조회 실패")
@@ -339,7 +449,7 @@ async def rerank(market: str = "domestic", horizon: str = "daytrade"):
     def _to_float(v):
         return float(v) if v is not None else 0.0
 
-    cache = {"market": market, "horizon": horizon, "results": [
+    cache = {"market": market, "horizon": horizon, "date": str(date.today()), "results": [
         {
             "stock_code":    r["stock_code"],
             "stock_name":    r["stock_name"],
@@ -615,6 +725,20 @@ def get_pending_orders(mode: str | None = None):
     if order_mgr is None:
         raise HTTPException(status_code=503, detail="엔진 초기화 중")
     return order_mgr.get_pending_order_rows()
+
+
+@app.get("/trade/orders/fills")
+def get_order_fills(market: str = "overseas", mode: str | None = None):
+    config = _components.get("config") or {}
+    engine_mode = config.get("mode")
+    if mode and engine_mode and mode != engine_mode:
+        return []
+    try:
+        if market == "overseas":
+            return _components["overseas"].get_daily_orders()
+        return _components["domestic"].get_daily_orders()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @app.get("/signals")

@@ -33,8 +33,14 @@ backtest:
   daytrade_lookback_days: 10
 
 schedule:
-  domestic_analysis_time: "08:00"
+  auto: false
+  allow_live_auto_trading: false # live 자동매매를 명시적으로 허용할 때만 true
+  analysis_offset_min: 30
+  rerank_offset_min: 10
+  domestic_analysis_time: "09:00"
   domestic_trading_end_time: "15:20"
+  us_daytime_start: "10:00"
+  us_daytime_end: "16:00"
   us_analysis_time: "22:30"
   us_trading_end_time: "05:00"
   report_time: "16:00"

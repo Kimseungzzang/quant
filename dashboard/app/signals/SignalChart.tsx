@@ -34,6 +34,7 @@ type SignalMap = Record<string, StockSignal>;
 
 function fmtTime(iso: string) {
   try {
+    if (!iso || /^\d+$/.test(iso)) return "";
     const d = new Date(iso);
     if (isNaN(d.getTime())) return iso.slice(11, 16);
     return d.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" });
@@ -53,10 +54,11 @@ function StockChart({ code, signal }: { code: string; signal: StockSignal }) {
 
   const chartData = candles.map((c) => ({
     t: fmtTime(c.t),
+    rawTime: c.t,
     price: c.c,
     ema5: c.ema5,
     ema20: c.ema20,
-  }));
+  })).filter((d) => d.t);
 
   // 진입 조건 평가
   const brokOut   = resistance != null && price > resistance * 1.003;

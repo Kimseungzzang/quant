@@ -19,6 +19,12 @@ _CACHE_DIR = Path("data/cache")
 _DAYTIME_START = dtime(10, 0)
 _DAYTIME_END   = dtime(22, 0)
 
+_ORDER_EXCHANGE_CODE = {
+    ExchangeCode.NASDAQ: "NASD",
+    ExchangeCode.NYSE: "NYSE",
+    ExchangeCode.AMEX: "AMEX",
+}
+
 
 def _is_daytime() -> bool:
     """현재 시각이 KIS 주간거래 시간대인지 확인."""
@@ -47,6 +53,15 @@ class OverseasAPI:
         if self.is_paper:
             return OverseasTRID.SELL_PAPER
         return OverseasTRID.SELL_LIVE if not _is_daytime() else OverseasTRID.DAYTIME_SELL_LIVE
+
+    def _order_path(self) -> str:
+        if not self.is_paper and _is_daytime():
+            return OverseasPath.DAYTIME_ORDER
+        return OverseasPath.ORDER
+
+    @staticmethod
+    def _order_exchange(exchange: ExchangeCode) -> str:
+        return _ORDER_EXCHANGE_CODE.get(exchange, str(exchange))
 
     # ── 시세 조회 ──────────────────────────────────────────────────────
 
@@ -113,7 +128,9 @@ class OverseasAPI:
         cached_df = self._load_cache(cache_file)
         if cached_df is not None and not cached_df.empty:
             cutoff = pd.Timestamp(date.today() - timedelta(days=lookback_days))
-            if cached_df["datetime"].min() <= cutoff:
+            today_start = pd.Timestamp(date.today())
+            has_today = cached_df["datetime"].max() >= today_start
+            if has_today:
                 result = cached_df[cached_df["datetime"] >= cutoff]
                 return self._aggregate(result, candle_minutes)
 
@@ -233,21 +250,23 @@ class OverseasAPI:
         exchange: ExchangeCode,
         qty: int,
         price: float,
-        order_type: OrderDivision = OrderDivision.MARKET,
+        order_type: OrderDivision = OrderDivision.LIMIT,
     ) -> dict:
-        order_price = 0 if order_type == OrderDivision.MARKET else price
+        order_price = price
         tr_id = self._buy_tr_id()
         body = {
             "CANO":            self.account_no,
             "ACNT_PRDT_CD":    self.acnt_prdt_cd,
-            "OVRS_EXCG_CD":    exchange,
+            "OVRS_EXCG_CD":    self._order_exchange(exchange),
             "PDNO":            stock_code,
             "ORD_DVSN":        order_type,
             "ORD_QTY":         str(qty),
-            "OVRS_ORD_UNPR":   str(order_price),
+            "OVRS_ORD_UNPR":   f"{float(order_price):.2f}",
+            "CTAC_TLNO":       "",
+            "MGCO_APTM_ODNO":  "",
             "ORD_SVR_DVSN_CD": "0",
         }
-        data = self.client.post(OverseasPath.ORDER, tr_id, body)
+        data = self.client.post(self._order_path(), tr_id, body)
         logger.info("해외 매수: %s(%s) %d주 @ %.2f [TR:%s]", stock_code, exchange, qty, price, tr_id)
         return data["output"]
 
@@ -257,22 +276,24 @@ class OverseasAPI:
         exchange: ExchangeCode,
         qty: int,
         price: float,
-        order_type: OrderDivision = OrderDivision.MARKET,
+        order_type: OrderDivision = OrderDivision.LIMIT,
     ) -> dict:
-        order_price = 0 if order_type == OrderDivision.MARKET else price
+        order_price = price
         tr_id = self._sell_tr_id()
         body = {
             "CANO":            self.account_no,
             "ACNT_PRDT_CD":    self.acnt_prdt_cd,
-            "OVRS_EXCG_CD":    exchange,
+            "OVRS_EXCG_CD":    self._order_exchange(exchange),
             "PDNO":            stock_code,
             "ORD_DVSN":        order_type,
             "ORD_QTY":         str(qty),
-            "OVRS_ORD_UNPR":   str(order_price),
+            "OVRS_ORD_UNPR":   f"{float(order_price):.2f}",
+            "CTAC_TLNO":       "",
+            "MGCO_APTM_ODNO":  "",
             "ORD_SVR_DVSN_CD": "0",
             "SLL_TYPE":        "00",
         }
-        data = self.client.post(OverseasPath.ORDER, tr_id, body)
+        data = self.client.post(self._order_path(), tr_id, body)
         logger.info("해외 매도: %s(%s) %d주 @ %.2f [TR:%s]", stock_code, exchange, qty, price, tr_id)
         return data["output"]
 
@@ -302,6 +323,32 @@ class OverseasAPI:
             "positions": data.get("output1", []),
             "summary":   summary,
         }
+
+    def get_daily_orders(self) -> list[dict]:
+        """오늘 해외주식 주문/체결내역 조회."""
+        today = date.today().strftime("%Y%m%d")
+        tr_id = OverseasTRID.FILLS_PAPER if self.is_paper else OverseasTRID.FILLS_LIVE
+        data = self.client.get(
+            OverseasPath.DAILY_ORDERS,
+            tr_id,
+            {
+                "CANO": self.account_no,
+                "ACNT_PRDT_CD": self.acnt_prdt_cd,
+                "PDNO": "%" if not self.is_paper else "",
+                "ORD_STRT_DT": today,
+                "ORD_END_DT": today,
+                "SLL_BUY_DVSN": "00",
+                "CCLD_NCCS_DVSN": "00",
+                "OVRS_EXCG_CD": "%%" if not self.is_paper else "",
+                "SORT_SQN": "DS",
+                "ORD_DT": "",
+                "ORD_GNO_BRNO": "",
+                "ODNO": "",
+                "CTX_AREA_NK200": "",
+                "CTX_AREA_FK200": "",
+            },
+        )
+        return data.get("output") or data.get("output1") or []
 
     def get_foreign_margin_usd(self) -> float:
         """USD 외화예수금 조회 (해외증거금 통화별조회, live 전용)."""

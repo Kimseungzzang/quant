@@ -137,16 +137,18 @@ class OverseasTRID(StrEnum):
     SELL_LIVE         = "TTTT1006U"
     BALANCE_LIVE      = "TTTS3012R"
     DAILY_ORDERS_LIVE = "TTTS2003R"
+    FILLS_LIVE        = "TTTS3035R"
 
-    # 주문/계좌 (실전 — 주간거래 10:00~22:00)
-    DAYTIME_BUY_LIVE  = "JTTT1002U"
-    DAYTIME_SELL_LIVE = "JTTT1006U"
+    # 주문/계좌 (실전 — 미국 주간거래)
+    DAYTIME_BUY_LIVE  = "TTTS6036U"
+    DAYTIME_SELL_LIVE = "TTTS6037U"
 
     # 주문/계좌 (모의 — 야간/주간 공용)
     BUY_PAPER          = "VTTT1002U"
     SELL_PAPER         = "VTTT1001U"
     BALANCE_PAPER      = "VTTS3012R"
     DAILY_ORDERS_PAPER = "VTTS2003R"
+    FILLS_PAPER        = "VTTS3035R"
     FOREIGN_MARGIN     = "TTTC2101R"   # 해외증거금 통화별조회 (live only)
 
 
@@ -180,6 +182,7 @@ class DomesticPath(StrEnum):
 
 class OverseasPath(StrEnum):
     ORDER        = "/uapi/overseas-stock/v1/trading/order"
+    DAYTIME_ORDER = "/uapi/overseas-stock/v1/trading/daytime-order"
     BALANCE         = "/uapi/overseas-stock/v1/trading/inquire-balance"
     FOREIGN_MARGIN  = "/uapi/overseas-stock/v1/trading/foreign-margin"
     DAILY_ORDERS = "/uapi/overseas-stock/v1/trading/inquire-ccnl"
