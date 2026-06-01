@@ -281,7 +281,7 @@ async def rerank(market: str = "domestic", horizon: str = "daytrade"):
     if not results:
         raise HTTPException(status_code=404, detail="분석 결과 없음.")
 
-    # 2) 실시간 거래량 순위 조회
+    # 2) 실시간 거래량 순위 조회 (KIS API 기본 정렬 = 거래량 기준)
     try:
         from kis.constants import ExchangeCode
         if market == "domestic":
@@ -292,34 +292,26 @@ async def rerank(market: str = "domestic", horizon: str = "daytrade"):
             vol_rank = await loop.run_in_executor(None, lambda: overseas.get_volume_ranking(exch))
             vol_map  = {r.get("symb", ""): idx for idx, r in enumerate(vol_rank)}
     except Exception as e:
-        logger.warning("거래량순위 조회 실패: %s → 거래량 가중치 없이 반환", e)
+        logger.warning("거래량순위 조회 실패: %s → 가중치 없이 반환", e)
         vol_map = {}
 
-    # 3) 갭 + 거래량 기반 재정렬 점수 계산
+    # 3) 갭 + 거래대금 기반 재정렬 점수 계산
     reranked = []
     for r in results:
-        code      = r["stock_code"]
+        code       = r["stock_code"]
         base_score = float(r.get("final_score") or 0)
 
-        # 거래량 순위 보너스: 1위=+30, 10위=+20, 50위=+5, 없음=0
+        # 거래대금 순위 보너스: 1위=+30, 10위=+25, 50위=+5, 없음=0
         vol_idx   = vol_map.get(code)
-        if vol_idx is not None:
-            vol_bonus = max(30 - vol_idx * 0.5, 0)
-        else:
-            vol_bonus = 0
+        vol_bonus = max(30 - (vol_idx or 9999) * 0.5, 0) if vol_idx is not None else 0
 
-        # 갭 보너스: 현재가 vs 전일종가 (갭 1% 당 +2점, 최대 +20)
+        # 갭 보너스: KIS 현재가 응답의 prdy_ctrt(전일대비율%) 활용
         gap_bonus = 0
         try:
             if market == "domestic":
                 price_data = await loop.run_in_executor(None, lambda c=code: domestic.get_price(c))
-                cur   = float(price_data.get("stck_prpr") or 0)
-                prev  = float(price_data.get("bstp_kor_isnm") or 0)   # 전일 종가는 별도 필드
-                # 전일 종가는 일봉 마지막 close 사용
-                prev  = float(price_data.get("stck_prdy_clpr") or price_data.get("prdy_vrss") or 0)
-                if cur > 0 and prev > 0:
-                    gap_pct   = (cur - prev) / prev * 100
-                    gap_bonus = min(abs(gap_pct) * 2, 20)
+                gap_pct    = float(price_data.get("prdy_ctrt") or 0)
+                gap_bonus  = min(abs(gap_pct) * 2, 20)
         except Exception:
             pass
 
