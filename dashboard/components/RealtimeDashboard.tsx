@@ -53,7 +53,8 @@ export default function RealtimeDashboard({
   const [summary, setSummary] = useState<PnlSummary | null>(initialSummary);
   const [positions, setPositions] = useState(initialPositions);
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
-  const [balance, setBalance] = useState<AccountBalance | null>(null);
+  const [balanceKrw, setBalanceKrw] = useState<AccountBalance | null>(null);
+  const [balanceUsd, setBalanceUsd] = useState<AccountBalance | null>(null);
   const [balanceLoading, setBalanceLoading] = useState(false);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
@@ -62,8 +63,12 @@ export default function RealtimeDashboard({
   async function refreshBalance() {
     setBalanceLoading(true);
     try {
-      const b = await fetchJson<AccountBalance>(`/api/command/account/balance?market=domestic&mode=${mode}`);
-      setBalance(b);
+      const [krw, usd] = await Promise.allSettled([
+        fetchJson<AccountBalance>(`/api/command/account/balance?market=domestic`),
+        fetchJson<AccountBalance>(`/api/command/account/balance?market=overseas`),
+      ]);
+      if (krw.status === "fulfilled") setBalanceKrw(krw.value);
+      if (usd.status === "fulfilled") setBalanceUsd(usd.value);
     } catch { /* ignore */ } finally {
       setBalanceLoading(false);
     }
@@ -126,14 +131,19 @@ export default function RealtimeDashboard({
 
       <div className="grid grid-cols-2 gap-4">
         <StatCard
-          label="계좌 평가"
-          value={balance ? fmtMoney(balance.totalAssets, balance.currency) : "-"}
-          sub={balance ? `현금 ${fmtMoney(balance.cash, balance.currency)} · ${balance.positionCount}종목` : undefined}
+          label="🇰🇷 국내 계좌"
+          value={balanceKrw ? fmtMoney(balanceKrw.totalAssets, balanceKrw.currency) : "-"}
+          sub={balanceKrw ? `현금 ${fmtMoney(balanceKrw.cash, balanceKrw.currency)} · ${balanceKrw.positionCount}종목` : undefined}
           action={
             <button onClick={refreshBalance} disabled={balanceLoading} className="text-gray-500 hover:text-gray-300 disabled:opacity-40">
               <RefreshCw size={12} className={balanceLoading ? "animate-spin" : ""} />
             </button>
           }
+        />
+        <StatCard
+          label="🇺🇸 해외 계좌"
+          value={balanceUsd ? fmtMoney(balanceUsd.totalAssets, balanceUsd.currency) : "-"}
+          sub={balanceUsd ? `현금 ${fmtMoney(balanceUsd.cash, balanceUsd.currency)} · ${balanceUsd.positionCount}종목` : undefined}
         />
         <StatCard
           label="누적 실현손익"
