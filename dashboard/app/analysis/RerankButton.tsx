@@ -10,10 +10,10 @@ interface RerankResult {
   stock_code: string;
   stock_name: string;
   final_score: number;
-  rerank_score: number;
-  vol_rank: number;
-  vol_bonus: number;
-  gap_bonus: number;
+  rerankScore: number;
+  volRank: number;
+  volBonus: number;
+  gapBonus: number;
   change_pct: number;
   win_rate_pct: number;
   backtest_return: number;
@@ -129,18 +129,18 @@ export default function RerankButton({ market, horizon }: Props) {
                     <div className="text-gray-500 text-xs">{r.stock_code}</div>
                   </td>
                   <td className="px-4 py-2 text-right text-amber-300 font-bold">
-                    {r.rerank_score?.toFixed(1)}
+                    {r.rerankScore?.toFixed(1)}
                   </td>
                   <td className="px-4 py-2 text-right">
-                    {r.vol_rank < 9999
-                      ? <span className="text-emerald-400">{r.vol_rank + 1}위</span>
+                    {r.volRank < 9999
+                      ? <span className="text-emerald-400">{r.volRank + 1}위</span>
                       : <span className="text-gray-600">—</span>}
                   </td>
                   <td className="px-4 py-2 text-right text-emerald-400">
-                    {r.vol_bonus > 0 ? `+${r.vol_bonus.toFixed(1)}` : "—"}
+                    {r.volBonus > 0 ? `+${r.volBonus.toFixed(1)}` : "—"}
                   </td>
                   <td className="px-4 py-2 text-right text-blue-400">
-                    {r.gap_bonus > 0 ? `+${r.gap_bonus.toFixed(1)}` : "—"}
+                    {r.gapBonus > 0 ? `+${r.gapBonus.toFixed(1)}` : "—"}
                   </td>
                   <td className="px-4 py-2 text-right text-gray-400">
                     {r.final_score?.toFixed(1)}
