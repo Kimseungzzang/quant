@@ -233,7 +233,11 @@ def get_regime():
         domestic_regime = None
 
     config = _components.get("config") or {}
-    overseas_regime = _main._overseas_regime(datetime.now(), config)
+    try:
+        from analysis.market_regime import OverseasRegimeDetector
+        overseas_regime = OverseasRegimeDetector(domestic, config).detect()
+    except Exception as e:
+        overseas_regime = _main._overseas_regime(datetime.now(), config)
 
     result = {"overseas": _fmt(overseas_regime)}
     if domestic_regime:

@@ -63,6 +63,70 @@ class MarketRegime:
         )
 
 
+# ── 공통 헬퍼 ─────────────────────────────────────────────────────────
+
+def _parse_hhmm(value: str, fallback: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    try:
+        h, m = value.split(":", 1)
+        return int(h), int(m)
+    except Exception:
+        return fallback
+
+
+def _is_between_cross_midnight(
+    now: datetime, start: tuple[int, int], end: tuple[int, int]
+) -> bool:
+    cur       = now.hour * 60 + now.minute
+    start_min = start[0] * 60 + start[1]
+    end_min   = end[0]   * 60 + end[1]
+    if start_min <= end_min:
+        return start_min <= cur < end_min
+    return cur >= start_min or cur < end_min
+
+
+def _classify_trend(df: pd.DataFrame) -> tuple["MarketTrend", float]:
+    if df.empty or len(df) < 5:
+        return MarketTrend.SIDEWAYS, 0.0
+    closes = df["close"].astype(float)
+    ema5   = closes.ewm(span=5,  adjust=False).mean()
+    ema20  = closes.ewm(span=20, adjust=False).mean()
+    last5, last20 = float(ema5.iloc[-1]), float(ema20.iloc[-1])
+    if last5 > last20 * 1.003:
+        trend = MarketTrend.UP
+    elif last5 < last20 * 0.997:
+        trend = MarketTrend.DOWN
+    else:
+        trend = MarketTrend.SIDEWAYS
+    pct_5d   = abs((float(closes.iloc[-1]) - float(closes.iloc[-5])) / float(closes.iloc[-5]) * 100) \
+               if len(closes) >= 5 else 0.0
+    strength = round(min(pct_5d * 10, 100.0), 1)
+    return trend, strength
+
+
+def _classify_volatility(df: pd.DataFrame) -> "MarketVolatility":
+    if df.empty or len(df) < 5:
+        return MarketVolatility.NORMAL
+    closes  = df["close"].astype(float)
+    returns = closes.pct_change().dropna().tail(5)
+    std     = float(returns.std()) * 100
+    if std < 0.5:
+        return MarketVolatility.LOW
+    if std > 1.5:
+        return MarketVolatility.HIGH
+    return MarketVolatility.NORMAL
+
+
+def _today_change(df: pd.DataFrame) -> float:
+    if df.empty or len(df) < 2:
+        return 0.0
+    try:
+        last = float(df["close"].iloc[-1])
+        prev = float(df["close"].iloc[-2])
+        return round((last - prev) / prev * 100, 2)
+    except Exception:
+        return 0.0
+
+
 # ── 탐지기 ────────────────────────────────────────────────────────────
 
 class MarketRegimeDetector:
@@ -82,9 +146,9 @@ class MarketRegimeDetector:
         session = self._classify_session(now)
         kospi   = self._fetch_kospi()
 
-        trend, strength     = self._classify_trend(kospi)
-        volatility          = self._classify_volatility(kospi)
-        index_change        = self._today_change(kospi)
+        trend, strength     = _classify_trend(kospi)
+        volatility          = _classify_volatility(kospi)
+        index_change        = _today_change(kospi)
         tradeable, reason   = self._is_tradeable(session, volatility, trend)
         strategies          = self._preferred_strategies(session, trend, volatility)
 
@@ -113,66 +177,6 @@ class MarketRegimeDetector:
         except Exception as e:
             logger.warning("KOSPI 조회 실패: %s → 기본값 사용", e)
             return pd.DataFrame()
-
-    # ── 추세 분류 ─────────────────────────────────────────────────────
-
-    def _classify_trend(self, df: pd.DataFrame) -> tuple[MarketTrend, float]:
-        if df.empty or len(df) < 5:
-            return MarketTrend.SIDEWAYS, 0.0
-
-        closes = df["close"].astype(float)
-        ema5   = closes.ewm(span=5,  adjust=False).mean()
-        ema20  = closes.ewm(span=20, adjust=False).mean()
-
-        last_ema5  = float(ema5.iloc[-1])
-        last_ema20 = float(ema20.iloc[-1])
-
-        # 추세 방향
-        if last_ema5 > last_ema20 * 1.003:
-            trend = MarketTrend.UP
-        elif last_ema5 < last_ema20 * 0.997:
-            trend = MarketTrend.DOWN
-        else:
-            trend = MarketTrend.SIDEWAYS
-
-        # 추세 강도: 5일간 수익률의 절댓값 (0~100 스케일)
-        if len(closes) >= 5:
-            pct_5d = abs((float(closes.iloc[-1]) - float(closes.iloc[-5])) / float(closes.iloc[-5]) * 100)
-            strength = min(pct_5d * 10, 100.0)
-        else:
-            strength = 0.0
-
-        return trend, round(strength, 1)
-
-    # ── 변동성 분류 ───────────────────────────────────────────────────
-
-    def _classify_volatility(self, df: pd.DataFrame) -> MarketVolatility:
-        if df.empty or len(df) < 5:
-            return MarketVolatility.NORMAL
-
-        closes = df["close"].astype(float)
-        # 5일 일간 등락률 표준편차
-        returns = closes.pct_change().dropna().tail(5)
-        std = float(returns.std()) * 100  # %
-
-        if std < 0.5:
-            return MarketVolatility.LOW
-        elif std > 1.5:
-            return MarketVolatility.HIGH
-        else:
-            return MarketVolatility.NORMAL
-
-    # ── 당일 등락률 ───────────────────────────────────────────────────
-
-    def _today_change(self, df: pd.DataFrame) -> float:
-        if df.empty or len(df) < 2:
-            return 0.0
-        try:
-            last  = float(df["close"].iloc[-1])
-            prev  = float(df["close"].iloc[-2])
-            return round((last - prev) / prev * 100, 2)
-        except Exception:
-            return 0.0
 
     # ── 시간대 분류 ───────────────────────────────────────────────────
 
@@ -235,4 +239,93 @@ class MarketRegimeDetector:
         if trend == MarketTrend.SIDEWAYS and volatility == MarketVolatility.LOW:
             strategies.clear()
 
+        return strategies
+
+
+# ── 미국 장세 탐지기 ──────────────────────────────────────────────────
+
+class OverseasRegimeDetector:
+    """
+    KODEX S&P500 ETF(360750) 일봉 + 현재 시각으로 미국 MarketRegime 판단.
+    국내 시장이 열려 있을 때 360750 ETF 일봉을 통해 S&P500 추세를 근사한다.
+    """
+
+    SP500_CODE = "360750"   # KODEX S&P500 ETF
+
+    def __init__(self, domestic_api, config: dict):
+        self.domestic = domestic_api
+        self.config   = config
+
+    def detect(self) -> MarketRegime:
+        now = datetime.now()
+        session, tradeable, reason = self._classify_session(now)
+        df = self._fetch_sp500()
+
+        trend, strength = _classify_trend(df)
+        volatility      = _classify_volatility(df)
+        index_change    = _today_change(df)
+
+        # 하락 고변동성 시 매매 불가
+        if tradeable and volatility == MarketVolatility.HIGH and trend == MarketTrend.DOWN:
+            tradeable = False
+            reason    = "하락 고변동성 — 매매 위험"
+
+        strategies = self._preferred_strategies(session, trend, volatility) if tradeable else []
+
+        regime = MarketRegime(
+            trend=trend,
+            trend_strength=strength,
+            volatility=volatility,
+            session=session,
+            index_change_pct=index_change,
+            preferred_strategies=strategies,
+            tradeable=tradeable,
+            reason=reason,
+        )
+        logger.info("미국 장세 분석: %s", regime)
+        return regime
+
+    def _fetch_sp500(self) -> pd.DataFrame:
+        """KODEX S&P500 ETF 최근 45일 일봉."""
+        end   = date.today()
+        start = end - timedelta(days=45)
+        try:
+            return self.domestic.get_daily_ohlcv(self.SP500_CODE, start, end)
+        except Exception as e:
+            logger.warning("S&P500(360750) 조회 실패: %s → 기본값 사용", e)
+            return pd.DataFrame()
+
+    def _classify_session(self, now: datetime) -> tuple[MarketSession, bool, str]:
+        sched    = self.config.get("schedule", {})
+        us_start = _parse_hhmm(sched.get("us_analysis_time",    "22:30"))
+        us_end   = _parse_hhmm(sched.get("us_trading_end_time", "05:00"))
+
+        in_us       = _is_between_cross_midnight(now, us_start, us_end)
+        in_daytime  = (10, 0) <= (now.hour, now.minute) < (22, 0)
+
+        if not (in_us or in_daytime):
+            return MarketSession.CLOSING, False, "해외주식 거래 시간 외 (05:00~10:00)"
+
+        if in_us:
+            us_start_min      = us_start[0] * 60 + us_start[1]
+            minutes_from_open = (now.hour * 60 + now.minute - us_start_min) % (24 * 60)
+            session = MarketSession.OPENING if minutes_from_open < 30 else MarketSession.MORNING
+            return session, True, "미국 정규장"
+
+        return MarketSession.MORNING, True, "주간거래"
+
+    @staticmethod
+    def _preferred_strategies(
+        session: MarketSession, trend: MarketTrend, volatility: MarketVolatility
+    ) -> list[str]:
+        strategies: list[str] = []
+        if session == MarketSession.OPENING:
+            strategies.append("gap")
+        if session in (MarketSession.OPENING, MarketSession.MORNING):
+            if trend == MarketTrend.UP:
+                strategies.extend(["breakout", "pullback"])
+            elif trend == MarketTrend.SIDEWAYS:
+                strategies.append("pullback")
+        if trend == MarketTrend.SIDEWAYS and volatility == MarketVolatility.LOW:
+            strategies.clear()
         return strategies
