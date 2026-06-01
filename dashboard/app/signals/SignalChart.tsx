@@ -103,11 +103,11 @@ function StockChart({ code, signal }: { code: string; signal: StockSignal }) {
           <ComposedChart data={chartData} margin={{ top: 4, right: 8, bottom: 0, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
             <XAxis dataKey="t" tick={{ fontSize: 10, fill: "#6b7280" }} interval="preserveStartEnd" />
-            <YAxis domain={[yMin, yMax]} tick={{ fontSize: 10, fill: "#6b7280" }} width={60}
+            <YAxis domain={yMin != null && yMax != null ? [yMin, yMax] : ["auto", "auto"]} tick={{ fontSize: 10, fill: "#6b7280" }} width={60}
               tickFormatter={v => v?.toLocaleString()} />
             <Tooltip
               contentStyle={{ backgroundColor: "#111827", border: "1px solid #374151", fontSize: 11 }}
-              formatter={(v: number) => [v?.toLocaleString(), ""]}
+              formatter={(v) => [Number(v).toLocaleString(), ""]}
             />
             {/* 눌림목 구간: EMA20 ±2% 밴드 */}
             {ema20 && (
