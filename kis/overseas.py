@@ -223,7 +223,7 @@ class OverseasAPI:
                 "VOL_RANG": "0",
             },
         )
-        return data.get("output", [])
+        return data.get("output2") or data.get("output", [])
 
     # ── 주문 ────────────────────────────────────────────────────────────
 
