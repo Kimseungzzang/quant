@@ -322,11 +322,14 @@ class Screener:
                                 bt.total_trades, bt.win_rate_pct,
                                 bt.total_return_pct, bt.max_drawdown_pct, bt.sharpe_ratio)
 
-                # ④ 뉴스 감성
-                articles = get_domestic_news(code)
-                sentiment = score_sentiment(articles)
-                logger.info("[%s] ④ 뉴스 | 기사=%d개 | 감성점수=%+.2f",
-                            code, len(articles), sentiment)
+                # ④ 뉴스 감성 (단타는 점수에 미반영 — 스킵)
+                if horizon != "daytrade":
+                    articles  = get_domestic_news(code)
+                    sentiment = score_sentiment(articles)
+                    logger.info("[%s] ④ 뉴스 | 기사=%d개 | 감성점수=%+.2f",
+                                code, len(articles), sentiment)
+                else:
+                    sentiment = 0.0
 
                 # ⑤ regime 필터 — 장세에 맞지 않는 종목 제외
                 if preferred and not context.get("regime_fit"):
@@ -474,10 +477,13 @@ class Screener:
                     logger.info("[%s] ③ %s 백테스트 | 거래=%d회 | 승률=%.1f%% | 수익률=%+.2f%%",
                                 code, horizon, bt.total_trades, bt.win_rate_pct, bt.total_return_pct)
 
-                # ④ 뉴스
-                articles = get_overseas_news(code)
-                sentiment = score_sentiment(articles)
-                logger.info("[%s] ④ 뉴스 | 기사=%d개 | 감성=%+.2f", code, len(articles), sentiment)
+                # ④ 뉴스 감성 (단타는 점수에 미반영 — 스킵)
+                if horizon != "daytrade":
+                    articles  = get_overseas_news(code)
+                    sentiment = score_sentiment(articles)
+                    logger.info("[%s] ④ 뉴스 | 기사=%d개 | 감성=%+.2f", code, len(articles), sentiment)
+                else:
+                    sentiment = 0.0
 
                 # ⑤ 최종
                 trading_value = _resolve_trading_value(item, price) * 1300
