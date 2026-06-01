@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import { TrendingUp, TrendingDown, Minus, Activity, Clock, Zap, AlertTriangle } from "lucide-react";
+import { TrendingUp, TrendingDown, Minus, Activity, Clock, Zap, AlertTriangle, RefreshCw } from "lucide-react";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8084";
 
@@ -108,16 +108,19 @@ function RegimeCard({ regime, label, indexLabel }: { regime: Regime; label: stri
 }
 
 export default function MarketRegimePanel() {
-  const [data, setData]       = useState<RegimeResponse | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError]     = useState(false);
+  const [data, setData]         = useState<RegimeResponse | null>(null);
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState(false);
+  const [updatedAt, setUpdatedAt] = useState<string | null>(null);
 
   const loadRegime = useCallback(async () => {
+    setLoading(true);
     try {
       const res = await window.fetch(`${BASE}/api/command/regime`, { cache: "no-store" });
       if (!res.ok) throw new Error();
       setData(await res.json());
       setError(false);
+      setUpdatedAt(new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }));
     } catch {
       setError(true);
     } finally {
@@ -125,11 +128,7 @@ export default function MarketRegimePanel() {
     }
   }, []);
 
-  useEffect(() => {
-    loadRegime();
-    const id = setInterval(loadRegime, 60_000);
-    return () => clearInterval(id);
-  }, [loadRegime]);
+  useEffect(() => { loadRegime(); }, [loadRegime]);
 
   if (loading) return <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 animate-pulse h-40" />;
   if (error || !data) return (
@@ -143,7 +142,20 @@ export default function MarketRegimePanel() {
 
   return (
     <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-3">
-      <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">장세 분석</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">장세 분석</h2>
+        <div className="flex items-center gap-2">
+          {updatedAt && <span className="text-xs text-gray-600">{updatedAt}</span>}
+          <button
+            onClick={loadRegime}
+            disabled={loading}
+            className="p-1 rounded text-gray-500 hover:text-gray-300 hover:bg-gray-800 transition-colors disabled:opacity-40"
+            title="새로고침"
+          >
+            <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
+          </button>
+        </div>
+      </div>
       <div className="grid grid-cols-2 gap-3">
         {domestic && <RegimeCard regime={domestic} label="🇰🇷 국내" indexLabel="KOSPI" />}
         {overseas && <RegimeCard regime={overseas} label="🇺🇸 미국" indexLabel="S&P" />}
