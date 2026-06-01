@@ -32,6 +32,11 @@ public class AnalysisService {
             .toList();
     }
 
+    public AnalysisRunDto getRunningRun(String market, String horizon) {
+        return analysisRunRepository.findByMarketAndHorizonAndStatusOrderByIdDesc(market, horizon, "running")
+            .stream().findFirst().map(AnalysisRunDto::from).orElse(null);
+    }
+
     public List<AnalysisResultDto> getByRunId(Long runId) {
         return analysisResultRepository.findByRunId(runId)
             .stream()

@@ -134,4 +134,9 @@ public class PythonEngineClient {
         ResponseEntity<Map> resp = restTemplate.getForEntity(baseUrl + "/regime", Map.class);
         return resp.getBody();
     }
+
+    public Object getSignals() {
+        ResponseEntity<Object> resp = restTemplate.getForEntity(baseUrl + "/signals", Object.class);
+        return resp.getBody();
+    }
 }

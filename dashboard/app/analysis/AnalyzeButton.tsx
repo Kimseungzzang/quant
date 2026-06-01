@@ -28,16 +28,30 @@ export default function AnalyzeButton({ market, horizon }: { market: string; hor
   const [progress, setProgress]         = useState<Progress | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // 마운트 시 localStorage에 저장된 runId가 있으면 폴링 재개
+  // 마운트 시 localStorage 또는 서버에서 진행 중인 분석 확인
   useEffect(() => {
-    const saved = localStorage.getItem(LS_KEY(market, horizon));
-    if (saved) {
-      const runId = parseInt(saved, 10);
-      if (!isNaN(runId)) {
+    async function resume() {
+      let runId: number | null = null;
+      const saved = localStorage.getItem(LS_KEY(market, horizon));
+      if (saved) {
+        const parsed = parseInt(saved, 10);
+        if (!isNaN(parsed)) runId = parsed;
+      }
+      if (!runId) {
+        try {
+          const res = await fetch(`${BASE}/api/analysis/running?market=${market}&horizon=${horizon}`, { cache: "no-store" });
+          if (res.ok) {
+            const run = await res.json();
+            if (run?.id) runId = run.id;
+          }
+        } catch { /* ignore */ }
+      }
+      if (runId) {
         setProgress({ done: 0, total: 0, current: "", status: "running", pct: 0 });
         startPolling(runId);
       }
     }
+    resume();
     return () => { if (pollRef.current) clearInterval(pollRef.current); };
   }, [market, horizon]);
 

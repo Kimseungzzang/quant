@@ -39,6 +39,18 @@ class PGWriter:
 
     # ── analysis_runs ──────────────────────────────────────────────
 
+    async def reset_stuck_analysis_runs(self) -> int:
+        """서버 재시작 시 stuck running 상태를 failed로 정리. 정리된 건수 반환."""
+        conn = await _conn()
+        try:
+            result = await conn.execute(
+                "UPDATE analysis_runs SET status='failed', error_msg='서버 재시작으로 인한 강제 종료' "
+                "WHERE status='running'"
+            )
+            return int(result.split()[-1])
+        finally:
+            await conn.close()
+
     async def has_running_analysis(self, market: str, horizon: str = "swing") -> bool:
         await self.ensure_analysis_horizon_columns()
         conn = await _conn()

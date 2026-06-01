@@ -71,8 +71,8 @@ class MarketRegimeDetector:
     domestic_api: DomesticAPI 인스턴스
     """
 
-    # KOSPI 지수 종목 코드 (KIS API)
-    KOSPI_CODE = "0001"
+    # KOSPI 프록시: KODEX 200 ETF (KIS paper API가 지수 일봉 미지원)
+    KOSPI_CODE = "069500"
 
     def __init__(self, domestic_api):
         self.domestic = domestic_api
@@ -221,7 +221,7 @@ class MarketRegimeDetector:
         if session == MarketSession.OPENING:
             strategies.append("gap")          # 갭 매매는 개장 구간에만
 
-        if session in (MarketSession.MORNING, MarketSession.AFTERNOON):
+        if session in (MarketSession.MORNING, MarketSession.MIDDAY, MarketSession.AFTERNOON):
             if trend == MarketTrend.UP:
                 strategies.append("breakout")  # 상승 추세 → 돌파
                 strategies.append("pullback")  # 상승 추세 → 눌림목

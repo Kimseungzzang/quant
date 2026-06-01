@@ -53,7 +53,7 @@ export default function BacktestRunButton({ market }: { market: string }) {
     setLoading(true);
     setResult(null);
     try {
-      const res = await fetch("http://localhost:8080/api/command/backtest", {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8084"}/api/command/backtest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ stockCode: code.trim(), market, startDate, endDate }),

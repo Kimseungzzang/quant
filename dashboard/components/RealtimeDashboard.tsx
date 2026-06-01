@@ -54,9 +54,24 @@ export default function RealtimeDashboard({
   const [positions, setPositions] = useState(initialPositions);
   const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
   const [balance, setBalance] = useState<AccountBalance | null>(null);
+  const [balanceLoading, setBalanceLoading] = useState(false);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [loading, setLoading] = useState(false);
+
+  async function refreshBalance() {
+    setBalanceLoading(true);
+    try {
+      const b = await fetchJson<AccountBalance>(`/api/command/account/balance?market=domestic&mode=${mode}`);
+      setBalance(b);
+    } catch { /* ignore */ } finally {
+      setBalanceLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refreshBalance();
+  }, [mode]);
 
   useEffect(() => {
     let alive = true;
@@ -64,18 +79,16 @@ export default function RealtimeDashboard({
     async function refresh() {
       setLoading(true);
       try {
-        const [nextSummary, nextPositions, nextPendingOrders, nextBalance, nextTrades] = await Promise.all([
+        const [nextSummary, nextPositions, nextPendingOrders, nextTrades] = await Promise.all([
           fetchJson<PnlSummary>(`/api/trades/pnl/summary?mode=${mode}`),
           fetchJson<Position[]>(`/api/command/trade/positions/live?mode=${mode}`),
           fetchJson<PendingOrder[]>(`/api/command/trade/orders/pending?mode=${mode}`),
-          fetchJson<AccountBalance>(`/api/command/account/balance?market=domestic&mode=${mode}`),
           fetchJson<TradePage>(`/api/trades?mode=${mode}&page=0&size=8&period=all`),
         ]);
         if (!alive) return;
         setSummary(nextSummary);
         setPositions(nextPositions);
         setPendingOrders(nextPendingOrders);
-        setBalance(nextBalance);
         setTrades(nextTrades.content);
         setUpdatedAt(new Date());
       } catch {
@@ -116,6 +129,11 @@ export default function RealtimeDashboard({
           label="계좌 평가"
           value={balance ? fmtMoney(balance.totalAssets, balance.currency) : "-"}
           sub={balance ? `현금 ${fmtMoney(balance.cash, balance.currency)} · ${balance.positionCount}종목` : undefined}
+          action={
+            <button onClick={refreshBalance} disabled={balanceLoading} className="text-gray-500 hover:text-gray-300 disabled:opacity-40">
+              <RefreshCw size={12} className={balanceLoading ? "animate-spin" : ""} />
+            </button>
+          }
         />
         <StatCard
           label="누적 실현손익"

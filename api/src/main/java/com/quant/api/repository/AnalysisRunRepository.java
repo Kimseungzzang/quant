@@ -12,4 +12,10 @@ public interface AnalysisRunRepository extends JpaRepository<AnalysisRun, Long> 
         String horizon,
         String status
     );
+
+    List<AnalysisRun> findByMarketAndHorizonAndStatusOrderByIdDesc(
+        String market,
+        String horizon,
+        String status
+    );
 }

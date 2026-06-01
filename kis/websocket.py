@@ -14,6 +14,12 @@ logger = logging.getLogger(__name__)
 
 _MSG_REALTIME = ("0", "1")
 
+# KIS WebSocket TR별 레코드당 필드 수 (공식 문서 기준)
+_KNOWN_FIELD_COUNTS: dict[str, int] = {
+    "H0STCNT0": 46,   # 국내주식 실시간체결가
+    "HDFSCNT0": 26,   # 해외주식 실시간체결가
+}
+
 
 def aes_cbc_base64_dec(key: str, iv: str, cipher_text: str) -> str:
     """AES-CBC + Base64 복호화. encrypt=Y 데이터에 사용."""
@@ -49,7 +55,7 @@ class KISWebSocket:
         if key not in self._handlers:
             self._subscriptions.append((tr_id, stock_code))
         self._handlers[key] = handler
-        self._data_map.setdefault(tr_id, {"columns": [], "encrypt": "N", "key": None, "iv": None, "field_count": None})
+        self._data_map.setdefault(str(tr_id), {"columns": [], "encrypt": "N", "key": None, "iv": None, "field_count": _KNOWN_FIELD_COUNTS.get(str(tr_id))})
 
     def subscribe_global(self, tr_id: WebSocketTRID | str, tr_key: str, handler: Callable):
         """종목코드가 첫 필드가 아닌 계좌 단위 통보 구독."""
@@ -57,7 +63,7 @@ class KISWebSocket:
         if key not in self._handlers:
             self._subscriptions.append((tr_id, tr_key))
         self._handlers[key] = handler
-        self._data_map.setdefault(tr_id, {"columns": [], "encrypt": "N", "key": None, "iv": None, "field_count": None})
+        self._data_map.setdefault(str(tr_id), {"columns": [], "encrypt": "N", "key": None, "iv": None, "field_count": _KNOWN_FIELD_COUNTS.get(str(tr_id))})
 
     @staticmethod
     def _handler_code(tr_id: WebSocketTRID | str, stock_code: str) -> str:
@@ -128,23 +134,22 @@ class KISWebSocket:
             all_fields = payload.split("^")
 
             if count > 1:
-                field_count = dm.get("field_count")
+                field_count = dm.get("field_count") or _KNOWN_FIELD_COUNTS.get(tr_id)
+                if field_count is None and len(all_fields) % count == 0:
+                    field_count = len(all_fields) // count
+                if field_count:
+                    if tr_id in self._data_map:
+                        self._data_map[tr_id]["field_count"] = field_count
                 if field_count and len(all_fields) == count * field_count:
                     records = [
                         all_fields[i * field_count:(i + 1) * field_count]
                         for i in range(count)
                     ]
                 else:
-                    # field_count 미파악 시 첫 틱만 처리
-                    logger.warning(
-                        "TR_ID %s: COUNT=%d이지만 field_count=%s — 첫 틱만 처리",
-                        tr_id, count, field_count,
-                    )
                     records = [all_fields]
             else:
                 records = [all_fields]
-                # 첫 단일 틱에서 레코드 필드 수 학습
-                if all_fields and "field_count" not in dm and tr_id in self._data_map:
+                if all_fields and dm.get("field_count") is None and tr_id in self._data_map:
                     self._data_map[tr_id]["field_count"] = len(all_fields)
 
             for fields in records:

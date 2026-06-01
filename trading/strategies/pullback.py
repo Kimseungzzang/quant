@@ -66,9 +66,9 @@ class PullbackStrategy(BaseStrategy):
         if pd.notna(rsi) and float(rsi) < 35:
             return EntrySignal(False, f"RSI 과매도 {rsi:.1f} → 추세 전환 가능성")
 
-        # ④ 거래량 평균 대비 회복
+        # ④ 거래량 평균 대비 회복 (데이터 부족 시 스킵)
         vol_ratio = self._vol_ratio(df)
-        if vol_ratio < self.vol_threshold:
+        if vol_ratio > 0 and vol_ratio < self.vol_threshold:
             return EntrySignal(False, f"거래량 미회복 (vol_ratio={vol_ratio:.2f})")
 
         # ⑤ 가격이 직전 캔들보다 높아야 (반등 확인)

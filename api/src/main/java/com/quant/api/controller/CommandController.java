@@ -10,7 +10,7 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api/command")
 @RequiredArgsConstructor
-@CrossOrigin(origins = {"http://localhost:3000"})
+@CrossOrigin(origins = {"http://localhost:3002"})
 public class CommandController {
 
     private final PythonEngineClient pythonEngineClient;
@@ -71,5 +71,10 @@ public class CommandController {
     @GetMapping("/regime")
     public Map<?, ?> getRegime() {
         return pythonEngineClient.getRegime();
+    }
+
+    @GetMapping("/signals")
+    public Object getSignals() {
+        return pythonEngineClient.getSignals();
     }
 }

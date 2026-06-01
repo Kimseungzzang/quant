@@ -8,6 +8,7 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 interface EngineStatus {
   status: string;
   trading_active: boolean;
+  trading_market?: string;
   mode?: string;
 }
 
@@ -134,7 +135,14 @@ export default function TradeControl({ mode }: TradeControlProps) {
           : "bg-gray-800 text-gray-500 border border-gray-700"
       }`}>
         <Activity size={14} className={active ? "animate-pulse" : ""} />
-        {active ? "매매 실행 중" : "대기 중"}
+        {active
+          ? `매매 실행 중 — ${
+              engine?.trading_market === "domestic" ? "🇰🇷 국내" :
+              engine?.trading_market === "overseas" ? "🇺🇸 미국" :
+              engine?.trading_market === "both"     ? "🇰🇷🇺🇸 국내+미국" :
+              engine?.trading_market ?? ""
+            }`
+          : "대기 중"}
       </div>
 
       <div className={`flex items-center justify-between px-3 py-2 rounded-lg border text-xs ${

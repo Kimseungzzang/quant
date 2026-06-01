@@ -52,8 +52,8 @@ class BreakoutStrategy(BaseStrategy):
         if not broke_out:
             return EntrySignal(False, f"미돌파 (현재가 {price:,.0f} / 저항선 {resistance:,.0f})")
 
-        # 거래량 확인
-        if vol_ratio < self.vol_threshold:
+        # 거래량 확인 (데이터 부족 시 스킵)
+        if vol_ratio > 0 and vol_ratio < self.vol_threshold:
             return EntrySignal(False, f"거래량 부족 (vol_ratio={vol_ratio:.2f})")
 
         return EntrySignal(True, f"돌파 확인 @ {price:,.0f} (저항선 {resistance:,.0f}, vol={vol_ratio:.2f}x)")

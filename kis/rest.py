@@ -1,5 +1,6 @@
 import time
 import logging
+import threading
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -9,14 +10,16 @@ from .constants import KIS_RATE_LIMIT_SEC
 logger = logging.getLogger(__name__)
 
 _last_request_time: float = 0.0
+_throttle_lock = threading.Lock()
 
 
 def _throttle():
     global _last_request_time
-    elapsed = time.monotonic() - _last_request_time
-    if elapsed < KIS_RATE_LIMIT_SEC:
-        time.sleep(KIS_RATE_LIMIT_SEC - elapsed)
-    _last_request_time = time.monotonic()
+    with _throttle_lock:
+        elapsed = time.monotonic() - _last_request_time
+        if elapsed < KIS_RATE_LIMIT_SEC:
+            time.sleep(KIS_RATE_LIMIT_SEC - elapsed)
+        _last_request_time = time.monotonic()
 
 
 class KISRestClient:
@@ -49,7 +52,7 @@ class KISRestClient:
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
-        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503])
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 502, 503])
         adapter = HTTPAdapter(max_retries=retry)
         session.mount("https://", adapter)
         session.mount("http://", adapter)

@@ -96,10 +96,12 @@ class StrategyRouter:
         dfs: dict[int, pd.DataFrame],
         tick: dict,
         position: dict,
+        _indicator_cache: dict[int, pd.DataFrame] | None = None,
     ) -> tuple[bool, str]:
         """
         Returns: (should_exit, reason)
         포지션에 기록된 전략으로 청산 판단.
+        _indicator_cache: check_entry에서 만든 캐시를 재사용하면 재계산 방지.
         """
         strategy_name = position.get("strategy", "")
         strategy = self._strategies.get(strategy_name)
@@ -108,8 +110,11 @@ class StrategyRouter:
             return self._default_exit(tick, position)
 
         minutes = strategy.candle_minutes
-        raw = dfs.get(minutes, pd.DataFrame())
-        df = calculate_indicators(raw) if not raw.empty and len(raw) >= 5 else raw
+        if _indicator_cache is not None and minutes in _indicator_cache:
+            df = _indicator_cache[minutes]
+        else:
+            raw = dfs.get(minutes, pd.DataFrame())
+            df = calculate_indicators(raw) if not raw.empty and len(raw) >= 5 else raw
 
         signal: ExitSignal = strategy.check_exit(df, tick, position)
         if signal.should_exit:

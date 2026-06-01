@@ -21,8 +21,13 @@ class DomesticAPI:
     def __init__(self, client: KISRestClient, config: dict):
         self.client = client
         self.is_paper = config["mode"] in ("paper", "mock")
-        self.account_no   = config["kis"]["account_no"]
-        self.acnt_prdt_cd = config["kis"]["account_product_code"]
+        kis = config["kis"]
+        if self.is_paper:
+            self.account_no   = kis.get("paper_account_no") or kis.get("account_no", "")
+            self.acnt_prdt_cd = kis.get("paper_account_product_code") or kis.get("account_product_code", "01")
+        else:
+            self.account_no   = kis.get("live_account_no") or kis.get("account_no", "")
+            self.acnt_prdt_cd = kis.get("live_account_product_code") or kis.get("account_product_code", "01")
 
     # ── 시세 조회 ──────────────────────────────────────────────────────
 

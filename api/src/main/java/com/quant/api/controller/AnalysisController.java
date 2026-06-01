@@ -11,7 +11,7 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/analysis")
 @RequiredArgsConstructor
-@CrossOrigin(origins = {"http://localhost:3000"})
+@CrossOrigin(origins = {"http://localhost:3002"})
 public class AnalysisController {
 
     private final AnalysisService analysisService;
@@ -30,6 +30,14 @@ public class AnalysisController {
         @RequestParam(defaultValue = "swing") String horizon
     ) {
         return analysisService.getLatest(market, horizon);
+    }
+
+    @GetMapping("/running")
+    public AnalysisRunDto getRunning(
+        @RequestParam(defaultValue = "domestic") String market,
+        @RequestParam(defaultValue = "swing") String horizon
+    ) {
+        return analysisService.getRunningRun(market, horizon);
     }
 
     @GetMapping("/run/{runId}")

@@ -2,6 +2,8 @@ import asyncio
 import argparse
 import logging
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import threading
 import schedule
 import time
@@ -88,10 +90,70 @@ class CandleAggregator:
             return pd.DataFrame()
         return pd.DataFrame(self._completed)
 
+    def preload(self, df: "pd.DataFrame"):
+        """과거 분봉 DataFrame을 completed 목록에 주입 (세션 시작 시 EMA 즉시 계산용)."""
+        import pandas as pd
+        if df.empty:
+            return
+        needed = ["open", "high", "low", "close", "volume"]
+        if not all(c in df.columns for c in needed):
+            return
+        rows = df[needed].tail(self.max_candles).to_dict("records")
+        self._completed = [
+            {"open": float(r["open"]), "high": float(r["high"]),
+             "low":  float(r["low"]),  "close": float(r["close"]),
+             "volume": float(r["volume"])}
+            for r in rows
+        ]
+
 
 # ── 전역 매매 스레드 상태 ─────────────────────────────────────────────
 _trading_thread: threading.Thread | None = None
 _trading_lock = threading.Lock()
+_trading_market: str | None = None  # 현재 매매 중인 market
+
+# 종목별 실시간 신호 상태 (대시보드 표시용)
+_signal_state: dict[str, dict] = {}
+_signal_state_lock = threading.Lock()
+_MAX_CANDLES = 120  # 최대 120개 봉 보관
+
+def _update_signal_state(stock_code: str, price: float, dfs: dict, ctx: dict):
+    import pandas as _pd
+    from analysis.indicators import calculate_indicators
+    df_raw = dfs.get(1, _pd.DataFrame())
+
+    # 지표 계산은 lock 밖에서 수행 (CPU 작업, 락 보유 시간 최소화)
+    new_state: dict = {
+        "price":      price,
+        "resistance": ctx.get("resistance"),
+        "updated_at": datetime.now().isoformat(),
+        "ema5": None, "ema20": None, "rsi": None,
+        "candles": [],
+    }
+    if not df_raw.empty and len(df_raw) >= 2:
+        df1 = calculate_indicators(df_raw) if len(df_raw) >= 5 else df_raw
+        row = df1.iloc[-1]
+        new_state["ema5"]  = float(row["ema5"])  if "ema5"  in df1.columns and _pd.notna(row.get("ema5"))  else None
+        new_state["ema20"] = float(row["ema20"]) if "ema20" in df1.columns and _pd.notna(row.get("ema20")) else None
+        new_state["rsi"]   = float(row["rsi"])   if "rsi"   in df1.columns and _pd.notna(row.get("rsi"))   else None
+        candles = []
+        for _, r in df1.tail(_MAX_CANDLES).iterrows():
+            t_val = r.get("datetime", r.name)
+            candles.append({
+                "t": t_val.isoformat() if hasattr(t_val, "isoformat") else str(t_val),
+                "o": float(r["open"])   if "open"   in df1.columns and _pd.notna(r.get("open"))   else None,
+                "h": float(r["high"])   if "high"   in df1.columns and _pd.notna(r.get("high"))   else None,
+                "l": float(r["low"])    if "low"    in df1.columns and _pd.notna(r.get("low"))    else None,
+                "c": float(r["close"])  if "close"  in df1.columns and _pd.notna(r.get("close"))  else None,
+                "v": float(r["volume"]) if "volume" in df1.columns and _pd.notna(r.get("volume")) else None,
+                "ema5":  float(r["ema5"])  if "ema5"  in df1.columns and _pd.notna(r.get("ema5"))  else None,
+                "ema20": float(r["ema20"]) if "ema20" in df1.columns and _pd.notna(r.get("ema20")) else None,
+            })
+        new_state["candles"] = candles
+
+    # 완성된 상태를 lock 안에서 원자적으로 교체
+    with _signal_state_lock:
+        _signal_state[stock_code] = new_state
 
 
 def _is_trading_active() -> bool:
@@ -274,12 +336,15 @@ def _build_initial_context(comp: dict, stock_code: str, exchange: str) -> dict:
     """일봉 데이터로 trading loop용 초기 context 구성."""
     from analysis.indicators import calculate_indicators
     try:
+        from datetime import date as _date, timedelta as _td
+        _end   = _date.today()
+        _start = _end - _td(days=30)
         if exchange == _KRX:
-            df = comp["domestic"].get_daily_ohlcv(stock_code)
+            df = comp["domestic"].get_daily_ohlcv(stock_code, _start, _end)
         else:
             from kis.constants import ExchangeCode
             df = comp["overseas"].get_daily_ohlcv(
-                stock_code, ExchangeCode(exchange)
+                stock_code, ExchangeCode(exchange), _start, _end
             )
         if df.empty or len(df) < 5:
             return {}
@@ -317,24 +382,37 @@ def _overseas_regime(now: datetime, config: dict):
         MarketRegime, MarketTrend, MarketVolatility, MarketSession,
     )
     sched = config.get("schedule", {})
-    start = _parse_hhmm(sched.get("us_analysis_time", "22:30"), (22, 30))
-    end = _parse_hhmm(sched.get("us_trading_end_time", "05:00"), (5, 0))
-    tradeable = _is_between_cross_midnight(now, start, end)
-    start_minutes = start[0] * 60 + start[1]
+    # 미국 정규장: 22:30~05:00
+    us_start = _parse_hhmm(sched.get("us_analysis_time", "22:30"), (22, 30))
+    us_end   = _parse_hhmm(sched.get("us_trading_end_time", "05:00"), (5, 0))
+    in_us_session = _is_between_cross_midnight(now, us_start, us_end)
+
+    # KIS 주간거래: 10:00~22:00
+    in_daytime = (10, 0) <= (now.hour, now.minute) < (22, 0)
+
+    tradeable = in_us_session or in_daytime
+
     current = now.hour * 60 + now.minute
-    minutes_from_open = (current - start_minutes) % (24 * 60)
     if not tradeable:
         session = MarketSession.CLOSING
         strategies = []
-        reason = "미국장 거래 시간 외"
-    elif minutes_from_open < 30:
-        session = MarketSession.OPENING
-        strategies = ["gap", "breakout"]
-        reason = ""
+        reason = "해외주식 거래 시간 외 (05:00~10:00)"
+    elif in_us_session:
+        us_start_min = us_start[0] * 60 + us_start[1]
+        minutes_from_open = (current - us_start_min) % (24 * 60)
+        if minutes_from_open < 30:
+            session = MarketSession.OPENING
+            strategies = ["gap", "breakout"]
+        else:
+            session = MarketSession.MORNING
+            strategies = ["breakout", "pullback"]
+        reason = "미국 정규장"
     else:
+        # 주간거래 (10:00~22:00)
         session = MarketSession.MORNING
         strategies = ["breakout", "pullback"]
-        reason = ""
+        reason = "주간거래"
+
     return MarketRegime(
         trend=MarketTrend.UP,
         trend_strength=50.0,
@@ -395,6 +473,19 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
 
     logger.info("%d개 종목 실시간 모니터링 시작", len(all_candidates))
 
+    # 틱 수신 전에도 대시보드에 종목 기본 정보 표시
+    for _c in all_candidates:
+        _code = _c["stock_code"]
+        _ctx_pre = _c.get("context") or {}
+        with _signal_state_lock:
+            _signal_state[_code] = {
+                "price":      float(_c.get("current_price", 0) or 0),
+                "resistance": _ctx_pre.get("resistance"),
+                "ema5": None, "ema20": None, "rsi": None,
+                "candles": [],
+                "updated_at": datetime.now().isoformat(),
+            }
+
     hts_id = _get_hts_id(comp["config"])
     if mode != TradingMode.MOCK and hts_id:
         def domestic_fill_handler(recv_tr_id: str, fields: list[str]):
@@ -417,30 +508,81 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
             ws.subscribe_global(overseas_fill_tr, hts_id, overseas_fill_handler)
         logger.info("KIS 체결통보 구독 등록: hts_id=%s market=%s", hts_id, market)
     elif mode != TradingMode.MOCK:
-        logger.error(
-            "kis.hts_id 또는 KIS_HTS_ID가 없어 체결통보 WebSocket을 구독하지 않습니다. "
-            "접수 응답만으로 포지션을 확정하지 않기 위해 매매 시작을 취소합니다."
+        logger.warning(
+            "kis.hts_id 또는 KIS_HTS_ID가 없거나 WebSocket 구독 실패 — "
+            "체결 타임아웃 폴러로 대체합니다."
         )
-        return
+
+    order_mgr.start_fill_timeout_poller()
 
     for c in all_candidates:
         code     = c["stock_code"]
         exchange = c["exchange"]
         # 일봉에서 resistance/prev_close/gap_open 초기 로드 (전략 진입 조건용)
         context  = c.get("context") or _build_initial_context(comp, code, exchange)
+        # 저항선 fallback: context 로드 실패 시 실시간 현재가 +2% 사용
+        # (분석 당시 current_price는 수 시간 전 값일 수 있어 실시간 가격 우선)
+        if not context.get("resistance"):
+            try:
+                live_price = float(comp["domestic"].get_price(code).get("stck_prpr", 0) or 0)
+            except Exception:
+                live_price = float(c.get("current_price", 0) or 0)
+            if live_price > 0:
+                context["resistance"] = live_price * 1.02
+                logger.warning("저항선 fallback 사용 (%s): %.0f × 1.02 = %.0f",
+                               code, live_price, context["resistance"])
         is_overseas = exchange != _KRX
         tr_id    = WebSocketTRID.DOMESTIC_PRICE if not is_overseas \
             else WebSocketTRID.OVERSEAS_PRICE
         subscribe_key = code if not is_overseas else f"D{exchange}{code}"
         parse_fn = parse_domestic_price if exchange == _KRX else parse_overseas_price
 
+        _preloaded: dict[int, object] = {}
+        if not is_overseas:
+            try:
+                df_1m = comp["domestic"].get_historical_minute_ohlcv(
+                    code, lookback_days=2, candle_minutes=1,
+                )
+                if not df_1m.empty:
+                    _preloaded[1]  = df_1m
+                    _preloaded[5]  = comp["domestic"].get_historical_minute_ohlcv(
+                        code, lookback_days=2, candle_minutes=5,
+                    )
+                    _preloaded[15] = comp["domestic"].get_historical_minute_ohlcv(
+                        code, lookback_days=2, candle_minutes=15,
+                    )
+                    logger.info("[%s] 분봉 프리로드 완료: 1분봉 %d봉", code, len(df_1m))
+            except Exception as e:
+                logger.warning("[%s] 분봉 프리로드 실패 (무시): %s", code, e)
+        else:
+            try:
+                from kis.constants import ExchangeCode as _EC
+                df_1m = comp["overseas"].get_historical_minute_ohlcv(
+                    code, _EC(exchange), lookback_days=2, candle_minutes=1,
+                )
+                if not df_1m.empty:
+                    _preloaded[1]  = df_1m
+                    _preloaded[5]  = comp["overseas"].get_historical_minute_ohlcv(
+                        code, _EC(exchange), lookback_days=2, candle_minutes=5,
+                    )
+                    _preloaded[15] = comp["overseas"].get_historical_minute_ohlcv(
+                        code, _EC(exchange), lookback_days=2, candle_minutes=15,
+                    )
+                    logger.info("[%s] 해외 분봉 프리로드 완료: 1분봉 %d봉", code, len(df_1m))
+            except Exception as e:
+                logger.warning("[%s] 해외 분봉 프리로드 실패 (무시): %s", code, e)
+
         def make_handler(stock_code, name, exch, _parse_fn, _base_ctx,
-                         _regime_state, _shared):
+                         _regime_state, _shared, _pre=None):
             _aggs = {
                 1:  CandleAggregator(1),
                 5:  CandleAggregator(5),
                 15: CandleAggregator(15),
             }
+            if _pre:
+                for m, df in _pre.items():
+                    if m in _aggs and df is not None and not df.empty:
+                        _aggs[m].preload(df)
             # 핸들러 내 수정 가능한 context 복사본
             _ctx      = dict(_base_ctx)
             _prev_p   = [0.0]    # 전 틱 가격 (전일 종가 계산용)
@@ -456,6 +598,7 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
                     return
                 if price <= 0:
                     return
+                logger.debug("[틱] %s @ %.0f", stock_code, price)
 
                 now      = datetime.now()
                 now_ts   = _pd.Timestamp(now)
@@ -536,6 +679,16 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
                     agg.update(tick)
                 dfs = {m: agg.get_df() for m, agg in _aggs.items()}
 
+                # ── 신호 상태 업데이트 (대시보드용) ───────────────────
+                _update_signal_state(stock_code, price, dfs, _ctx)
+
+                # 지표 캐시 — 진입/청산 양쪽에서 재사용해 재계산 방지
+                from analysis.indicators import calculate_indicators as _calc_ind
+                _ind_cache: dict[int, _pd.DataFrame] = {
+                    m: (_calc_ind(df) if not df.empty and len(df) >= 5 else df)
+                    for m, df in dfs.items()
+                }
+
                 # ── 진입 판단 ─────────────────────────────────────────
                 if stock_code not in positions:
                     if router and regime and regime.tradeable:
@@ -562,7 +715,8 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
                         "strategy":    getattr(pos, "strategy", ""),
                     }
                     if router:
-                        should_exit, reason = router.check_exit(dfs, tick, position_dict)
+                        should_exit, reason = router.check_exit(dfs, tick, position_dict,
+                                                                _indicator_cache=_ind_cache)
                         if should_exit:
                             order_mgr.close_position(stock_code, price, reason=reason)
                             _pos_entry_dates.pop(stock_code, None)
@@ -575,7 +729,8 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
 
         ws.subscribe(tr_id, subscribe_key,
                      make_handler(code, c["name"], exchange, parse_fn,
-                                  context, regime_state, live_shared))
+                                  context, regime_state, live_shared,
+                                  _pre=_preloaded))
 
     comp["ws"] = ws
     await ws.run()
@@ -609,7 +764,7 @@ def _mock_regime():
 
 def _start_trading_thread(comp: dict, market: str = "both"):
     """별도 스레드에서 asyncio 이벤트 루프로 매매 실행."""
-    global _trading_thread
+    global _trading_thread, _trading_market
 
     with _trading_lock:
         if _is_trading_active():
@@ -617,13 +772,16 @@ def _start_trading_thread(comp: dict, market: str = "both"):
             return
 
         def _run():
+            global _trading_market
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
                 loop.run_until_complete(_run_trading_loop(comp, market))
             finally:
+                _trading_market = None
                 loop.close()
 
+        _trading_market = market
         _trading_thread = threading.Thread(target=_run, daemon=True, name="trading-loop")
         _trading_thread.start()
         logging.getLogger("main").info("매매 스레드 시작")

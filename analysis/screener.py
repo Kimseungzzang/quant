@@ -74,7 +74,8 @@ class Screener:
         self._domestic_fallback = config["universe"]["domestic"].get("stocks", [])
         self._overseas_fallback = config["universe"]["overseas"].get("stocks", [])
         bt_cfg = config.get("backtest", {})
-        self._bt_days    = bt_cfg.get("lookback_days",  30)
+        self._bt_days         = bt_cfg.get("lookback_days", 30)
+        self._daytrade_bt_days = bt_cfg.get("daytrade_lookback_days", self._bt_days)
 
     def run_domestic(self, top_n: int = 10, lookback_days: int | None = None,
                      on_progress=None, regime=None, horizon: str = "swing") -> list[Candidate]:
@@ -298,7 +299,7 @@ class Screener:
                 if horizon == "daytrade":
                     # ③ 단타 백테스트 (1분봉 원본 → 전략별 1/5/15분봉 리샘플링)
                     df_min = self.domestic.get_historical_minute_ohlcv(
-                        code, lookback_days=self._bt_days, candle_minutes=1)
+                        code, lookback_days=self._daytrade_bt_days, candle_minutes=1)
                     if not df_min.empty:
                         bt = run_strategy_backtest(
                             code,
@@ -311,7 +312,7 @@ class Screener:
                         logger.info("[%s] 분봉 데이터 없음 → 단타 백테스트 스킵", code)
                         bt = BacktestResult(stock_code=code)
                     logger.info("[%s] ③ 단타 백테스트(1/5/15분봉/%d일) | 거래=%d회 | 승률=%.1f%% | 수익률=%+.2f%% | MDD=%.2f%% | Sharpe=%.2f",
-                                code, self._bt_days,
+                                code, self._daytrade_bt_days,
                                 bt.total_trades, bt.win_rate_pct,
                                 bt.total_return_pct, bt.max_drawdown_pct, bt.sharpe_ratio)
                 else:

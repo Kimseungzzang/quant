@@ -31,9 +31,10 @@ class TradingMode(StrEnum):
 # ── 국내주식 시장 코드 ────────────────────────────────────────────────
 
 class MarketCode(StrEnum):
-    KRX = "J"    # 한국거래소
-    NXT = "NX"   # 넥스트레이드(대체거래소)
-    ALL = "UN"   # 통합(KRX+NXT)
+    KRX   = "J"   # 한국거래소
+    NXT   = "NX"  # 넥스트레이드(대체거래소)
+    ALL   = "UN"  # 통합(KRX+NXT)
+    INDEX = "U"   # 업종/지수 (KOSPI=0001, KOSDAQ=1001)
 
 
 # ── 해외주식 거래소 코드 ──────────────────────────────────────────────
@@ -131,13 +132,17 @@ class OverseasTRID(StrEnum):
     MINUTE_CHART = "HHDFS76950200"
     VOLUME_RANK  = "HHDFS76310010"
 
-    # 주문/계좌 (실전)
+    # 주문/계좌 (실전 — 야간 정규장)
     BUY_LIVE          = "TTTT1002U"
     SELL_LIVE         = "TTTT1006U"
     BALANCE_LIVE      = "TTTS2012R"
     DAILY_ORDERS_LIVE = "TTTS2003R"
 
-    # 주문/계좌 (모의)
+    # 주문/계좌 (실전 — 주간거래 10:00~22:00)
+    DAYTIME_BUY_LIVE  = "JTTT1002U"
+    DAYTIME_SELL_LIVE = "JTTT1006U"
+
+    # 주문/계좌 (모의 — 야간/주간 공용)
     BUY_PAPER          = "VTTT1002U"
     SELL_PAPER         = "VTTT1001U"
     BALANCE_PAPER      = "VTTS2012R"

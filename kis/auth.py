@@ -13,16 +13,19 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
-TOKEN_CACHE_FILE = Path("data/.token_cache.json")
-
-
 class KISAuth:
     def __init__(self, config: dict):
-        self.app_key = config["kis"]["app_key"]
-        self.app_secret = config["kis"]["app_secret"]
+        kis_cfg = config["kis"]
         mode = TradingMode(config["mode"])
+        if mode in (TradingMode.PAPER, TradingMode.MOCK):
+            self.app_key    = kis_cfg.get("paper_app_key") or kis_cfg.get("app_key", "")
+            self.app_secret = kis_cfg.get("paper_app_secret") or kis_cfg.get("app_secret", "")
+        else:
+            self.app_key    = kis_cfg.get("live_app_key") or kis_cfg.get("app_key", "")
+            self.app_secret = kis_cfg.get("live_app_secret") or kis_cfg.get("app_secret", "")
         self.is_mock  = mode == TradingMode.MOCK
         self.is_paper = mode in (TradingMode.PAPER, TradingMode.MOCK)
+        self._token_cache_file = Path(f"data/.token_cache_{mode.value}.json")
 
         if mode == TradingMode.MOCK:
             self.base_url    = config["kis"].get("rest_url", KIS_REST_URL_MOCK)
@@ -108,17 +111,17 @@ class KISAuth:
         return self._ws_approval_key
 
     def _load_token_cache(self) -> dict | None:
-        if not TOKEN_CACHE_FILE.exists():
+        if not self._token_cache_file.exists():
             return None
         try:
-            with TOKEN_CACHE_FILE.open() as f:
+            with self._token_cache_file.open() as f:
                 return json.load(f)
         except Exception:
             return None
 
     def _save_token_cache(self):
-        TOKEN_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with TOKEN_CACHE_FILE.open("w") as f:
+        self._token_cache_file.parent.mkdir(parents=True, exist_ok=True)
+        with self._token_cache_file.open("w") as f:
             json.dump(
                 {
                     "access_token": self._access_token,

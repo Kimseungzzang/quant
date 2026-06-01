@@ -6,6 +6,8 @@ import asyncio
 import copy
 import logging
 import threading
+from dotenv import load_dotenv
+load_dotenv()
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime
@@ -49,6 +51,15 @@ async def lifespan(app: FastAPI):
     global _components
     config = _load_config()
     _components = _main.build_components(config)
+    # 서버 시작 시 이전 비정상 종료로 stuck된 running 상태 정리
+    try:
+        from db.pg_writer import PGWriter
+        pg = PGWriter()
+        cleaned = await pg.reset_stuck_analysis_runs()
+        if cleaned > 0:
+            logger.warning("stuck running analysis_run %d건 failed로 정리", cleaned)
+    except Exception as e:
+        logger.warning("stuck analysis 정리 실패 (무시): %s", e)
     logger.info("FastAPI 엔진 초기화 완료")
     yield
     logger.info("FastAPI 엔진 종료")
@@ -100,9 +111,13 @@ def health():
     return {
         "status": "ok",
         "trading_active": _main._is_trading_active(),
+        "trading_market": _main._trading_market,
         "mode": config.get("mode"),
     }
 
+
+_balance_cache: dict = {}  # key: market → {data, ts}
+_BALANCE_CACHE_SEC = 30
 
 @app.get("/account/balance")
 def account_balance(market: str = "domestic", mode: str | None = None):
@@ -114,6 +129,10 @@ def account_balance(market: str = "domestic", mode: str | None = None):
             detail=f"현재 엔진은 {engine_mode} 모드입니다. {mode} 잔고를 조회할 수 없습니다.",
         )
 
+    cached = _balance_cache.get(market)
+    if cached and (datetime.now().timestamp() - cached["ts"]) < _BALANCE_CACHE_SEC:
+        return cached["data"]
+
     try:
         if market == "overseas":
             balance = _components["overseas"].get_balance()
@@ -121,7 +140,7 @@ def account_balance(market: str = "domestic", mode: str | None = None):
             cash = _to_float(summary.get("frcr_dncl_amt_2"))
             total = _to_float(summary.get("tot_asst_amt"))
             positions = balance.get("positions") or []
-            return {
+            result = {
                 "market": "overseas",
                 "mode": engine_mode,
                 "currency": "USD",
@@ -132,6 +151,8 @@ def account_balance(market: str = "domestic", mode: str | None = None):
                 "summary": summary,
                 "updatedAt": datetime.now().isoformat(),
             }
+            _balance_cache[market] = {"data": result, "ts": datetime.now().timestamp()}
+            return result
 
         balance = _components["domestic"].get_balance()
         summary = balance.get("summary") or {}
@@ -139,7 +160,7 @@ def account_balance(market: str = "domestic", mode: str | None = None):
         total = _to_float(summary.get("tot_evlu_amt") or summary.get("nass_amt"))
         position_value = _to_float(summary.get("evlu_amt_smtl_amt"))
         positions = balance.get("positions") or []
-        return {
+        result = {
             "market": "domestic",
             "mode": engine_mode,
             "currency": "KRW",
@@ -150,6 +171,8 @@ def account_balance(market: str = "domestic", mode: str | None = None):
             "summary": summary,
             "updatedAt": datetime.now().isoformat(),
         }
+        _balance_cache[market] = {"data": result, "ts": datetime.now().timestamp()}
+        return result
     except Exception as e:
         logger.exception("계좌 잔고 조회 실패")
         raise HTTPException(status_code=502, detail=f"KIS 계좌 잔고 조회 실패: {e}")
@@ -185,26 +208,45 @@ def set_mode(req: ModeRequest):
 
 @app.get("/regime")
 def get_regime():
-    """현재 시장 상황 분석 결과 반환."""
+    """국내/미국 시장 상황 분석 결과 반환."""
     from analysis.market_regime import MarketRegimeDetector
+    from datetime import datetime
     domestic = _components.get("domestic")
     if domestic is None:
         raise HTTPException(status_code=503, detail="엔진 초기화 중")
-    try:
-        detector = MarketRegimeDetector(domestic)
-        regime   = detector.detect()
+
+    def _fmt(r):
         return {
-            "trend":                regime.trend.value,
-            "trend_strength":       regime.trend_strength,
-            "volatility":           regime.volatility.value,
-            "session":              regime.session.value,
-            "index_change_pct":     regime.index_change_pct,
-            "preferred_strategies": regime.preferred_strategies,
-            "tradeable":            regime.tradeable,
-            "reason":               regime.reason,
+            "trend":                r.trend.value,
+            "trend_strength":       r.trend_strength,
+            "volatility":           r.volatility.value,
+            "session":              r.session.value,
+            "index_change_pct":     r.index_change_pct,
+            "preferred_strategies": r.preferred_strategies,
+            "tradeable":            r.tradeable,
+            "reason":               r.reason,
         }
+
+    try:
+        domestic_regime = MarketRegimeDetector(domestic).detect()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        domestic_regime = None
+
+    config = _components.get("config") or {}
+    overseas_regime = _main._overseas_regime(datetime.now(), config)
+
+    result = {"overseas": _fmt(overseas_regime)}
+    if domestic_regime:
+        result["domestic"] = _fmt(domestic_regime)
+    else:
+        # 국내 장세 실패 시 기존 단일 포맷 호환 유지
+        result["domestic"] = None
+
+    # 기존 단일 포맷 호환 (domestic 필드 최상위 노출)
+    if domestic_regime:
+        result.update(_fmt(domestic_regime))
+
+    return result
 
 
 # ── 분석 ──────────────────────────────────────────────────────────────
@@ -417,3 +459,10 @@ def get_pending_orders(mode: str | None = None):
     if order_mgr is None:
         raise HTTPException(status_code=503, detail="엔진 초기화 중")
     return order_mgr.get_pending_order_rows()
+
+
+@app.get("/signals")
+def get_signals():
+    """종목별 실시간 신호 상태 (차트용)."""
+    with _main._signal_state_lock:
+        return dict(_main._signal_state)

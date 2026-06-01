@@ -10,7 +10,7 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/backtest")
 @RequiredArgsConstructor
-@CrossOrigin(origins = {"http://localhost:3000"})
+@CrossOrigin(origins = {"http://localhost:3002"})
 public class BacktestController {
 
     private final BacktestService backtestService;

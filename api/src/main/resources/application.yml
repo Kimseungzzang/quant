@@ -8,6 +8,7 @@ spring:
   jpa:
     hibernate:
       ddl-auto: validate        # 스키마는 schema.sql로 관리, JPA는 검증만
+    open-in-view: false
     show-sql: false
     properties:
       hibernate:
@@ -18,7 +19,7 @@ spring:
     enabled: false              # 초기 개발 중 비활성화
 
 server:
-  port: 8080
+  port: 8084
   error:
     include-message: always
 
