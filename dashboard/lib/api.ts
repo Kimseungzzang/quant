@@ -121,6 +121,8 @@ export interface AccountBalance {
   totalAssets: number;
   positionValue: number;
   positionCount: number;
+  totalPnl?: number;
+  totalPnlPct?: number;
   updatedAt: string;
 }
 

@@ -143,7 +143,11 @@ export default function RealtimeDashboard({
         <StatCard
           label="🇺🇸 해외 계좌"
           value={balanceUsd ? fmtMoney(balanceUsd.totalAssets, balanceUsd.currency) : "-"}
-          sub={balanceUsd ? `현금 ${fmtMoney(balanceUsd.cash, balanceUsd.currency)} · ${balanceUsd.positionCount}종목` : undefined}
+          sub={balanceUsd
+            ? balanceUsd.positionCount > 0
+              ? `${balanceUsd.positionCount}종목 · 손익 ${balanceUsd.totalPnl != null ? fmtMoney(balanceUsd.totalPnl, "USD") : "-"} (${balanceUsd.totalPnlPct?.toFixed(2) ?? "0.00"}%)`
+              : "보유 포지션 없음"
+            : undefined}
         />
         <StatCard
           label="누적 실현손익"

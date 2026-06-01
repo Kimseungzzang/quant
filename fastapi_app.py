@@ -136,23 +136,25 @@ def account_balance(market: str = "domestic", mode: str | None = None):
 
     try:
         if market == "overseas":
-            balance = _components["overseas"].get_balance()
-            summary = balance.get("summary") or {}
+            balance  = _components["overseas"].get_balance()
+            summary  = balance.get("summary") or {}
             positions = balance.get("positions") or []
-            cash  = _to_float(summary.get("frcr_dncl_amt_2") or summary.get("frcr_dncl_amt1"))
-            total = _to_float(
-                summary.get("tot_asst_amt")
-                or summary.get("tot_evlu_pfls_amt")
-                or sum(_to_float(p.get("ovrs_stck_evlu_amt")) for p in positions)
-            )
+            # output2에 현금 예수금 없음 — 보유 주식 평가금액 합산
+            stock_value  = sum(_to_float(p.get("ovrs_stck_evlu_amt")) for p in positions)
+            purchase_amt = _to_float(summary.get("frcr_buy_amt_smtl1"))
+            evlu_pfls    = _to_float(summary.get("tot_evlu_pfls_amt"))
+            total = stock_value if stock_value > 0 else purchase_amt + evlu_pfls
+            cash  = 0.0  # 예수금은 별도 API 필요 (해외증거금 통화별조회)
             result = {
                 "market": "overseas",
                 "mode": engine_mode,
                 "currency": "USD",
                 "cash": cash,
                 "totalAssets": total,
-                "positionValue": max(total - cash, 0),
+                "positionValue": stock_value,
                 "positionCount": len(positions),
+                "totalPnl":  _to_float(summary.get("ovrs_tot_pfls")),
+                "totalPnlPct": _to_float(summary.get("tot_pftrt")),
                 "summary": summary,
                 "updatedAt": datetime.now().isoformat(),
             }
