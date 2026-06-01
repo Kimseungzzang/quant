@@ -332,6 +332,30 @@ async def rerank(market: str = "domestic", horizon: str = "daytrade"):
         })
 
     reranked.sort(key=lambda x: x["rerankScore"], reverse=True)
+
+    # 재정렬 결과를 캐시 파일에 저장 — 매매 시작 시 WebSocket 구독 순서로 사용
+    import json as _json
+    from pathlib import Path as _Path
+    cache = {"market": market, "horizon": horizon, "results": [
+        {
+            "stock_code":   r["stock_code"],
+            "stock_name":   r["stock_name"],
+            "exchange":     r.get("exchange") or ("KRX" if market == "domestic" else "NAS"),
+            "current_price": r.get("current_price") or 0,
+            "final_score":  r.get("final_score") or 0,
+            "rerank_score": r["rerankScore"],
+        }
+        for r in reranked
+    ]}
+    try:
+        _Path("data").mkdir(exist_ok=True)
+        _Path("data/candidates_reranked.json").write_text(
+            _json.dumps(cache, ensure_ascii=False), encoding="utf-8"
+        )
+        logger.info("재정렬 캐시 저장 완료: %s %d개", market, len(reranked))
+    except Exception as e:
+        logger.warning("재정렬 캐시 저장 실패: %s", e)
+
     return {"market": market, "horizon": horizon, "results": reranked}
 
 

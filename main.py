@@ -285,8 +285,39 @@ def _save_candidates(candidates, market: str):
         logging.getLogger("main").error("PostgreSQL 저장 실패: %s", e)
 
 
+_RERANK_CACHE_FILE = Path("data/candidates_reranked.json")
+
+
 def _load_candidates(market: str) -> list[dict]:
-    """PostgreSQL에서 가장 최근 완료된 분석 결과를 로드."""
+    """
+    재정렬 캐시 → PostgreSQL 순서로 로드.
+    재정렬 버튼을 누른 경우 캐시 파일이 존재하며, 해당 순서가 WebSocket 구독 순서가 됨.
+    """
+    import json as _json
+    logger = logging.getLogger("main")
+
+    # 재정렬 캐시가 있으면 우선 사용
+    if _RERANK_CACHE_FILE.exists():
+        try:
+            cached = _json.loads(_RERANK_CACHE_FILE.read_text())
+            if cached.get("market") == market:
+                results = cached.get("results", [])
+                if results:
+                    logger.info("재정렬 캐시 사용: %s %d개 (재정렬 점수 기준)", market, len(results))
+                    return [
+                        {
+                            "stock_code":    r["stock_code"],
+                            "name":          r["stock_name"],
+                            "exchange":      r.get("exchange") or ("KRX" if market == "domestic" else "NAS"),
+                            "current_price": float(r.get("current_price") or 0),
+                            "final_score":   float(r.get("rerank_score") or r.get("final_score") or 0),
+                        }
+                        for r in results
+                    ]
+        except Exception as e:
+            logger.warning("재정렬 캐시 읽기 실패: %s → DB 사용", e)
+
+    # DB에서 로드
     try:
         import psycopg2, os
         dsn = os.getenv("DATABASE_URL", "postgresql://kimseungzzang@localhost/quant_trading")
@@ -309,7 +340,7 @@ def _load_candidates(market: str) -> list[dict]:
             rows = cur.fetchall()
         conn.close()
         if not rows:
-            logging.getLogger("main").warning("PostgreSQL에 %s 분석 결과 없음", market)
+            logger.warning("PostgreSQL에 %s 분석 결과 없음", market)
             return []
         return [
             {
@@ -322,7 +353,7 @@ def _load_candidates(market: str) -> list[dict]:
             for r in rows
         ]
     except Exception as e:
-        logging.getLogger("main").error("PostgreSQL 로드 실패: %s", e)
+        logger.error("PostgreSQL 로드 실패: %s", e)
         return []
 
 
@@ -447,6 +478,15 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
         all_candidates = _load_candidates("overseas")
     else:
         all_candidates = _load_candidates("domestic") + _load_candidates("overseas")
+
+    # 재정렬 캐시를 사용한 경우 로드 후 삭제 (다음 날 재사용 방지)
+    if _RERANK_CACHE_FILE.exists():
+        try:
+            _RERANK_CACHE_FILE.unlink()
+            logger.info("재정렬 캐시 소비 완료 — 삭제")
+        except Exception:
+            pass
+
     if not all_candidates:
         logger.warning("추천 종목 없음")
         return
