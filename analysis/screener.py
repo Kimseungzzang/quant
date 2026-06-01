@@ -459,9 +459,24 @@ class Screener:
                             f"{row.get('vol_ratio'):.2f}" if row.get('vol_ratio') else "N/A")
 
                 if horizon == "daytrade":
-                    # 해외는 현재 분봉 API 미지원이라 단타 점수는 지표 점수만 사용
-                    logger.info("[%s] 해외 단타 분봉 백테스트 미지원 → signal_score만 사용", code)
-                    bt = BacktestResult(stock_code=code, signal_score=round(signal_score, 1))
+                    context = self._build_context(df_ind, ["breakout", "pullback"])
+                    df_min = self.overseas.get_historical_minute_ohlcv(
+                        code, ExchangeCode(str(exchange)),
+                        lookback_days=self._daytrade_bt_days, candle_minutes=1,
+                    )
+                    if not df_min.empty:
+                        bt = run_strategy_backtest(
+                            code, df_min,
+                            context=context,
+                            stop_loss_pct=self.stop_loss,
+                            take_profit_pct=self.take_profit,
+                        )
+                    else:
+                        logger.info("[%s] 해외 분봉 데이터 없음 → 단타 백테스트 스킵", code)
+                        bt = BacktestResult(stock_code=code)
+                    logger.info("[%s] ③ 단타 백테스트(1/5/15분봉/%d일) | 거래=%d회 | 승률=%.1f%% | 수익률=%+.2f%%",
+                                code, self._daytrade_bt_days,
+                                bt.total_trades, bt.win_rate_pct, bt.total_return_pct)
                 else:
                     bt = run_backtest(
                         code,
@@ -471,8 +486,8 @@ class Screener:
                         entry_fn=swing_entry if horizon == "swing" else None,
                         start_from=analysis_start,
                     )
-                logger.info("[%s] ③ %s 백테스트 | 거래=%d회 | 승률=%.1f%% | 수익률=%+.2f%%",
-                            code, horizon, bt.total_trades, bt.win_rate_pct, bt.total_return_pct)
+                    logger.info("[%s] ③ %s 백테스트 | 거래=%d회 | 승률=%.1f%% | 수익률=%+.2f%%",
+                                code, horizon, bt.total_trades, bt.win_rate_pct, bt.total_return_pct)
 
                 # ④ 뉴스
                 articles = get_overseas_news(code)
