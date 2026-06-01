@@ -131,6 +131,13 @@ public class PythonEngineClient {
         return resp.getBody();
     }
 
+    public Map<?, ?> cancelAnalysis(Long runId) {
+        log.info("Python /analyze/{}/cancel 호출", runId);
+        ResponseEntity<Map> resp = restTemplate.postForEntity(
+            baseUrl + "/analyze/" + runId + "/cancel", null, Map.class);
+        return resp.getBody();
+    }
+
     public Map<?, ?> getRegime() {
         ResponseEntity<Map> resp = restTemplate.getForEntity(baseUrl + "/regime", Map.class);
         return resp.getBody();

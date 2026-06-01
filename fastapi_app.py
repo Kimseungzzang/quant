@@ -38,6 +38,7 @@ logging.basicConfig(level=logging.INFO)
 
 _components: dict = {}
 _analysis_progress: dict[int, dict] = {}   # run_id → {done, total, current, status}
+_cancel_flags: set[int] = set()            # 취소 요청된 run_id
 _components_lock = threading.Lock()
 
 
@@ -369,6 +370,17 @@ async def get_progress(run_id: int):
     return {**p, "pct": pct}
 
 
+@app.post("/analyze/{run_id}/cancel")
+async def cancel_analysis(run_id: int):
+    """실행 중인 분석을 취소하고 DB를 failed로 정리."""
+    _cancel_flags.add(run_id)
+    _analysis_progress.pop(run_id, None)
+    pg = PGWriter()
+    await pg.complete_analysis_run(run_id, "failed", "사용자 취소")
+    logger.info("분석 취소 요청 run_id=%d", run_id)
+    return {"run_id": run_id, "status": "cancelled"}
+
+
 async def _run_analysis(
     run_id: int,
     market: str,
@@ -380,6 +392,8 @@ async def _run_analysis(
     _analysis_progress[run_id] = {"done": 0, "total": 0, "current": "", "status": "running"}
 
     def on_progress(done: int, total: int, current: str):
+        if run_id in _cancel_flags:
+            raise RuntimeError("사용자 취소")
         _analysis_progress[run_id] = {"done": done, "total": total, "current": current, "status": "running"}
 
     try:
@@ -409,9 +423,13 @@ async def _run_analysis(
                                        "current": "", "status": "completed"}
         logger.info(f"분석 완료 run_id={run_id} market={market} horizon={horizon} count={len(candidates)}")
     except Exception as e:
-        logger.error(f"분석 실패 run_id={run_id}: {e}")
-        await pg.complete_analysis_run(run_id, "failed", str(e))
-        _analysis_progress[run_id] = {**_analysis_progress.get(run_id, {}), "status": "failed"}
+        is_cancel = "사용자 취소" in str(e)
+        logger.info("분석 취소 run_id=%d", run_id) if is_cancel else logger.error("분석 실패 run_id=%d: %s", run_id, e)
+        if not is_cancel:
+            await pg.complete_analysis_run(run_id, "failed", str(e))
+        _analysis_progress[run_id] = {**_analysis_progress.get(run_id, {}), "status": "cancelled" if is_cancel else "failed"}
+    finally:
+        _cancel_flags.discard(run_id)
 
 
 # ── 백테스트 ──────────────────────────────────────────────────────────

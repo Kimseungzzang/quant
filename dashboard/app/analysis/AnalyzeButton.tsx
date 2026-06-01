@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Play, Loader2, CheckCircle, XCircle } from "lucide-react";
+import { Play, Square, Loader2, CheckCircle, XCircle } from "lucide-react";
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 const LS_KEY = (market: string, horizon: string) => `analyze_run_id_${market}_${horizon}`;
@@ -25,8 +25,10 @@ interface Progress {
 export default function AnalyzeButton({ market, horizon }: { market: string; horizon: string }) {
   const [lookbackDays, setLookbackDays] = useState(30);
   const [loading, setLoading]           = useState(false);
+  const [cancelling, setCancelling]     = useState(false);
   const [progress, setProgress]         = useState<Progress | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const runIdRef = useRef<number | null>(null);
 
   // 마운트 시 localStorage 또는 서버에서 진행 중인 분석 확인
   useEffect(() => {
@@ -91,6 +93,7 @@ export default function AnalyzeButton({ market, horizon }: { market: string; hor
       }
       if (!res.ok) throw new Error();
       const data = await res.json();
+      runIdRef.current = data.run_id;
       localStorage.setItem(LS_KEY(market, horizon), String(data.run_id));
       setProgress({ done: 0, total: 0, current: "", status: "running", pct: 0 });
       startPolling(data.run_id);
@@ -98,6 +101,21 @@ export default function AnalyzeButton({ market, horizon }: { market: string; hor
       setProgress({ done: 0, total: 0, current: "오류 발생", status: "failed", pct: 0 });
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleCancel() {
+    const saved = localStorage.getItem(LS_KEY(market, horizon));
+    const runId = runIdRef.current ?? (saved ? parseInt(saved, 10) || null : null);
+    if (!runId) return;
+    setCancelling(true);
+    try {
+      await fetch(`${BASE}/api/command/analyze/${runId}/cancel`, { method: "POST" });
+      if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+      localStorage.removeItem(LS_KEY(market, horizon));
+      setProgress({ done: 0, total: 0, current: "분석이 취소됐습니다.", status: "failed", pct: 0 });
+    } catch { /* ignore */ } finally {
+      setCancelling(false);
     }
   }
 
@@ -130,11 +148,25 @@ export default function AnalyzeButton({ market, horizon }: { market: string; hor
           disabled={busy}
           className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm px-4 py-2 rounded-lg transition-colors whitespace-nowrap"
         >
-          {busy
+          {loading
             ? <Loader2 size={14} className="animate-spin" />
             : <Play size={14} />}
           {busy ? "분석 중..." : "분석 실행"}
         </button>
+
+        {/* 중지 버튼 — 분석 실행 중일 때만 표시 */}
+        {progress?.status === "running" && (
+          <button
+            onClick={handleCancel}
+            disabled={cancelling}
+            className="flex items-center gap-2 bg-red-800 hover:bg-red-700 disabled:opacity-40 text-white text-sm px-4 py-2 rounded-lg transition-colors whitespace-nowrap"
+          >
+            {cancelling
+              ? <Loader2 size={14} className="animate-spin" />
+              : <Square size={14} />}
+            중지
+          </button>
+        )}
       </div>
 
       {/* 프로그레스 바 */}

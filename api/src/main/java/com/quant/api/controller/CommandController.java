@@ -76,6 +76,11 @@ public class CommandController {
         return pythonEngineClient.analyzeProgress(runId);
     }
 
+    @PostMapping("/analyze/{runId}/cancel")
+    public Map<?, ?> cancelAnalysis(@PathVariable Long runId) {
+        return pythonEngineClient.cancelAnalysis(runId);
+    }
+
     @GetMapping("/regime")
     public Map<?, ?> getRegime() {
         return pythonEngineClient.getRegime();
