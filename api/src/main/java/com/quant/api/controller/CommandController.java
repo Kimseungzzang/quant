@@ -48,7 +48,7 @@ public class CommandController {
     @GetMapping("/account/balance")
     public Map<?, ?> accountBalance(
         @RequestParam(defaultValue = "domestic") String market,
-        @RequestParam(defaultValue = "paper") String mode
+        @RequestParam(defaultValue = "") String mode
     ) {
         return pythonEngineClient.getAccountBalance(market, mode);
     }

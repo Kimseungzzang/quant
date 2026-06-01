@@ -107,8 +107,9 @@ public class PythonEngineClient {
     }
 
     public Map<?, ?> getAccountBalance(String market, String mode) {
-        ResponseEntity<Map> resp = restTemplate.getForEntity(
-            baseUrl + "/account/balance?market=" + market + "&mode=" + mode, Map.class);
+        String url = baseUrl + "/account/balance?market=" + market;
+        if (mode != null && !mode.isBlank()) url += "&mode=" + mode;
+        ResponseEntity<Map> resp = restTemplate.getForEntity(url, Map.class);
         return resp.getBody();
     }
 
