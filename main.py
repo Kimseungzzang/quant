@@ -601,18 +601,23 @@ async def _run_trading_loop(comp: dict, market: str = "both"):
         else:
             try:
                 from kis.constants import ExchangeCode as _EC
-                df_1m = comp["overseas"].get_historical_minute_ohlcv(
-                    code, _EC(exchange), lookback_days=2, candle_minutes=1,
-                )
-                if not df_1m.empty:
-                    _preloaded[1]  = df_1m
-                    _preloaded[5]  = comp["overseas"].get_historical_minute_ohlcv(
-                        code, _EC(exchange), lookback_days=2, candle_minutes=5,
+                cache_path = Path(f"data/cache/{code}_{exchange}_1min.pkl")
+                if cache_path.exists():
+                    # 캐시 있을 때만 프리로드 — 없으면 스킵하고 WebSocket 먼저 연결
+                    df_1m = comp["overseas"].get_historical_minute_ohlcv(
+                        code, _EC(exchange), lookback_days=2, candle_minutes=1,
                     )
-                    _preloaded[15] = comp["overseas"].get_historical_minute_ohlcv(
-                        code, _EC(exchange), lookback_days=2, candle_minutes=15,
-                    )
-                    logger.info("[%s] 해외 분봉 프리로드 완료: 1분봉 %d봉", code, len(df_1m))
+                    if not df_1m.empty:
+                        _preloaded[1]  = df_1m
+                        _preloaded[5]  = comp["overseas"].get_historical_minute_ohlcv(
+                            code, _EC(exchange), lookback_days=2, candle_minutes=5,
+                        )
+                        _preloaded[15] = comp["overseas"].get_historical_minute_ohlcv(
+                            code, _EC(exchange), lookback_days=2, candle_minutes=15,
+                        )
+                        logger.info("[%s] 해외 분봉 프리로드 완료: 1분봉 %d봉", code, len(df_1m))
+                else:
+                    logger.info("[%s] 해외 분봉 캐시 없음 → 프리로드 스킵 (WebSocket 우선)", code)
             except Exception as e:
                 logger.warning("[%s] 해외 분봉 프리로드 실패 (무시): %s", code, e)
 

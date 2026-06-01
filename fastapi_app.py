@@ -335,14 +335,18 @@ async def rerank(market: str = "domestic", horizon: str = "daytrade"):
     # 재정렬 결과를 캐시 파일에 저장 — 매매 시작 시 WebSocket 구독 순서로 사용
     import json as _json
     from pathlib import Path as _Path
+    from decimal import Decimal as _Dec
+    def _to_float(v):
+        return float(v) if v is not None else 0.0
+
     cache = {"market": market, "horizon": horizon, "results": [
         {
-            "stock_code":   r["stock_code"],
-            "stock_name":   r["stock_name"],
-            "exchange":     r.get("exchange") or ("KRX" if market == "domestic" else "NAS"),
-            "current_price": r.get("current_price") or 0,
-            "final_score":  r.get("final_score") or 0,
-            "rerank_score": r["rerankScore"],
+            "stock_code":    r["stock_code"],
+            "stock_name":    r["stock_name"],
+            "exchange":      r.get("exchange") or ("KRX" if market == "domestic" else "NAS"),
+            "current_price": _to_float(r.get("current_price")),
+            "final_score":   _to_float(r.get("final_score")),
+            "rerank_score":  _to_float(r["rerankScore"]),
         }
         for r in reranked
     ]}
