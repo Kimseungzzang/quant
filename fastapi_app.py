@@ -562,15 +562,43 @@ async def get_positions():
 
 
 @app.get("/trade/positions/live")
-def get_live_positions(mode: str | None = None):
-    config = _components.get("config") or {}
+async def get_live_positions(mode: str | None = None):
+    config     = _components.get("config") or {}
     engine_mode = config.get("mode")
     if mode and engine_mode and mode != engine_mode:
         return []
     order_mgr = _components.get("order_mgr")
     if order_mgr is None:
         raise HTTPException(status_code=503, detail="엔진 초기화 중")
-    return order_mgr.get_live_positions()
+
+    rows = order_mgr.get_live_positions()
+    if not rows:
+        return []
+
+    # 매매 루프 꺼져 있을 때: _last_prices 없으면 REST로 현재가 보완
+    from kis.constants import ExchangeCode as _ExchCode
+    loop = asyncio.get_event_loop()
+    for row in rows:
+        code = row["stockCode"]
+        # currentPrice == avgPrice 이면 WebSocket 미수신 → REST 조회
+        if abs(row["currentPrice"] - row["avgPrice"]) < 0.001:
+            try:
+                if row["market"] == "domestic":
+                    pd = await loop.run_in_executor(
+                        None, lambda c=code: _components["domestic"].get_price(c))
+                    row["currentPrice"] = float(pd.get("stck_prpr") or row["currentPrice"])
+                else:
+                    pd = await loop.run_in_executor(
+                        None, lambda c=code: _components["overseas"].get_price(c))
+                    row["currentPrice"] = float(pd.get("last") or row["currentPrice"])
+                # 재계산
+                entry, cur, qty = row["avgPrice"], row["currentPrice"], row["quantity"]
+                row["unrealizedPnl"] = round(qty * (cur - entry), 4)
+                row["unrealizedPct"] = round((cur - entry) / entry * 100, 2) if entry > 0 else 0
+                row["marketValue"]   = round(qty * cur, 4)
+            except Exception:
+                pass
+    return rows
 
 
 @app.get("/trade/orders/pending")

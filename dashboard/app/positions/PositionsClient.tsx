@@ -106,28 +106,41 @@ export default function PositionsClient({ initial, mode }: { initial: Position[]
                 <th className="text-right px-4 py-3">평균가</th>
                 <th className="text-right px-4 py-3">현재가</th>
                 <th className="text-right px-4 py-3">평가금액</th>
-                <th className="text-right px-4 py-3">미실현</th>
+                <th className="text-right px-4 py-3">미실현 손익</th>
                 <th className="text-right px-4 py-3">보유시간</th>
               </tr>
             </thead>
             <tbody>
-              {positions.map((p) => (
+              {positions.map((p) => {
+                const pnlPositive = (p.unrealizedPnl ?? 0) >= 0;
+                const priceUp = p.currentPrice >= p.avgPrice;
+                return (
                 <tr key={p.id} className="border-b border-gray-800/50 hover:bg-gray-800/40">
                   <td className="px-4 py-3">
                     <div className="font-medium">{p.stockName}</div>
-                    <div className="text-xs text-gray-500">{p.stockCode} · {p.market}</div>
+                    <div className="text-xs text-gray-500 flex items-center gap-1.5 mt-0.5">
+                      <span>{p.stockCode}</span>
+                      {p.strategy && (
+                        <span className="px-1.5 py-0.5 rounded text-xs bg-indigo-900/60 text-indigo-300">
+                          {p.strategy}
+                        </span>
+                      )}
+                    </div>
                   </td>
                   <td className="px-4 py-3 text-right">{p.quantity.toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right">{fmtMoney(p.avgPrice, p.currency)}</td>
-                  <td className="px-4 py-3 text-right">{fmtMoney(p.currentPrice, p.currency)}</td>
+                  <td className="px-4 py-3 text-right text-gray-300">{fmtMoney(p.avgPrice, p.currency)}</td>
+                  <td className={`px-4 py-3 text-right font-medium ${priceUp ? "text-emerald-400" : "text-red-400"}`}>
+                    {fmtMoney(p.currentPrice, p.currency)}
+                  </td>
                   <td className="px-4 py-3 text-right">{fmtMoney(p.marketValue, p.currency)}</td>
-                  <td className={`px-4 py-3 text-right font-medium ${(p.unrealizedPnl ?? 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-                    <div>{fmtMoney(p.unrealizedPnl, p.currency)}</div>
+                  <td className={`px-4 py-3 text-right font-medium ${pnlPositive ? "text-emerald-400" : "text-red-400"}`}>
+                    <div>{pnlPositive ? "+" : ""}{fmtMoney(p.unrealizedPnl, p.currency)}</div>
                     <div className="text-xs">{fmtPct(p.unrealizedPct)}</div>
                   </td>
                   <td className="px-4 py-3 text-right text-gray-400">{holdingTime(p.openedAt)}</td>
                 </tr>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>

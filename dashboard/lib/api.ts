@@ -83,6 +83,7 @@ export interface Position {
   unrealizedPnl: number | null;
   unrealizedPct: number | null;
   mode: string;
+  strategy: string | null;
   openedAt: string;
   updatedAt: string;
 }
