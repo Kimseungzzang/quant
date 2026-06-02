@@ -29,8 +29,9 @@ class AIAgent:
         self._current_session_id: int | None = None
 
     async def initialize(self) -> None:
-        self._chat_history = await self._memory.load_today_history()
-        logger.info("히스토리 복원: %d개 항목", len(self._chat_history))
+        full = await self._memory.load_today_history()
+        self._chat_history = full[-_CHAT_HISTORY_LIMIT * 2:]
+        logger.info("히스토리 복원: %d개 항목 (전체 %d개)", len(self._chat_history), len(full))
 
     def _push_history(self, role: str, source: str, content: str) -> None:
         self._chat_history.append({"role": role, "content": content})
@@ -53,23 +54,27 @@ class AIAgent:
         ) or "없음"
 
         user_msg = build_event_prompt(_format_event(event), plan_str, recent_str)
+        past = list(self._chat_history)
         self._push_history("user", "event", user_msg)
-        await self._run_loop(source="event")
+        await self._run_loop(source="event", past_history=past, current_message=user_msg)
 
     async def morning_brief(self) -> None:
         logger.info("아침 브리핑 시작")
         self._notify("system", "장 시작 전 브리핑을 시작합니다...")
         prompt = build_morning_brief_prompt()
+        past = list(self._chat_history)
         self._push_history("user", "morning_brief", prompt)
-        await self._run_loop(source="morning_brief")
+        await self._run_loop(source="morning_brief", past_history=past, current_message=prompt)
 
     async def chat(self, user_input: str) -> str:
+        past = list(self._chat_history)
         self._push_history("user", "chat", user_input)
-        return await self._run_loop(source="chat")
+        return await self._run_loop(source="chat", past_history=past, current_message=user_input)
 
-    async def _run_loop(self, source: str) -> str:
+    async def _run_loop(self, source: str, past_history: list[dict], current_message: str) -> str:
         final_text = await self._provider.run_loop(
-            history=list(self._chat_history),
+            past_history=past_history,
+            current_message=current_message,
             on_text=lambda text: self._notify(source, text),
             on_tool=lambda name, result: self._notify("tool", f"{name} → {result[:200]}"),
             execute_tool=self._executor.execute,

@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+import re
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 
@@ -19,7 +21,8 @@ class BaseProvider(ABC):
     @abstractmethod
     async def run_loop(
         self,
-        history: list[dict],
+        past_history: list[dict],
+        current_message: str,
         on_text: Callable[[str], None],
         on_tool: Callable[[str, str], None],
         execute_tool: Callable[[str, dict], Awaitable[str]],
@@ -34,12 +37,18 @@ class AnthropicProvider(BaseProvider):
 
     async def run_loop(
         self,
-        history: list[dict],
+        past_history: list[dict],
+        current_message: str,
         on_text: Callable[[str], None],
         on_tool: Callable[[str, str], None],
         execute_tool: Callable[[str, dict], Awaitable[str]],
     ) -> str:
-        messages = list(history)
+        messages: list[dict] = []
+        if past_history:
+            messages.append({"role": "user", "content": "[이전 대화 기록 — 참고용, 재실행 금지]"})
+            messages.append({"role": "assistant", "content": "이전 대화 기록을 참고하겠습니다."})
+            messages.extend(past_history)
+        messages.append({"role": "user", "content": current_message})
         final_text = ""
 
         while True:
@@ -102,12 +111,13 @@ class OpenAICompatibleProvider(BaseProvider):
 
     async def run_loop(
         self,
-        history: list[dict],
+        past_history: list[dict],
+        current_message: str,
         on_text: Callable[[str], None],
         on_tool: Callable[[str, str], None],
         execute_tool: Callable[[str, dict], Awaitable[str]],
     ) -> str:
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
+        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *past_history, {"role": "user", "content": current_message}]
         tools = self._to_openai_tools(TOOL_DEFINITIONS)
         final_text = ""
 
@@ -128,6 +138,24 @@ class OpenAICompatibleProvider(BaseProvider):
                         return "API 일일 요청 한도를 초과했습니다. 내일 다시 사용 가능합니다."
                     logger.warning("429 — %ds 후 재시도 (%d/2)", retry_after, attempt + 1)
                     await asyncio.sleep(retry_after)
+                except openai.BadRequestError as e:
+                    parsed = _parse_failed_generation(e)
+                    if parsed:
+                        fn_name, fn_args = parsed
+                        logger.info("tool_use_failed 파싱 성공: %s(%s)", fn_name, fn_args)
+                        fake_id = f"call_{uuid.uuid4().hex[:8]}"
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{"id": fake_id, "type": "function", "function": {"name": fn_name, "arguments": json.dumps(fn_args, ensure_ascii=False)}}],
+                        })
+                        on_text(f"[{fn_name}]")
+                        result = await execute_tool(fn_name, fn_args)
+                        on_tool(fn_name, result)
+                        messages.append({"role": "tool", "tool_call_id": fake_id, "content": result})
+                        break
+                    logger.warning("400 Bad Request (파싱 불가): %s", e)
+                    return "요청을 처리할 수 없습니다. 다시 시도해 주세요."
             else:
                 return "API 요청 한도 초과입니다."
 
@@ -171,9 +199,24 @@ _PROVIDERS = {
     "groq":      lambda key: OpenAICompatibleProvider(
         key,
         "https://api.groq.com/openai/v1",
-        "llama-3.3-70b-versatile",
+        "llama-3.1-8b-instant",
     ),
 }
+
+
+def _parse_failed_generation(e: Exception) -> tuple[str, dict] | None:
+    """Groq tool_use_failed 에러에서 함수명+인자 파싱."""
+    try:
+        body = e.response.json() if hasattr(e, "response") else {}
+        failed = body.get("error", {}).get("failed_generation", "")
+        m = re.search(r"<function=(\w+)[=(]?({.*?})\s*[)>]?</function>", failed, re.DOTALL)
+        if not m:
+            m = re.search(r"<function=(\w+)({.*?})</function>", failed, re.DOTALL)
+        if m:
+            return m.group(1), json.loads(m.group(2))
+    except Exception:
+        pass
+    return None
 
 
 def create_provider(provider_name: str, api_key: str) -> BaseProvider:

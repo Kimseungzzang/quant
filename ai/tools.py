@@ -269,7 +269,6 @@ class ToolExecutor:
         ws: Any = None,
         domestic_api: Any = None,
         overseas_api: Any = None,
-        regime_fn: Any = None,
     ):
         self._market = market_data
         self._account = account
@@ -279,7 +278,6 @@ class ToolExecutor:
         self._ws = ws
         self._domestic = domestic_api
         self._overseas = overseas_api
-        self._regime_fn = regime_fn
 
     async def execute(self, tool_name: str, tool_input: dict) -> str:
         logger.info("도구 실행: %s %s", tool_name, tool_input)
@@ -370,7 +368,12 @@ class ToolExecutor:
                 items = self._domestic.get_volume_ranking() if self._domestic else []
         except Exception as e:
             return json.dumps({"error": f"순위 조회 실패: {e}"})
-        return json.dumps({"rank_type": rank_type, "market": market, "items": items}, ensure_ascii=False)
+        slim = [
+            {"name": it.get("hts_kor_isnm", ""), "code": it.get("mksc_shrn_iscd", ""), "rank": it.get("data_rank", ""),
+             "price": it.get("stck_prpr", ""), "change_rate": it.get("prdy_ctrt", "")}
+            for it in items[:10]
+        ]
+        return json.dumps({"rank_type": rank_type, "market": market, "items": slim}, ensure_ascii=False)
 
     async def _get_candles(self, stock_code: str, market: str, candle_type: str, count: int) -> str:
         import asyncio
@@ -423,12 +426,11 @@ class ToolExecutor:
         try:
             from ddgs import DDGS
             with DDGS() as ddgs:
-                results = list(ddgs.text(query, region="kr-kr", max_results=min(max_results, 10)))
+                results = list(ddgs.text(query, region="kr-kr", max_results=min(max_results, 5)))
             items = [
                 {
                     "title": r.get("title", ""),
-                    "body": r.get("body", "")[:300],
-                    "url": r.get("href", ""),
+                    "body": r.get("body", "")[:150],
                 }
                 for r in results
             ]

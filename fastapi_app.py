@@ -17,7 +17,7 @@ import asyncpg
 import redis
 import yaml
 from dotenv import load_dotenv
-from fastapi import FastAPI, BackgroundTasks, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -37,10 +37,6 @@ from kis.websocket import (
 )
 from kis.constants import WebSocketTRID, ExchangeCode, TradingMode
 
-from analysis.screener import Screener
-from analysis import backtester as bt_module
-from analysis.indicators import calculate_indicators
-from analysis.market_regime import MarketRegimeDetector, OverseasRegimeDetector
 
 from trading.risk import RiskManager
 from trading.order_manager import OrderManager, TradeLogger
@@ -59,7 +55,7 @@ from ai.tools import ToolExecutor
 from ai.agent import AIAgent
 from ai.provider import create_provider
 
-from main import CandleAggregator, load_config, setup_logging
+from utils import CandleAggregator, load_config, setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +65,7 @@ _ws_clients: set[WebSocket] = set()
 _components: dict[str, Any] = {}
 _agent: AIAgent | None = None
 _event_engine: EventEngine | None = None
-_analysis_progress: dict[int, dict] = {}
-_cancel_flags: set[int] = set()
+
 _components_lock = threading.Lock()
 _trading_task: asyncio.Task | None = None
 
@@ -107,20 +102,19 @@ def _build_sync_components(config: dict) -> dict:
         db=redis_cfg.get("db", 0),
         decode_responses=False,
     )
-    auth = KISAuth(config)
+    auth = KISAuth(config, redis_client=redis_client)
     client = KISRestClient(auth)
     domestic = DomesticAPI(client, config)
     overseas = OverseasAPI(client, config)
     risk = RiskManager(config)
     pg_sync = PGWriterSync()
     order_mgr = OrderManager(domestic, overseas, risk, TradeLogger(), pg=pg_sync, mode=config["mode"])
-    screener = Screener(domestic, overseas, config)
     market_data = MarketDataCollector(redis_client)
     account = AccountCollector(redis_client)
     return dict(
         config=config, auth=auth,
         domestic=domestic, overseas=overseas,
-        risk=risk, order_mgr=order_mgr, screener=screener,
+        risk=risk, order_mgr=order_mgr,
         redis=redis_client,
         market_data=market_data, account=account,
     )
@@ -138,13 +132,6 @@ async def _build_async_components(config: dict, sync_comp: dict) -> dict:
     )
     memory = AgentMemory(pg_pool)
 
-    def _regime_fn():
-        try:
-            r = MarketRegimeDetector(sync_comp["domestic"]).detect()
-            return {"trend": r.trend.value, "volatility": r.volatility.value, "tradeable": r.tradeable}
-        except Exception:
-            return {}
-
     tool_executor = ToolExecutor(
         market_data=sync_comp["market_data"],
         account=sync_comp["account"],
@@ -154,7 +141,6 @@ async def _build_async_components(config: dict, sync_comp: dict) -> dict:
         ws=sync_comp.get("ws"),
         domestic_api=sync_comp["domestic"],
         overseas_api=sync_comp["overseas"],
-        regime_fn=_regime_fn,
     )
     ai_cfg = config.get("ai", {})
     provider_name = ai_cfg.get("provider", "anthropic")
@@ -304,15 +290,6 @@ async def lifespan(app: FastAPI):
     config = load_config()
     setup_logging(config)
 
-    try:
-        from db.pg_writer import PGWriter as _PGW
-        pg = _PGW()
-        cleaned = await pg.reset_stuck_analysis_runs()
-        if cleaned > 0:
-            logger.warning("stuck analysis_run %d건 정리", cleaned)
-    except Exception as e:
-        logger.warning("stuck 정리 실패: %s", e)
-
     sync_comp = _build_sync_components(config)
     async_comp = await _build_async_components(config, sync_comp)
     _components = {**sync_comp, **async_comp}
@@ -353,21 +330,6 @@ app.add_middleware(
 
 
 # ── 요청 모델 ─────────────────────────────────────────────────────────
-
-class AnalyzeRequest(BaseModel):
-    market: str = "domestic"
-    horizon: str = "swing"
-    top_n: int = 10
-    lookback_days: int | None = None
-
-class BacktestRequest(BaseModel):
-    stock_code: str
-    stock_name: str = ""
-    market: str = "domestic"
-    exchange: str | None = None
-    period_days: int = 60
-    start_date: str | None = None
-    end_date: str | None = None
 
 class ChatRequest(BaseModel):
     message: str
@@ -502,37 +464,6 @@ def account_balance(market: str = "domestic", mode: str | None = None):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@app.get("/regime")
-def get_regime():
-    domestic = _components.get("domestic")
-    if domestic is None:
-        raise HTTPException(status_code=503, detail="초기화 중")
-    config = _components.get("config") or {}
-
-    def _fmt(r):
-        return {
-            "trend": r.trend.value, "trend_strength": r.trend_strength,
-            "volatility": r.volatility.value, "session": r.session.value,
-            "index_change_pct": r.index_change_pct,
-            "preferred_strategies": r.preferred_strategies,
-            "tradeable": r.tradeable, "reason": r.reason,
-        }
-
-    try:
-        dom_regime = MarketRegimeDetector(domestic).detect()
-        dom_result = _fmt(dom_regime)
-    except Exception:
-        dom_result = None
-
-    try:
-        ovs_regime = OverseasRegimeDetector(domestic, config).detect()
-        ovs_result = _fmt(ovs_regime)
-    except Exception:
-        ovs_result = None
-
-    return {"domestic": dom_result, "overseas": ovs_result}
-
-
 # ── 포지션 / 주문 ─────────────────────────────────────────────────────
 
 @app.get("/trade/positions")
@@ -578,112 +509,7 @@ def set_mode(req: ModeRequest):
     return {"status": "ok", "mode": req.mode}
 
 
-# ── 분석 ──────────────────────────────────────────────────────────────
-
-@app.post("/analyze")
-async def analyze(req: AnalyzeRequest, background_tasks: BackgroundTasks):
-    pg = PGWriter()
-    if req.horizon not in {"long", "swing", "daytrade"}:
-        raise HTTPException(status_code=400, detail="horizon: long/swing/daytrade")
-    if await pg.has_running_analysis(req.market, req.horizon):
-        raise HTTPException(status_code=409, detail="분析 이미 실행 중")
-    run_id = await pg.create_analysis_run(req.market, req.top_n, req.horizon)
-    background_tasks.add_task(_run_analysis, run_id, req.market, req.top_n, req.lookback_days, req.horizon)
-    return {"run_id": run_id, "status": "started"}
-
-
-@app.get("/analyze/{run_id}/progress")
-async def get_progress(run_id: int):
-    p = _analysis_progress.get(run_id)
-    if p is None:
-        saved = await PGWriter().get_analysis_run_status(run_id)
-        if not saved:
-            return {"done": 0, "total": 0, "current": "", "status": "unknown", "pct": 0}
-        done = int(saved.get("result_count") or 0)
-        total = max(done, int(saved.get("top_n") or 0))
-        p = {"done": done, "total": total, "current": "", "status": saved.get("status", "unknown")}
-    pct = int(p["done"] / p["total"] * 100) if p["total"] > 0 else 0
-    return {**p, "pct": pct}
-
-
-@app.post("/analyze/{run_id}/cancel")
-async def cancel_analysis(run_id: int):
-    _cancel_flags.add(run_id)
-    _analysis_progress.pop(run_id, None)
-    await PGWriter().complete_analysis_run(run_id, "failed", "사용자 취소")
-    return {"run_id": run_id, "status": "cancelled"}
-
-
-async def _run_analysis(run_id: int, market: str, top_n: int, lookback_days: int | None, horizon: str):
-    pg = PGWriter()
-    _analysis_progress[run_id] = {"done": 0, "total": 0, "current": "", "status": "running"}
-
-    def on_progress(done: int, total: int, current: str):
-        if run_id in _cancel_flags:
-            raise RuntimeError("사용자 취소")
-        _analysis_progress[run_id] = {"done": done, "total": total, "current": current, "status": "running"}
-
-    try:
-        screener: Screener = _components["screener"]
-        loop = asyncio.get_event_loop()
-        if market == "domestic":
-            candidates = await loop.run_in_executor(
-                None, lambda: screener.run_domestic(top_n=top_n, lookback_days=lookback_days, on_progress=on_progress, horizon=horizon)
-            )
-        else:
-            candidates = await loop.run_in_executor(
-                None, lambda: screener.run_overseas(top_n=top_n, lookback_days=lookback_days, on_progress=on_progress, horizon=horizon)
-            )
-        await pg.save_analysis_results(run_id, candidates)
-        await pg.complete_analysis_run(run_id, "completed")
-        _analysis_progress[run_id] = {"done": len(candidates), "total": len(candidates), "current": "", "status": "completed"}
-    except Exception as e:
-        is_cancel = "사용자 취소" in str(e)
-        if not is_cancel:
-            logger.exception("분析 실패 run_id=%d", run_id)
-            await pg.complete_analysis_run(run_id, "failed", str(e))
-        _analysis_progress[run_id] = {**_analysis_progress.get(run_id, {}), "status": "cancelled" if is_cancel else "failed"}
-    finally:
-        _cancel_flags.discard(run_id)
-
-
-# ── 백테스트 ──────────────────────────────────────────────────────────
-
-@app.post("/backtest")
-async def backtest(req: BacktestRequest):
-    loop = asyncio.get_event_loop()
-    end_date = date.fromisoformat(req.end_date) if req.end_date else date.today()
-    start_date = date.fromisoformat(req.start_date) if req.start_date else end_date - timedelta(days=req.period_days)
-    period_days = (end_date - start_date).days
-    fetch_start = start_date - timedelta(days=90)
-    try:
-        if req.market == "domestic":
-            daily_df = await loop.run_in_executor(None, lambda: _components["domestic"].get_daily_ohlcv(req.stock_code, fetch_start, end_date))
-            minute_df = await loop.run_in_executor(None, lambda: _components["domestic"].get_historical_minute_ohlcv(req.stock_code, lookback_days=period_days, candle_minutes=1))
-            daily_ind = calculate_indicators(daily_df)
-            context = Screener._build_context(daily_ind, ["gap", "breakout", "pullback"])
-            risk_cfg = (_components.get("config") or {}).get("trading", {})
-            result = await loop.run_in_executor(None, lambda: bt_module.run_strategy_backtest(
-                req.stock_code, minute_df, context=context,
-                stop_loss_pct=risk_cfg.get("stop_loss_pct", 5.0),
-                take_profit_pct=risk_cfg.get("take_profit_pct", 5.0),
-            ))
-        else:
-            exchange = ExchangeCode(req.exchange or "NAS")
-            df = await loop.run_in_executor(None, lambda: _components["overseas"].get_daily_ohlcv(req.stock_code, exchange, fetch_start, end_date))
-            result = await loop.run_in_executor(None, lambda: bt_module.run_backtest(req.stock_code, df, start_from=start_date))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    result_dict = asdict(result)
-    result_dict.update({"stock_name": req.stock_name or req.stock_code, "period_days": period_days,
-                         "start_date": start_date.isoformat(), "end_date": end_date.isoformat()})
-    trades = result_dict.pop("trades", [])
-    saved_id = await PGWriter().save_backtest_result(result_dict, req.market)
-    return {"id": saved_id, **result_dict, "trades": trades}
-
-
-# ── 거래 내역 조회 (Spring Boot 에서 이관) ───────────────────────────
+# ── 거래 내역 조회 ───────────────────────────────────────────────────
 
 @app.get("/trades")
 async def get_trades(mode: str = "paper", page: int = 0, size: int = 20, period: str = "all", stockCode: str = ""):
@@ -709,30 +535,6 @@ async def get_stock_performance(mode: str = "paper", period: str = "month"):
 async def get_daily_reports(mode: str = "paper", period: str = "month"):
     return await PGWriter().get_daily_reports(mode=mode, period=period)
 
-
-@app.get("/backtest")
-async def get_backtest_list(market: str = "domestic", limit: int = 20):
-    return await PGWriter().get_backtest_list(market=market, limit=limit)
-
-
-@app.get("/analysis/runs")
-async def get_analysis_runs(market: str = "domestic", horizon: str = "swing"):
-    return await PGWriter().get_analysis_runs(market=market, horizon=horizon)
-
-
-@app.get("/analysis")
-async def get_analysis_latest(market: str = "domestic", horizon: str = "swing"):
-    return await PGWriter().get_analysis_latest(market=market, horizon=horizon)
-
-
-@app.get("/analysis/run/{run_id}")
-async def get_analysis_by_run(run_id: int):
-    return await PGWriter().get_results_by_run(run_id)
-
-
-@app.get("/analysis/running")
-async def get_running_analysis():
-    return await PGWriter().get_running_analysis()
 
 
 # ── 유틸 ──────────────────────────────────────────────────────────────

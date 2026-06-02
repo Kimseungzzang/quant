@@ -1,7 +1,6 @@
 import json
 import logging
 import requests
-from pathlib import Path
 from datetime import datetime
 
 from .constants import (
@@ -13,8 +12,9 @@ from .constants import (
 
 logger = logging.getLogger(__name__)
 
+
 class KISAuth:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, redis_client=None):
         kis_cfg = config["kis"]
         mode = TradingMode(config["mode"])
         if mode in (TradingMode.PAPER, TradingMode.MOCK):
@@ -25,7 +25,8 @@ class KISAuth:
             self.app_secret = kis_cfg.get("live_app_secret") or kis_cfg.get("app_secret", "")
         self.is_mock  = mode == TradingMode.MOCK
         self.is_paper = mode in (TradingMode.PAPER, TradingMode.MOCK)
-        self._token_cache_file = Path(f"data/.token_cache_{mode.value}.json")
+        self._redis = redis_client
+        self._redis_key = f"kis:token:{mode.value}"
 
         if mode == TradingMode.MOCK:
             self.base_url    = config["kis"].get("rest_url", KIS_REST_URL_MOCK)
@@ -111,21 +112,25 @@ class KISAuth:
         return self._ws_approval_key
 
     def _load_token_cache(self) -> dict | None:
-        if not self._token_cache_file.exists():
-            return None
-        try:
-            with self._token_cache_file.open() as f:
-                return json.load(f)
-        except Exception:
-            return None
+        if self._redis:
+            try:
+                raw = self._redis.get(self._redis_key)
+                return json.loads(raw) if raw else None
+            except Exception:
+                return None
+        return None
 
     def _save_token_cache(self):
-        self._token_cache_file.parent.mkdir(parents=True, exist_ok=True)
-        with self._token_cache_file.open("w") as f:
-            json.dump(
-                {
-                    "access_token": self._access_token,
-                    "expired_at": self._token_expired_at.isoformat(),
-                },
-                f,
+        if not self._redis:
+            return
+        ttl = int((self._token_expired_at - datetime.now()).total_seconds())
+        if ttl <= 0:
+            return
+        try:
+            self._redis.setex(
+                self._redis_key,
+                ttl,
+                json.dumps({"access_token": self._access_token, "expired_at": self._token_expired_at.isoformat()}),
             )
+        except Exception as e:
+            logger.warning("Redis 토큰 저장 실패: %s", e)
