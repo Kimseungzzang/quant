@@ -41,6 +41,8 @@ class KISWebSocket:
         self.auth = auth
         self.ws_url = auth.ws_full_url
         self._running = False
+        self._ws = None           # 활성 WebSocket 연결 (동적 구독에 사용)
+        self._approval_key = None
 
         # tr_id → {columns, encrypt, key, iv}
         self._data_map: dict[str, dict] = {}
@@ -82,22 +84,82 @@ class KISWebSocket:
         ]
         self._handlers.pop(f"{tr_id}:{stock_code}", None)
 
+    async def add_live_subscription(self, tr_id: WebSocketTRID | str, stock_code: str, handler: Callable) -> bool:
+        """연결 중인 WebSocket에 실시간으로 구독 추가. 연결 전이면 False 반환."""
+        self.subscribe(tr_id, stock_code, handler)
+        if self._ws is None or self._approval_key is None:
+            return False
+        try:
+            msg = {
+                "header": {
+                    "approval_key": self._approval_key,
+                    "custtype": "P",
+                    "tr_type": "1",
+                    "content-type": "utf-8",
+                },
+                "body": {"input": {"tr_id": str(tr_id), "tr_key": stock_code}},
+            }
+            await self._ws.send(json.dumps(msg))
+            logger.info("동적 구독 추가: [%s] %s", tr_id, stock_code)
+            return True
+        except Exception as e:
+            logger.warning("동적 구독 실패: %s", e)
+            return False
+
+    async def connect_and_subscribe(
+        self,
+        domestic_codes: list[str],
+        overseas_codes: list[str],
+        callbacks: dict,
+    ) -> None:
+        """편의 메서드: 종목 목록으로 구독 등록 후 run() 실행."""
+        from kis.constants import WebSocketTRID as _TRID
+
+        price_cb = callbacks.get(_TRID.DOMESTIC_PRICE)
+        askbid_cb = callbacks.get(_TRID.DOMESTIC_ASKBID)
+        fill_cb = callbacks.get(_TRID.DOMESTIC_FILL)
+        ovs_price_cb = callbacks.get(_TRID.OVERSEAS_PRICE)
+        ovs_fill_cb = callbacks.get(_TRID.OVERSEAS_FILL)
+
+        for code in domestic_codes:
+            if price_cb:
+                self.subscribe(_TRID.DOMESTIC_PRICE, code, price_cb)
+            if askbid_cb:
+                self.subscribe(_TRID.DOMESTIC_ASKBID, code, askbid_cb)
+
+        for code in overseas_codes:
+            if ovs_price_cb:
+                tr_key = f"DNAS{code}"
+                self.subscribe(_TRID.OVERSEAS_PRICE, tr_key, ovs_price_cb)
+
+        hts_id = self.auth.config.get("kis", {}).get("hts_id", "")
+        account_no = self.auth.get_account_no()
+        if fill_cb and hts_id:
+            self.subscribe_global(_TRID.DOMESTIC_FILL, hts_id, fill_cb)
+        if ovs_fill_cb and account_no:
+            self.subscribe_global(_TRID.OVERSEAS_FILL, account_no, ovs_fill_cb)
+
+        await self.run()
+
     async def run(self):
         """WebSocket 수신 루프. 재연결 포함."""
         self._running = True
-        approval_key = self.auth.get_ws_approval_key()
+        self._approval_key = self.auth.get_ws_approval_key()
 
         while self._running:
             try:
                 async with websockets.connect(self.ws_url, ping_interval=None) as ws:
+                    self._ws = ws
                     logger.info("WebSocket 연결됨: %s", self.ws_url)
-                    await self._send_subscriptions(ws, approval_key)
+                    await self._send_subscriptions(ws, self._approval_key)
                     await self._recv_loop(ws)
             except (websockets.ConnectionClosed, OSError) as e:
                 logger.warning("WebSocket 연결 종료: %s — 5초 후 재연결", e)
+                self._ws = None
                 await asyncio.sleep(5)
             except Exception as e:
                 logger.error("WebSocket 오류: %s", e)
+                self._ws = None
                 await asyncio.sleep(5)
 
     def stop(self):

@@ -10,7 +10,7 @@ import asyncpg
 
 _DSN = os.getenv(
     "DATABASE_URL",
-    "postgresql://kimseungzzang@localhost/quant_trading",
+    "postgresql://ksjhbrc@localhost/quant_trading",
 )
 
 
@@ -257,6 +257,194 @@ class PGWriter:
         finally:
             await conn.close()
 
+    async def get_trades(self, mode: str = "paper", page: int = 0, size: int = 20,
+                          period: str = "all", stock_code: str = "") -> dict:
+        conn = await _conn()
+        try:
+            where = ["mode = $1"]
+            params: list = [mode]
+            if stock_code:
+                params.append(f"%{stock_code}%")
+                where.append(f"(stock_code ILIKE ${len(params)} OR stock_name ILIKE ${len(params)})")
+            if period != "all":
+                days = {"week": 7, "month": 30, "quarter": 90, "year": 365}.get(period, 30)
+                where.append(f"traded_at >= NOW() - INTERVAL '{days} days'")
+            w = " AND ".join(where)
+            total = await conn.fetchval(f"SELECT COUNT(*) FROM trades WHERE {w}", *params)
+            params.extend([size, page * size])
+            rows = await conn.fetch(
+                f"SELECT * FROM trades WHERE {w} ORDER BY traded_at DESC LIMIT ${len(params)-1} OFFSET ${len(params)}",
+                *params,
+            )
+            return {
+                "content": [dict(r) for r in rows],
+                "totalElements": total,
+                "totalPages": -(-total // size),
+                "number": page,
+            }
+        finally:
+            await conn.close()
+
+    async def get_pnl_summary(self, mode: str = "paper") -> dict:
+        conn = await _conn()
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(SUM(realized_pnl), 0) AS total_realized_pnl,
+                    COUNT(*) FILTER (WHERE side = 'SELL') AS total_trades,
+                    COUNT(*) FILTER (WHERE side = 'SELL' AND realized_pnl > 0) AS winning_trades
+                FROM trades WHERE mode = $1 AND realized_pnl IS NOT NULL
+                """,
+                mode,
+            )
+            total = int(row["total_trades"] or 0)
+            wins = int(row["winning_trades"] or 0)
+            pnl = float(row["total_realized_pnl"] or 0)
+            return {
+                "totalRealizedPnl": pnl,
+                "totalTrades": total,
+                "winningTrades": wins,
+                "winRate": round(wins / total * 100, 2) if total > 0 else 0,
+                "avgPnlPerTrade": round(pnl / total, 4) if total > 0 else 0,
+            }
+        finally:
+            await conn.close()
+
+    async def get_pnl_chart(self, mode: str = "paper", days: int = 30) -> list[dict]:
+        conn = await _conn()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT snapshot_date AS date, total_value AS "totalValue",
+                       cumulative_pnl AS "cumulativePnl", realized_pnl AS "dailyPnl"
+                FROM portfolio_snapshots
+                WHERE mode = $1 AND snapshot_date >= CURRENT_DATE - $2
+                ORDER BY snapshot_date
+                """,
+                mode, days,
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    async def get_stock_performance(self, mode: str = "paper", period: str = "month") -> list[dict]:
+        conn = await _conn()
+        try:
+            days = {"week": 7, "month": 30, "quarter": 90, "year": 365}.get(period, 30)
+            rows = await conn.fetch(
+                """
+                SELECT stock_code AS "stockCode", stock_name AS "stockName",
+                       COUNT(*) FILTER (WHERE side = 'SELL') AS "tradePairs",
+                       COUNT(*) FILTER (WHERE side = 'SELL' AND realized_pnl > 0) AS wins,
+                       COALESCE(SUM(realized_pnl) FILTER (WHERE side = 'SELL'), 0) AS "totalPnl",
+                       COALESCE(AVG(realized_pnl) FILTER (WHERE side = 'SELL'), 0) AS "avgPnl",
+                       COALESCE(MAX(realized_pnl) FILTER (WHERE side = 'SELL'), 0) AS "maxPnl",
+                       COALESCE(MIN(realized_pnl) FILTER (WHERE side = 'SELL'), 0) AS "minPnl"
+                FROM trades
+                WHERE mode = $1 AND traded_at >= NOW() - INTERVAL '1 day' * $2
+                GROUP BY stock_code, stock_name
+                ORDER BY "totalPnl" DESC
+                """,
+                mode, days,
+            )
+            result = []
+            for r in rows:
+                d = dict(r)
+                pairs = int(d["tradePairs"] or 0)
+                wins = int(d["wins"] or 0)
+                d["winRate"] = round(wins / pairs * 100, 2) if pairs > 0 else 0
+                result.append(d)
+            return result
+        finally:
+            await conn.close()
+
+    async def get_daily_reports(self, mode: str = "paper", period: str = "month") -> list[dict]:
+        conn = await _conn()
+        try:
+            days = {"week": 7, "month": 30, "quarter": 90, "year": 365}.get(period, 30)
+            rows = await conn.fetch(
+                """
+                SELECT traded_at::date AS date,
+                       COUNT(*) FILTER (WHERE side = 'SELL') AS "tradePairs",
+                       COUNT(*) FILTER (WHERE side = 'SELL' AND realized_pnl > 0) AS wins,
+                       COUNT(*) FILTER (WHERE side = 'SELL' AND realized_pnl <= 0) AS losses,
+                       COALESCE(SUM(realized_pnl) FILTER (WHERE side = 'SELL'), 0) AS "totalPnl",
+                       COALESCE(MAX(realized_pnl) FILTER (WHERE side = 'SELL'), 0) AS "maxPnl",
+                       COALESCE(MIN(realized_pnl) FILTER (WHERE side = 'SELL'), 0) AS "minPnl"
+                FROM trades
+                WHERE mode = $1 AND traded_at >= NOW() - INTERVAL '1 day' * $2
+                GROUP BY traded_at::date
+                ORDER BY date DESC
+                """,
+                mode, days,
+            )
+            result = []
+            for r in rows:
+                d = dict(r)
+                pairs = int(d["tradePairs"] or 0)
+                wins = int(d["wins"] or 0)
+                d["winRate"] = round(wins / pairs * 100, 2) if pairs > 0 else 0
+                result.append(d)
+            return result
+        finally:
+            await conn.close()
+
+    async def get_backtest_list(self, market: str = "domestic", limit: int = 20) -> list[dict]:
+        conn = await _conn()
+        try:
+            rows = await conn.fetch(
+                "SELECT * FROM backtest_results WHERE market = $1 ORDER BY run_at DESC LIMIT $2",
+                market, limit,
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    async def get_analysis_runs(self, market: str = "domestic", horizon: str = "swing") -> list[dict]:
+        conn = await _conn()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT id, market, horizon, run_at AS "runAt", status,
+                       (SELECT COUNT(*) FROM analysis_results WHERE run_id = ar.id) AS "resultCount"
+                FROM analysis_runs ar
+                WHERE market = $1 AND horizon = $2
+                ORDER BY run_at DESC LIMIT 20
+                """,
+                market, horizon,
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    async def get_analysis_latest(self, market: str = "domestic", horizon: str = "swing") -> list[dict]:
+        conn = await _conn()
+        try:
+            rows = await conn.fetch(
+                """
+                SELECT ar.* FROM analysis_results ar
+                JOIN analysis_runs run ON ar.run_id = run.id
+                WHERE run.market = $1 AND run.horizon = $2 AND run.status = 'completed'
+                ORDER BY run.run_at DESC, ar.rank
+                LIMIT 30
+                """,
+                market, horizon,
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
+    async def get_running_analysis(self) -> list[dict]:
+        conn = await _conn()
+        try:
+            rows = await conn.fetch(
+                "SELECT * FROM analysis_runs WHERE status = 'running' ORDER BY run_at DESC"
+            )
+            return [dict(r) for r in rows]
+        finally:
+            await conn.close()
+
     async def upsert_position(self, pos: dict):
         conn = await _conn()
         try:
@@ -304,7 +492,7 @@ import psycopg2.extras
 
 _SYNC_DSN = os.getenv(
     "DATABASE_URL",
-    "postgresql://kimseungzzang@localhost/quant_trading",
+    "postgresql://ksjhbrc@localhost/quant_trading",
 )
 
 

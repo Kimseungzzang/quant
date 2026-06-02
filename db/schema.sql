@@ -145,3 +145,37 @@ CREATE TABLE trading_sessions (
                              CHECK (status IN ('running', 'stopped', 'error')),
     config_snapshot JSONB
 );
+
+-- ── 8. AI 세션 (아침 브리핑 계획) ────────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_sessions (
+    id              BIGSERIAL PRIMARY KEY,
+    market_outlook  TEXT         NOT NULL,
+    watch_stocks    JSONB        NOT NULL DEFAULT '[]',
+    strategy        TEXT         NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_sessions_date ON ai_sessions(created_at DESC);
+
+-- ── 9. AI 판단 이력 ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_decisions (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  BIGINT REFERENCES ai_sessions(id),
+    event_kind  VARCHAR(30)  NOT NULL,
+    stock_code  VARCHAR(20)  NOT NULL DEFAULT '',
+    action      VARCHAR(20)  NOT NULL,
+    reason      TEXT         NOT NULL,
+    confidence  NUMERIC(4,2) NOT NULL DEFAULT 0,
+    decided_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_decisions_at ON ai_decisions(decided_at DESC);
+
+-- ── 10. AI 메모 ─────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_memos (
+    id          BIGSERIAL PRIMARY KEY,
+    content     TEXT         NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_memos_at ON ai_memos(created_at DESC);

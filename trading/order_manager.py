@@ -6,8 +6,17 @@ from datetime import datetime
 from typing import Optional
 
 from kis.constants import ExchangeCode, CloseReason, TradeSignal
-from report.logger import TradeLogger
 from .risk import RiskManager
+
+
+class TradeLogger:
+    """pg_writer가 실제 DB 저장을 담당하므로 Python 로거에만 기록."""
+
+    def log_buy(self, stock_code: str, name: str, exchange: str, qty: int, price: float, order_no: str) -> None:
+        logger.info("BUY | %s(%s) %s주 @%.2f order=%s", name, stock_code, qty, price, order_no)
+
+    def log_sell(self, stock_code: str, name: str, exchange: str, qty: int, price: float, pnl_pct: float, reason: str, order_no: str) -> None:
+        logger.info("SELL | %s(%s) %s주 @%.2f pnl=%.2f%% reason=%s order=%s", name, stock_code, qty, price, pnl_pct, reason, order_no)
 
 logger = logging.getLogger(__name__)
 
