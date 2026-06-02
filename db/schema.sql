@@ -179,3 +179,14 @@ CREATE TABLE IF NOT EXISTS ai_memos (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ai_memos_at ON ai_memos(created_at DESC);
+
+-- ── 11. AI 대화 히스토리 ─────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_chat_history (
+    id          BIGSERIAL PRIMARY KEY,
+    role        VARCHAR(10)  NOT NULL,  -- user | assistant
+    source      VARCHAR(20)  NOT NULL,  -- chat | event | morning_brief
+    content     TEXT         NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_chat_history_at ON ai_chat_history(created_at DESC);

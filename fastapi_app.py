@@ -57,6 +57,7 @@ from events.engine import EventEngine
 from ai.memory import AgentMemory
 from ai.tools import ToolExecutor
 from ai.agent import AIAgent
+from ai.provider import create_provider
 
 from main import CandleAggregator, load_config, setup_logging
 
@@ -87,6 +88,8 @@ async def _broadcast(msg: dict) -> None:
 
 
 def _on_ai_message(source: str, message: str) -> None:
+    if source == "chat":
+        return  # CLI가 HTTP 응답으로 직접 처리
     asyncio.get_event_loop().call_soon_threadsafe(
         lambda: asyncio.create_task(
             _broadcast({"type": "ai_message", "source": source, "message": message, "ts": datetime.now().isoformat()})
@@ -153,8 +156,13 @@ async def _build_async_components(config: dict, sync_comp: dict) -> dict:
         overseas_api=sync_comp["overseas"],
         regime_fn=_regime_fn,
     )
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    agent = AIAgent(api_key=api_key, tool_executor=tool_executor, memory=memory, on_message=_on_ai_message)
+    ai_cfg = config.get("ai", {})
+    provider_name = ai_cfg.get("provider", "anthropic")
+    _key_env = {"gemini": "GEMINI_API_KEY", "groq": "GROQ_API_KEY", "anthropic": "ANTHROPIC_API_KEY"}
+    api_key = os.getenv(_key_env.get(provider_name, "ANTHROPIC_API_KEY"), "")
+    provider = create_provider(provider_name, api_key or "")
+    agent = AIAgent(provider=provider, tool_executor=tool_executor, memory=memory, on_message=_on_ai_message)
+    await agent.initialize()
 
     detector = EventDetector(sync_comp["market_data"], sync_comp["redis"])
     engine = EventEngine(detector)
@@ -562,8 +570,11 @@ def get_order_fills(market: str = "overseas"):
 def set_mode(req: ModeRequest):
     if req.mode not in {"paper", "live"}:
         raise HTTPException(status_code=400, detail="mode는 paper/live 중 하나")
-    config = (_components.get("config") or {})
-    config["mode"] = req.mode
+    cfg = _components.get("config") or {}
+    cfg["mode"] = req.mode
+    order_mgr = _components.get("order_mgr")
+    if order_mgr:
+        order_mgr.mode = req.mode
     return {"status": "ok", "mode": req.mode}
 
 

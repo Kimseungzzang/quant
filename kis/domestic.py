@@ -455,7 +455,7 @@ class DomesticAPI:
         for col in ["open", "high", "low", "close", "volume", "trading_value"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-        df["date"] = pd.to_datetime(df["date"], format="%Y%m%d")
-        return df.sort_values("date").reset_index(drop=True)[
-            ["date", "open", "high", "low", "close", "volume", "trading_value"]
+        df["datetime"] = pd.to_datetime(df["date"], format="%Y%m%d")
+        return df.sort_values("datetime").reset_index(drop=True)[
+            ["datetime", "open", "high", "low", "close", "volume", "trading_value"]
         ]

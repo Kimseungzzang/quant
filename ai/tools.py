@@ -4,8 +4,6 @@ from datetime import datetime
 from typing import Any
 
 import requests
-from bs4 import BeautifulSoup
-
 import redis
 
 from ai.memory import AgentMemory
@@ -17,7 +15,6 @@ _WATCHES_KEY = "ai:watches"
 
 logger = logging.getLogger(__name__)
 
-_NEWS_HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
 
 TOOL_DEFINITIONS = [
@@ -80,21 +77,30 @@ TOOL_DEFINITIONS = [
         },
     },
     {
-        "name": "get_market_summary",
-        "description": "KOSPI, KOSDAQ, 나스닥 등 주요 지수 현황과 시장 레짐을 조회합니다.",
-        "input_schema": {
-            "type": "object",
-            "properties": {},
-        },
-    },
-    {
-        "name": "search_news",
-        "description": "종목명 또는 키워드로 최신 뉴스를 검색합니다.",
+        "name": "set_trading_mode",
+        "description": (
+            "거래 모드를 paper(모의투자) 또는 live(실거래)로 변경합니다. "
+            "사용자가 명시적으로 요청할 때만 사용하세요."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "검색어 (예: '삼성전자 실적', '반도체 섹터 뉴스')"},
-                "max_results": {"type": "integer", "default": 5},
+                "mode": {"type": "string", "description": "paper | live"},
+            },
+            "required": ["mode"],
+        },
+    },
+    {
+        "name": "search_web",
+        "description": (
+            "웹에서 최신 정보를 검색합니다. 뉴스, 시황, 종목 분석, 경제 지표 등 실시간 정보가 필요할 때 사용하세요. "
+            "예: '삼성전자 오늘 뉴스', '미국 증시 마감', '코스피 시황', 'NVDA 실적 발표'"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "검색어"},
+                "max_results": {"type": "integer", "default": 5, "description": "결과 수 (최대 10)"},
             },
             "required": ["query"],
         },
@@ -176,6 +182,24 @@ TOOL_DEFINITIONS = [
                     "type": "string",
                     "description": "BUY/SELL/HOLD 등 특정 액션만 필터",
                 },
+            },
+        },
+    },
+    {
+        "name": "get_chat_history",
+        "description": (
+            "오늘 또는 특정 날짜의 대화 히스토리를 조회합니다. "
+            "'오늘 어떤 이벤트가 있었지?', '아까 브리핑에서 뭐라고 했지?' 등을 확인할 때 사용하세요."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "조회할 날짜 (YYYY-MM-DD). 비워두면 오늘"},
+                "source": {
+                    "type": "string",
+                    "description": "chat | event | morning_brief. 비워두면 전체",
+                },
+                "limit": {"type": "integer", "default": 20, "description": "가져올 최대 개수"},
             },
         },
     },
@@ -276,10 +300,10 @@ class ToolExecutor:
                         tool_input.get("candle_type", "minute"),
                         tool_input.get("count", 30),
                     )
-                case "get_market_summary":
-                    return self._get_market_summary()
-                case "search_news":
-                    return self._search_news(tool_input["query"], tool_input.get("max_results", 5))
+                case "set_trading_mode":
+                    return self._set_trading_mode(tool_input["mode"])
+                case "search_web":
+                    return self._search_web(tool_input["query"], tool_input.get("max_results", 5))
                 case "place_order":
                     return await self._place_order(tool_input)
                 case "cancel_order":
@@ -293,6 +317,12 @@ class ToolExecutor:
                         tool_input.get("stock_code", ""),
                         tool_input.get("limit", 20),
                         tool_input.get("action_filter", ""),
+                    )
+                case "get_chat_history":
+                    return await self._get_chat_history(
+                        tool_input.get("date"),
+                        tool_input.get("source"),
+                        tool_input.get("limit", 20),
                     )
                 case "set_watch":
                     return self._set_watch(tool_input)
@@ -337,10 +367,7 @@ class ToolExecutor:
                 from kis.constants import ExchangeCode
                 items = self._overseas.get_volume_ranking(ExchangeCode.NASDAQ) if self._overseas else []
             else:
-                if rank_type == "volume":
-                    items = self._domestic.get_volume_rank(top_n=30) if self._domestic else []
-                else:
-                    items = self._domestic.get_trading_value_rank(top_n=30) if self._domestic else []
+                items = self._domestic.get_volume_ranking() if self._domestic else []
         except Exception as e:
             return json.dumps({"error": f"순위 조회 실패: {e}"})
         return json.dumps({"rank_type": rank_type, "market": market, "items": items}, ensure_ascii=False)
@@ -379,38 +406,35 @@ class ToolExecutor:
         except Exception as e:
             return json.dumps({"error": f"차트 조회 실패: {e}"})
 
-    def _get_market_summary(self) -> str:
-        regime = self._regime_fn() if self._regime_fn else {}
-        all_prices = self._market.get_all_prices()
-        summary = {
-            "regime": regime,
-            "tracking_count": len(all_prices),
-            "timestamp": datetime.now().isoformat(),
-        }
-        return json.dumps(summary, ensure_ascii=False, default=str)
-
-    def _search_news(self, query: str, max_results: int) -> str:
+    def _set_trading_mode(self, mode: str) -> str:
+        if mode not in ("paper", "live"):
+            return json.dumps({"error": "mode는 paper 또는 live 중 하나입니다."})
         try:
-            url = f"https://search.naver.com/search.naver?where=news&query={requests.utils.quote(query)}&sort=1"
-            resp = requests.get(url, headers=_NEWS_HEADERS, timeout=8)
-            resp.encoding = "utf-8"
-            soup = BeautifulSoup(resp.text, "lxml")
-            articles = []
-            for item in soup.select("div.news_wrap")[:max_results]:
-                title_tag = item.select_one("a.news_tit")
-                desc_tag = item.select_one("div.dsc_wrap")
-                press_tag = item.select_one("a.info.press")
-                date_tag = item.select_one("span.info")
-                if title_tag:
-                    articles.append({
-                        "title": title_tag.get_text(strip=True),
-                        "description": desc_tag.get_text(strip=True)[:200] if desc_tag else "",
-                        "press": press_tag.get_text(strip=True) if press_tag else "",
-                        "date": date_tag.get_text(strip=True) if date_tag else "",
-                    })
-            return json.dumps({"query": query, "articles": articles}, ensure_ascii=False)
+            resp = requests.post(
+                "http://localhost:8000/mode",
+                json={"mode": mode},
+                timeout=5,
+            )
+            return json.dumps(resp.json(), ensure_ascii=False)
         except Exception as e:
-            return json.dumps({"error": f"뉴스 검색 실패: {e}"})
+            return json.dumps({"error": f"모드 변경 실패: {e}"})
+
+    def _search_web(self, query: str, max_results: int) -> str:
+        try:
+            from ddgs import DDGS
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, region="kr-kr", max_results=min(max_results, 10)))
+            items = [
+                {
+                    "title": r.get("title", ""),
+                    "body": r.get("body", "")[:300],
+                    "url": r.get("href", ""),
+                }
+                for r in results
+            ]
+            return json.dumps({"query": query, "results": items}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": f"웹 검색 실패: {e}"})
 
     async def _place_order(self, inp: dict) -> str:
         stock_code = inp["stock_code"]
@@ -480,6 +504,10 @@ class ToolExecutor:
             "decisions": decisions,
             "recent_memos": memos,
         }, ensure_ascii=False, default=str)
+
+    async def _get_chat_history(self, date: str | None, source: str | None, limit: int) -> str:
+        rows = await self._memory.get_chat_history(date=date, source=source, limit=limit)
+        return json.dumps(rows, ensure_ascii=False, default=str)
 
     def _set_watch(self, inp: dict) -> str:
         if not self._r:

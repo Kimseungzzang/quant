@@ -106,3 +106,49 @@ class AgentMemory:
                 limit,
             )
             return [r["content"] for r in rows]
+
+    async def save_history_entry(self, role: str, source: str, content: str) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ai_chat_history (role, source, content, created_at)
+                VALUES ($1, $2, $3, NOW())
+                """,
+                role, source, content,
+            )
+
+    async def get_chat_history(
+        self,
+        date: str | None = None,
+        source: str | None = None,
+        limit: int = 40,
+    ) -> list[dict]:
+        async with self._pool.acquire() as conn:
+            conditions = []
+            params: list = []
+            if date:
+                params.append(date)
+                conditions.append(f"created_at::date = ${len(params)}::date")
+            else:
+                conditions.append("created_at::date = CURRENT_DATE")
+            if source:
+                params.append(source)
+                conditions.append(f"source = ${len(params)}")
+            params.append(limit)
+            where = " AND ".join(conditions)
+            rows = await conn.fetch(
+                f"""
+                SELECT role, source, content, created_at
+                FROM ai_chat_history
+                WHERE {where}
+                ORDER BY created_at ASC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+            return [dict(r) for r in rows]
+
+    async def load_today_history(self) -> list[dict]:
+        """서버 시작 시 오늘 대화 히스토리를 복원합니다."""
+        rows = await self.get_chat_history()
+        return [{"role": r["role"], "content": r["content"]} for r in rows]

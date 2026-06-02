@@ -49,7 +49,12 @@ class KISRestClient:
             body = resp.text[:1000] if resp.text else ""
             logger.error("KIS HTTP 오류 [%s] %s: %s", resp.status_code, resp.url, body)
             raise e
-        data = resp.json()
+        if not resp.text:
+            raise RuntimeError("KIS API 빈 응답 (시장 닫힘 또는 데이터 없음)")
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise RuntimeError(f"KIS API 응답 파싱 실패: {e} | body={resp.text[:200]}") from e
         if data.get("rt_cd") != "0":
             logger.error("KIS API 오류 [%s]: %s", data.get("msg_cd"), data.get("msg1"))
             raise RuntimeError(f"KIS API 오류: {data.get('msg1')}")

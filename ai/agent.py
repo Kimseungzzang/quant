@@ -1,36 +1,42 @@
 import asyncio
-import json
 import logging
 from collections.abc import Callable
 
-import anthropic
-
 from ai.memory import AgentMemory
-from ai.prompts import SYSTEM_PROMPT, build_event_prompt, build_morning_brief_prompt
-from ai.tools import TOOL_DEFINITIONS, ToolExecutor
-from events.types import EventKind, MarketEvent
+from ai.prompts import build_event_prompt, build_morning_brief_prompt
+from ai.provider import BaseProvider
+from ai.tools import ToolExecutor
+from events.types import MarketEvent
 
 logger = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-8"
-MAX_TOKENS = 4096
 _CHAT_HISTORY_LIMIT = 20
 
 
 class AIAgent:
     def __init__(
         self,
-        api_key: str,
+        provider: BaseProvider,
         tool_executor: ToolExecutor,
         memory: AgentMemory,
         on_message: Callable[[str, str], None] | None = None,
     ):
-        self._client = anthropic.Anthropic(api_key=api_key)
+        self._provider = provider
         self._executor = tool_executor
         self._memory = memory
         self._on_message = on_message
         self._chat_history: list[dict] = []
         self._current_session_id: int | None = None
+
+    async def initialize(self) -> None:
+        self._chat_history = await self._memory.load_today_history()
+        logger.info("히스토리 복원: %d개 항목", len(self._chat_history))
+
+    def _push_history(self, role: str, source: str, content: str) -> None:
+        self._chat_history.append({"role": role, "content": content})
+        if len(self._chat_history) > _CHAT_HISTORY_LIMIT * 2:
+            self._chat_history = self._chat_history[-_CHAT_HISTORY_LIMIT * 2:]
+        asyncio.ensure_future(self._memory.save_history_entry(role, source, content))
 
     async def handle_event(self, event: MarketEvent) -> None:
         logger.info("AI 이벤트 처리: %s", event)
@@ -46,80 +52,31 @@ class AIAgent:
             for r in recent
         ) or "없음"
 
-        event_summary = _format_event(event)
-        user_msg = build_event_prompt(event_summary, plan_str, recent_str)
-
-        await self._run_agentic_loop(user_msg, source="event")
+        user_msg = build_event_prompt(_format_event(event), plan_str, recent_str)
+        self._push_history("user", "event", user_msg)
+        await self._run_loop(source="event")
 
     async def morning_brief(self) -> None:
         logger.info("아침 브리핑 시작")
         self._notify("system", "장 시작 전 브리핑을 시작합니다...")
-        await self._run_agentic_loop(build_morning_brief_prompt(), source="morning_brief")
+        prompt = build_morning_brief_prompt()
+        self._push_history("user", "morning_brief", prompt)
+        await self._run_loop(source="morning_brief")
 
     async def chat(self, user_input: str) -> str:
-        self._chat_history.append({"role": "user", "content": user_input})
-        if len(self._chat_history) > _CHAT_HISTORY_LIMIT * 2:
-            self._chat_history = self._chat_history[-_CHAT_HISTORY_LIMIT * 2:]
+        self._push_history("user", "chat", user_input)
+        return await self._run_loop(source="chat")
 
-        response = await self._run_agentic_loop(
-            user_input,
-            source="chat",
-            use_history=True,
+    async def _run_loop(self, source: str) -> str:
+        final_text = await self._provider.run_loop(
+            history=list(self._chat_history),
+            on_text=lambda text: self._notify(source, text),
+            on_tool=lambda name, result: self._notify("tool", f"{name} → {result[:200]}"),
+            execute_tool=self._executor.execute,
         )
-        return response
 
-    async def _run_agentic_loop(
-        self,
-        initial_message: str,
-        source: str,
-        use_history: bool = False,
-    ) -> str:
-        if use_history:
-            messages = list(self._chat_history)
-        else:
-            messages = [{"role": "user", "content": initial_message}]
-
-        final_text = ""
-
-        while True:
-            response = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda msgs=messages: self._client.messages.create(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    system=SYSTEM_PROMPT,
-                    tools=TOOL_DEFINITIONS,
-                    messages=msgs,
-                ),
-            )
-
-            tool_calls = [b for b in response.content if b.type == "tool_use"]
-            text_blocks = [b for b in response.content if b.type == "text"]
-
-            if text_blocks:
-                final_text = text_blocks[-1].text
-                self._notify(source, final_text)
-
-            messages.append({"role": "assistant", "content": response.content})
-
-            if response.stop_reason == "end_turn" or not tool_calls:
-                break
-
-            tool_results = []
-            for tool_call in tool_calls:
-                logger.info("도구 호출: %s(%s)", tool_call.name, tool_call.input)
-                result = await self._executor.execute(tool_call.name, tool_call.input)
-                self._notify("tool", f"{tool_call.name} → {result[:200]}")
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tool_call.id,
-                    "content": result,
-                })
-
-            messages.append({"role": "user", "content": tool_results})
-
-        if use_history:
-            self._chat_history.append({"role": "assistant", "content": final_text})
+        if final_text:
+            self._push_history("assistant", source, final_text)
 
         if source in ("event", "morning_brief") and final_text:
             await self._memory.save_memo(f"[{source}] {final_text[:500]}")
@@ -134,7 +91,7 @@ class AIAgent:
 
 def _format_event(event: MarketEvent) -> str:
     payload = event.payload
-    lines = [f"종류: {event.kind}", f"시장: {event.market}"]
+    lines = [f"종류: {event.kind}", f"시각: {event.market}"]
     if event.stock_code:
         lines.append(f"종목: {event.stock_name} ({event.stock_code})")
     for key, val in payload.items():
