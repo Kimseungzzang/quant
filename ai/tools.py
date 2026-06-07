@@ -433,7 +433,7 @@ class ToolExecutor:
                 data = self._domestic.get_price(stock_code)
                 return json.dumps({"stock_code": stock_code, "market": "domestic", "source": "rest", "data": data}, ensure_ascii=False, default=str)
             if market == "overseas" and self._overseas:
-                exch, data = self._get_overseas_price_auto(stock_code, exchange)
+                exch, data = self._fetch_overseas_data(stock_code, exchange, "price")
                 if data:
                     return json.dumps({"stock_code": stock_code, "market": "overseas", "exchange": str(exch), "source": "rest", "data": data}, ensure_ascii=False, default=str)
         except Exception as e:
@@ -485,7 +485,7 @@ class ToolExecutor:
                 start = end - timedelta(days=count * 2)
                 if market == "overseas":
                     df = await asyncio.wait_for(loop.run_in_executor(
-                        None, lambda: self._get_overseas_daily_ohlcv_auto(stock_code, exchange, start, end)[1]
+                        None, lambda: self._fetch_overseas_data(stock_code, exchange, "daily", start=start, end=end)[1]
                     ), timeout=12)
                 else:
                     df = await asyncio.wait_for(loop.run_in_executor(
@@ -495,14 +495,14 @@ class ToolExecutor:
                 if market == "overseas":
                     try:
                         df = await asyncio.wait_for(loop.run_in_executor(
-                            None, lambda: self._get_overseas_minute_ohlcv_auto(stock_code, exchange)
+                            None, lambda: self._fetch_overseas_data(stock_code, exchange, "minute")[1]
                         ), timeout=8)
                     except Exception:
                         from datetime import date, timedelta
                         end = date.today()
                         start = end - timedelta(days=count * 2)
                         df = await asyncio.wait_for(loop.run_in_executor(
-                            None, lambda: self._get_overseas_daily_ohlcv_auto(stock_code, exchange, start, end)[1]
+                            None, lambda: self._fetch_overseas_data(stock_code, exchange, "daily", start=start, end=end)[1]
                         ), timeout=12)
                         candle_type = "daily_fallback"
                 else:
@@ -614,7 +614,7 @@ class ToolExecutor:
             exchange = "KRX" if self._is_domestic_code(stock_code) else str(self._exchange_candidates(stock_code, inp.get("exchange"))[0])
             price = price or self._resolve_order_price(stock_code, exchange)
             if price <= 0:
-                return json.dumps({"error": f"{stock_code} 주문 기준가 확인 실패"})
+                return json.dumps({"error": f"{stock_code} 주문 기준가 확인 실패"}, ensure_ascii=False)
             result = self._order_manager.open_position(
                 stock_code=stock_code,
                 name=stock_name,
@@ -659,19 +659,15 @@ class ToolExecutor:
                 data = self._domestic.get_price(stock_code)
                 return self._first_float(data, ["stck_prpr", "price", "current_price", "last"])
             if self._overseas:
-                data = self._overseas.get_price(stock_code, self._exchange_candidates(stock_code, exchange)[0])
-                price = self._first_float(data, [
-                    "last", "price", "current_price", "ovrs_nmix_prpr",
-                    "stck_prpr", "tlast", "base", "clos",
-                ])
+                _, data = self._fetch_overseas_data(stock_code, exchange, "price")
+                price = self._first_float(data or {}, self._PRICE_FIELDS)
                 if price > 0:
                     return price
                 from datetime import date, timedelta
-                _, df = self._get_overseas_daily_ohlcv_auto(
-                    stock_code,
-                    exchange,
-                    date.today() - timedelta(days=10),
-                    date.today(),
+                _, df = self._fetch_overseas_data(
+                    stock_code, exchange, "daily",
+                    start=date.today() - timedelta(days=10),
+                    end=date.today(),
                 )
                 if df is not None and not df.empty:
                     return float(df.iloc[-1]["close"])
@@ -679,31 +675,37 @@ class ToolExecutor:
             logger.exception("주문 기준가 조회 실패: %s", stock_code)
         return 0.0
 
-    def _get_overseas_price_auto(self, stock_code: str, exchange: str | None = None) -> tuple[Any, dict]:
-        for exch in self._exchange_candidates(stock_code, exchange):
-            data = self._overseas.get_price(stock_code, exch)
-            if data and self._first_float(data, [
-                "last", "price", "current_price", "ovrs_nmix_prpr",
-                "stck_prpr", "tlast", "base", "clos",
-            ]) > 0:
-                return exch, data
-        return (None, {})
+    _PRICE_FIELDS = ["last", "price", "current_price", "ovrs_nmix_prpr", "stck_prpr", "tlast", "base", "clos"]
 
-    def _get_overseas_daily_ohlcv_auto(self, stock_code: str, exchange: str | None, start, end) -> tuple[Any, Any]:
+    def _fetch_overseas_data(
+        self,
+        stock_code: str,
+        exchange: str | None,
+        mode: str,  # "price" | "daily" | "minute"
+        *,
+        start=None,
+        end=None,
+    ) -> tuple[Any, Any]:
+        """해외 데이터 조회: exchange 우선순위대로 첫 성공 반환. (exch, data) 튜플 반환."""
         for exch in self._exchange_candidates(stock_code, exchange):
-            df = self._overseas.get_daily_ohlcv(stock_code, exch, start, end)
-            if df is not None and not df.empty:
-                df.attrs["exchange"] = str(exch)
-                return exch, df
-        return (None, None)
-
-    def _get_overseas_minute_ohlcv_auto(self, stock_code: str, exchange: str | None):
-        for exch in self._exchange_candidates(stock_code, exchange):
-            df = self._overseas.get_historical_minute_ohlcv(stock_code, exch, lookback_days=3)
-            if df is not None and not df.empty:
-                df.attrs["exchange"] = str(exch)
-                return df
-        return None
+            try:
+                if mode == "price":
+                    data = self._overseas.get_price(stock_code, exch)
+                    if data and self._first_float(data, self._PRICE_FIELDS) > 0:
+                        return exch, data
+                elif mode == "daily":
+                    df = self._overseas.get_daily_ohlcv(stock_code, exch, start, end)
+                    if df is not None and not df.empty:
+                        df.attrs["exchange"] = str(exch)
+                        return exch, df
+                elif mode == "minute":
+                    df = self._overseas.get_historical_minute_ohlcv(stock_code, exch, lookback_days=3)
+                    if df is not None and not df.empty:
+                        df.attrs["exchange"] = str(exch)
+                        return exch, df
+            except Exception:
+                continue
+        return None, None
 
     def _exchange_candidates(self, stock_code: str, exchange: str | None = None) -> list[Any]:
         from kis.constants import ExchangeCode
@@ -811,97 +813,17 @@ class ToolExecutor:
                 "instruction": "현재 한국 정규장이 닫혀 있습니다. 이 시간대에는 해외/미국 후보를 선택하세요.",
             }, ensure_ascii=False)
 
-        price_data = self._market.get_price(stock_code)
-        exchange = "KRX"
-        baseline_price = self._first_float(price_data or {}, ["current_price", "price", "last"])
-        baseline_volume = self._first_float(price_data or {}, ["acml_volume", "volume", "acml_vol"])
-        if baseline_price <= 0 and market == "overseas" and self._overseas:
-            try:
-                exchange_obj, rest_price = self._get_overseas_price_auto(stock_code, inp.get("exchange"))
-                if exchange_obj:
-                    exchange = str(exchange_obj)
-                baseline_price = self._first_float(rest_price or {}, [
-                    "last", "price", "current_price", "ovrs_nmix_prpr",
-                    "stck_prpr", "tlast", "base", "clos",
-                ])
-                baseline_volume = self._first_float(rest_price or {}, ["acml_vol", "volume", "tvol"])
-                if baseline_price <= 0:
-                    from datetime import date, timedelta
-                    exchange_obj, df = self._get_overseas_daily_ohlcv_auto(
-                        stock_code,
-                        inp.get("exchange"),
-                        date.today() - timedelta(days=10),
-                        date.today(),
-                    )
-                    if exchange_obj:
-                        exchange = str(exchange_obj)
-                    if df is not None and not df.empty:
-                        last = df.iloc[-1]
-                        baseline_price = float(last.get("close") or 0)
-                        baseline_volume = float(last.get("volume") or 0)
-            except Exception:
-                logger.exception("감시 기준가 조회 실패: %s", stock_code)
-        elif market == "overseas":
-            exchange = str(self._exchange_candidates(stock_code, inp.get("exchange"))[0])
+        err = self._validate_watch_conditions(inp.get("conditions", []))
+        if err:
+            return err
 
-        # expr 아닌 조건 reject
-        bad = [
-            c.get("type") for c in inp.get("conditions", [])
-            if c.get("type") not in ("expr", "price_above", "price_below")
-        ]
-        if bad:
-            return json.dumps({
-                "error": f"조건 타입 거부: {bad}. price_change/volume_spike는 사용 불가.",
-                "instruction": (
-                    "반드시 expr 타입을 사용하고 formula 필드에 파이썬 비교식을 작성하세요. "
-                    "2개 이상 지표를 조합해야 합니다. "
-                    "예시: 'rsi < 30 and bb_pct < 0.15 and change_pct < -2' "
-                    "사용 가능 변수: price, volume, change_pct, volume_ratio, "
-                    "rsi, macd, ma5, ma10, ma20, ma60, bb_pct, bb_upper, bb_lower, stoch_k, stoch_d"
-                ),
-            }, ensure_ascii=False)
-
-        watches = self._load_watches()
-        watches[stock_code] = {
-            "stock_code": stock_code,
-            "stock_name": inp["stock_name"],
-            "market": market,
-            "exchange": exchange,
-            "conditions": inp["conditions"],
-            "baseline_price": baseline_price,
-            "baseline_volume": baseline_volume,
-            "set_at": datetime.now().isoformat(),
-            "triggered_types": [],
-        }
-        self._r.set(_WATCHES_KEY, json.dumps(watches, ensure_ascii=False))
-
-        ws_subscribed = False
-        if self._ws is not None:
-            from kis.constants import WebSocketTRID
-
-            def _on_price(tr_id, fields):
-                from kis.websocket import parse_domestic_price, parse_overseas_price
-                parsed = parse_domestic_price(fields) if market == "domestic" else parse_overseas_price(fields)
-                code = parsed.get("stock_code", "")
-                if code:
-                    self._market.on_price_tick(code, {
-                        "stock_code": code,
-                        "current_price": parsed.get("price", 0),
-                        "volume": parsed.get("vol", 0),
-                        "acml_volume": parsed.get("acml_vol", 0),
-                        "time": parsed.get("time", ""),
-                        "exchange": exchange,
-                        "stock_name": inp["stock_name"],
-                    })
-
-            tr_id = WebSocketTRID.DOMESTIC_PRICE if market == "domestic" else WebSocketTRID.OVERSEAS_PRICE
-            tr_key = stock_code if market == "domestic" else f"D{exchange}{stock_code}"
-            try:
-                ws_subscribed = await self._ws.add_live_subscription(tr_id, tr_key, _on_price)
-            except Exception:
-                logger.exception("감시 종목 동적 구독 실패: %s", stock_code)
-                ws_subscribed = False
-
+        exchange, baseline_price, baseline_volume = await self._resolve_watch_baseline(
+            stock_code, market, inp.get("exchange")
+        )
+        ws_subscribed = await self._store_and_subscribe_watch(
+            stock_code, inp["stock_name"], market, exchange,
+            baseline_price, baseline_volume, inp["conditions"],
+        )
         return json.dumps({
             "status": "감시 설정 완료",
             "stock_code": stock_code,
@@ -911,6 +833,112 @@ class ToolExecutor:
             "ws_subscribed": ws_subscribed,
             "conditions": inp["conditions"],
         }, ensure_ascii=False)
+
+    def _validate_watch_conditions(self, conditions: list) -> str | None:
+        """허용되지 않는 조건 타입이 있으면 에러 JSON 반환, 없으면 None."""
+        bad = [c.get("type") for c in conditions if c.get("type") not in ("expr", "price_above", "price_below")]
+        if not bad:
+            return None
+        return json.dumps({
+            "error": f"조건 타입 거부: {bad}. price_change/volume_spike는 사용 불가.",
+            "instruction": (
+                "반드시 expr 타입을 사용하고 formula 필드에 파이썬 비교식을 작성하세요. "
+                "2개 이상 지표를 조합해야 합니다. "
+                "예시: 'rsi < 30 and bb_pct < 0.15 and change_pct < -2' "
+                "사용 가능 변수: price, volume, change_pct, volume_ratio, "
+                "rsi, macd, ma5, ma10, ma20, ma60, bb_pct, bb_upper, bb_lower, stoch_k, stoch_d"
+            ),
+        }, ensure_ascii=False)
+
+    async def _resolve_watch_baseline(
+        self, stock_code: str, market: str, exchange_hint: str | None
+    ) -> tuple[str, float, float]:
+        """캐시 → REST → 일봉 순서로 기준가/거래량 조회. (exchange, price, volume) 반환."""
+        price_data = self._market.get_price(stock_code)
+        exchange = "KRX"
+        baseline_price = self._first_float(price_data or {}, ["current_price", "price", "last"])
+        baseline_volume = self._first_float(price_data or {}, ["acml_volume", "volume", "acml_vol"])
+
+        if market == "overseas" and self._overseas:
+            if baseline_price <= 0:
+                try:
+                    exch_obj, rest_price = self._fetch_overseas_data(stock_code, exchange_hint, "price")
+                    if exch_obj:
+                        exchange = str(exch_obj)
+                    baseline_price = self._first_float(rest_price or {}, self._PRICE_FIELDS)
+                    baseline_volume = self._first_float(rest_price or {}, ["acml_vol", "volume", "tvol"])
+                    if baseline_price <= 0:
+                        from datetime import date, timedelta
+                        exch_obj, df = self._fetch_overseas_data(
+                            stock_code, exchange_hint, "daily",
+                            start=date.today() - timedelta(days=10),
+                            end=date.today(),
+                        )
+                        if exch_obj:
+                            exchange = str(exch_obj)
+                        if df is not None and not df.empty:
+                            last = df.iloc[-1]
+                            baseline_price = float(last.get("close") or 0)
+                            baseline_volume = float(last.get("volume") or 0)
+                except Exception:
+                    logger.exception("감시 기준가 조회 실패: %s", stock_code)
+            else:
+                exchange = str(self._exchange_candidates(stock_code, exchange_hint)[0])
+
+        return exchange, baseline_price, baseline_volume
+
+    async def _store_and_subscribe_watch(
+        self,
+        stock_code: str,
+        stock_name: str,
+        market: str,
+        exchange: str,
+        baseline_price: float,
+        baseline_volume: float,
+        conditions: list,
+    ) -> bool:
+        """Redis에 감시 저장 + WebSocket 동적 구독. ws_subscribed 반환."""
+        watches = self._load_watches()
+        watches[stock_code] = {
+            "stock_code": stock_code,
+            "stock_name": stock_name,
+            "market": market,
+            "exchange": exchange,
+            "conditions": conditions,
+            "baseline_price": baseline_price,
+            "baseline_volume": baseline_volume,
+            "set_at": datetime.now().isoformat(),
+            "triggered_types": [],
+        }
+        self._r.set(_WATCHES_KEY, json.dumps(watches, ensure_ascii=False))
+
+        if self._ws is None:
+            return False
+
+        from kis.constants import WebSocketTRID
+
+        def _on_price(tr_id, fields):
+            from kis.websocket import parse_domestic_price, parse_overseas_price
+            parsed = parse_domestic_price(fields) if market == "domestic" else parse_overseas_price(fields)
+            code = parsed.get("stock_code", "")
+            if code:
+                self._market.on_price_tick(code, {
+                    "stock_code": code,
+                    "current_price": parsed.get("price", 0),
+                    "volume": parsed.get("vol", 0),
+                    "acml_volume": parsed.get("acml_vol", 0),
+                    "time": parsed.get("time", ""),
+                    "exchange": exchange,
+                    "stock_name": stock_name,
+                })
+
+        tr_id = WebSocketTRID.DOMESTIC_PRICE if market == "domestic" else WebSocketTRID.OVERSEAS_PRICE
+        tr_key = stock_code if market == "domestic" else f"D{exchange}{stock_code}"
+        try:
+            return await self._ws.add_live_subscription(tr_id, tr_key, _on_price)
+        except Exception:
+            logger.exception("감시 종목 동적 구독 실패: %s", stock_code)
+            return False
 
     def _clear_watch(self, stock_code: str) -> str:
         if not self._r:

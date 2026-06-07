@@ -281,38 +281,23 @@ JSON, 검색 결과 원문, 툴 페이로드를 포함하지 마세요.
             "- 실제 주문은 실행하지 않았습니다. 이 요청은 계획/감시 설정으로 처리했습니다."
         )
 
+    _FALLBACK_WATCH_CONDITIONS = [
+        {"type": "expr", "formula": "rsi < 32 and bb_pct < 0.15 and change_pct < -2", "note": "과매도 + 하락 진입 신호"},
+        {"type": "expr", "formula": "rsi > 70 and bb_pct > 0.85", "note": "과매수 익절 신호"},
+    ]
+    _FALLBACK_CANDIDATES = [
+        ("NVDA", "NVIDIA"),
+        ("AAPL", "Apple"),
+        ("MSFT", "Microsoft"),
+    ]
+
     def _pick_fallback_candidate(self, user_input: str, final_text: str) -> dict:
         text = f"{user_input}\n{final_text}".upper()
-        candidates = {
-            "NVDA": {
-                "code": "NVDA",
-                "name": "NVIDIA",
-                "conditions": [
-                    {"type": "expr", "formula": "rsi < 32 and bb_pct < 0.15 and change_pct < -2", "note": "과매도 + 하락 진입 신호"},
-                    {"type": "expr", "formula": "rsi > 70 and bb_pct > 0.85", "note": "과매수 익절 신호"},
-                ],
-            },
-            "AAPL": {
-                "code": "AAPL",
-                "name": "Apple",
-                "conditions": [
-                    {"type": "expr", "formula": "rsi < 32 and bb_pct < 0.15 and change_pct < -2", "note": "과매도 + 하락 진입 신호"},
-                    {"type": "expr", "formula": "rsi > 70 and bb_pct > 0.85", "note": "과매수 익절 신호"},
-                ],
-            },
-            "MSFT": {
-                "code": "MSFT",
-                "name": "Microsoft",
-                "conditions": [
-                    {"type": "expr", "formula": "rsi < 32 and bb_pct < 0.15 and change_pct < -2", "note": "과매도 + 하락 진입 신호"},
-                    {"type": "expr", "formula": "rsi > 70 and bb_pct > 0.85", "note": "과매수 익절 신호"},
-                ],
-            },
-        }
-        for code, candidate in candidates.items():
+        for code, name in self._FALLBACK_CANDIDATES:
             if code in text:
-                return candidate
-        return candidates["NVDA"]
+                return {"code": code, "name": name, "conditions": self._FALLBACK_WATCH_CONDITIONS}
+        code, name = self._FALLBACK_CANDIDATES[0]
+        return {"code": code, "name": name, "conditions": self._FALLBACK_WATCH_CONDITIONS}
 
     def _build_chat_prompt(self, user_input: str, is_planning: bool | None = None) -> str:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S KST")

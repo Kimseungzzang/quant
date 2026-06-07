@@ -2,6 +2,8 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+import pandas as pd
+import pandas_ta as ta
 import redis
 from simpleeval import EvalWithCompoundTypes, FeatureNotAvailable, InvalidExpression
 
@@ -22,79 +24,74 @@ def _compute_indicators(
     highs: list[float] | None = None,
     lows: list[float] | None = None,
 ) -> dict:
-    """캔들 데이터로 지표 계산. 데이터 부족 시 None."""
-    result: dict = {}
-    n = len(closes)
-    if n == 0:
-        return result
+    """pandas_ta로 기술 지표 계산."""
+    if not closes:
+        return {}
 
-    def ema(prices: list[float], period: int) -> float | None:
-        if len(prices) < period:
-            return None
-        k = 2 / (period + 1)
-        val = sum(prices[:period]) / period
-        for p in prices[period:]:
-            val = p * k + val * (1 - k)
-        return val
+    n = len(closes)
+    close_s = pd.Series(closes, dtype=float)
+    result: dict = {}
 
     for period, key in [(5, "ma5"), (10, "ma10"), (20, "ma20"), (60, "ma60")]:
         if n >= period:
-            result[key] = sum(closes[-period:]) / period
+            val = close_s.rolling(period).mean().iloc[-1]
+            if pd.notna(val):
+                result[key] = round(float(val), 4)
 
     if n >= 14:
-        gains, losses = [], []
-        for i in range(1, n):
-            diff = closes[i] - closes[i - 1]
-            gains.append(max(diff, 0))
-            losses.append(max(-diff, 0))
-        avg_gain = sum(gains[-14:]) / 14
-        avg_loss = sum(losses[-14:]) / 14
-        if avg_loss == 0:
-            result["rsi"] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            result["rsi"] = round(100 - 100 / (1 + rs), 2)
+        rsi = ta.rsi(close_s, length=14)
+        if rsi is not None and not rsi.empty:
+            val = rsi.dropna().iloc[-1] if not rsi.dropna().empty else None
+            if val is not None and pd.notna(val):
+                result["rsi"] = round(float(val), 2)
 
-    fast = ema(closes, 12)
-    slow = ema(closes, 26)
-    if fast is not None and slow is not None:
-        result["macd"] = round(fast - slow, 4)
+    if n >= 26:
+        macd_df = ta.macd(close_s, fast=12, slow=26, signal=9)
+        if macd_df is not None and not macd_df.empty:
+            col = next((c for c in macd_df.columns if c.startswith("MACD_")), None)
+            if col:
+                val = macd_df[col].dropna()
+                if not val.empty and pd.notna(val.iloc[-1]):
+                    result["macd"] = round(float(val.iloc[-1]), 4)
+
+    if n >= 20:
+        bb = ta.bbands(close_s, length=20, std=2.0)
+        if bb is not None and not bb.empty:
+            lower_col = next((c for c in bb.columns if c.startswith("BBL_")), None)
+            upper_col = next((c for c in bb.columns if c.startswith("BBU_")), None)
+            pct_col = next((c for c in bb.columns if c.startswith("BBP_")), None)
+            if lower_col and upper_col:
+                lower = float(bb[lower_col].iloc[-1])
+                upper = float(bb[upper_col].iloc[-1])
+                if pd.notna(lower) and pd.notna(upper):
+                    result["bb_lower"] = round(lower, 4)
+                    result["bb_upper"] = round(upper, 4)
+            if pct_col:
+                val = float(bb[pct_col].iloc[-1])
+                if pd.notna(val):
+                    result["bb_pct"] = round(val, 4)
 
     if volumes and n >= 20:
         result["avg_volume"] = sum(volumes[-20:]) / 20
 
-    # 볼린저 밴드 %B (20일, 2σ)
-    if n >= 20:
-        import math
-        ma20 = sum(closes[-20:]) / 20
-        std20 = math.sqrt(sum((c - ma20) ** 2 for c in closes[-20:]) / 20)
-        if std20 > 0:
-            bb_upper = ma20 + 2 * std20
-            bb_lower = ma20 - 2 * std20
-            result["bb_upper"] = round(bb_upper, 4)
-            result["bb_lower"] = round(bb_lower, 4)
-            result["bb_pct"] = round((closes[-1] - bb_lower) / (bb_upper - bb_lower), 4)
-
-    # 스토캐스틱 %K, %D (14일)
     if highs and lows and len(highs) >= 14 and len(lows) >= 14:
-        period = 14
-        high14 = max(highs[-period:])
-        low14 = min(lows[-period:])
-        if high14 != low14:
-            stoch_k = (closes[-1] - low14) / (high14 - low14) * 100
-            result["stoch_k"] = round(stoch_k, 2)
-            # %D = 3일 %K SMA (슬라이딩)
-            k_values = []
-            for i in range(3):
-                idx = n - 1 - i
-                if idx < period - 1:
-                    break
-                h = max(highs[idx - period + 1: idx + 1])
-                l = min(lows[idx - period + 1: idx + 1])
-                if h != l:
-                    k_values.append((closes[idx] - l) / (h - l) * 100)
-            if len(k_values) == 3:
-                result["stoch_d"] = round(sum(k_values) / 3, 2)
+        stoch = ta.stoch(
+            pd.Series(highs, dtype=float),
+            pd.Series(lows, dtype=float),
+            close_s,
+            k=14, d=3, smooth_k=3,
+        )
+        if stoch is not None and not stoch.empty:
+            k_col = next((c for c in stoch.columns if c.startswith("STOCHk")), None)
+            d_col = next((c for c in stoch.columns if c.startswith("STOCHd")), None)
+            if k_col:
+                val = stoch[k_col].dropna()
+                if not val.empty and pd.notna(val.iloc[-1]):
+                    result["stoch_k"] = round(float(val.iloc[-1]), 2)
+            if d_col:
+                val = stoch[d_col].dropna()
+                if not val.empty and pd.notna(val.iloc[-1]):
+                    result["stoch_d"] = round(float(val.iloc[-1]), 2)
 
     return result
 
