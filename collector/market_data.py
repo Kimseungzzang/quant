@@ -29,9 +29,8 @@ class MarketDataCollector:
         return json.loads(raw) if raw else None
 
     def get_all_prices(self) -> dict[str, dict]:
-        keys = self._r.keys("price:*")
         result: dict[str, dict] = {}
-        for key in keys:
+        for key in self._r.scan_iter("price:*"):  # KEYS 대신 SCAN — O(N) 블로킹 방지
             raw = self._r.get(key)
             if raw:
                 code = key.decode().split(":", 1)[1]

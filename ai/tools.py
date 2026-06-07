@@ -338,12 +338,15 @@ class ToolExecutor:
         self.executed_tools.clear()
 
     async def execute(self, tool_name: str, tool_input: dict) -> str:
+        import asyncio as _asyncio
         logger.info("도구 실행: %s %s", tool_name, tool_input)
         self.executed_tools.append(tool_name)
         try:
             match tool_name:
                 case "get_price":
-                    return self._get_price(
+                    # KIS REST fallback이 동기 HTTP — 이벤트 루프 블로킹 방지
+                    return await _asyncio.to_thread(
+                        self._get_price,
                         tool_input["stock_code"],
                         tool_input.get("market"),
                         tool_input.get("exchange"),
@@ -351,9 +354,13 @@ class ToolExecutor:
                 case "get_orderbook":
                     return self._get_orderbook(tool_input["stock_code"])
                 case "get_portfolio":
-                    return self._get_portfolio(tool_input.get("market", "both"))
+                    return await _asyncio.to_thread(self._get_portfolio, tool_input.get("market", "both"))
                 case "get_rankings":
-                    return self._get_rankings(tool_input.get("rank_type", "volume"), tool_input.get("market", "domestic"))
+                    return await _asyncio.to_thread(
+                        self._get_rankings,
+                        tool_input.get("rank_type", "volume"),
+                        tool_input.get("market", "domestic"),
+                    )
                 case "get_candles":
                     stock_code = tool_input["stock_code"]
                     market = tool_input.get("market") or ("domestic" if self._is_domestic_code(stock_code) else "overseas")
@@ -367,9 +374,11 @@ class ToolExecutor:
                 case "get_indicators":
                     return self._get_indicators(tool_input["stock_code"])
                 case "set_trading_mode":
-                    return self._set_trading_mode(tool_input["mode"])
+                    return await _asyncio.to_thread(self._set_trading_mode, tool_input["mode"])
                 case "search_web":
-                    return self._search_web(tool_input["query"], tool_input.get("max_results", 5))
+                    return await _asyncio.to_thread(
+                        self._search_web, tool_input["query"], tool_input.get("max_results", 5)
+                    )
                 case "place_order":
                     if not self.allow_orders:
                         return json.dumps({"error": "주문 실행 차단: 명시적 주문 실행 요청이 없어서 계획/감시만 설정합니다."}, ensure_ascii=False)

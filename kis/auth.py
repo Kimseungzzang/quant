@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import requests
 from datetime import datetime
 
@@ -47,20 +48,22 @@ class KISAuth:
         self._access_token: str | None = None
         self._token_expired_at: datetime | None = None
         self._ws_approval_key: str | None = None
+        self._token_lock = threading.Lock()
 
     def get_access_token(self) -> str:
-        if self._is_token_valid():
-            return self._access_token
-
-        cached = self._load_token_cache()
-        if cached:
-            self._access_token = cached["access_token"]
-            self._token_expired_at = datetime.fromisoformat(cached["expired_at"])
+        with self._token_lock:
             if self._is_token_valid():
-                logger.debug("캐시에서 토큰 로드")
                 return self._access_token
 
-        return self._issue_token()
+            cached = self._load_token_cache()
+            if cached:
+                self._access_token = cached["access_token"]
+                self._token_expired_at = datetime.fromisoformat(cached["expired_at"])
+                if self._is_token_valid():
+                    logger.debug("캐시에서 토큰 로드")
+                    return self._access_token
+
+            return self._issue_token()
 
     def get_ws_approval_key(self) -> str:
         if self._ws_approval_key:

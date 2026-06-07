@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 async def _broadcast(msg: dict) -> None:
     dead = set()
-    for ws in state.ws_clients:
+    for ws in list(state.ws_clients):  # snapshot — disconnect 시 set 변경 방지
         try:
             await ws.send_json(msg)
         except Exception:

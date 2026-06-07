@@ -139,6 +139,8 @@ class OrderManager:
 
     # ── 매수 ────────────────────────────────────────────────────────────
 
+    _PLACING_PREFIX = "__placing__"
+
     def open_position(
         self,
         stock_code: str,
@@ -149,6 +151,7 @@ class OrderManager:
         qty_override: int | None = None,
         position_pct_override: float | None = None,
     ) -> bool:
+        sentinel_key = f"{self._PLACING_PREFIX}{stock_code}"
         with self._lock:
             if not self.risk.can_open_position(len(self._positions)):
                 logger.warning("최대 보유 종목 초과: %s", stock_code)
@@ -159,30 +162,35 @@ class OrderManager:
             if self._has_pending(stock_code, "BUY"):
                 logger.warning("이미 매수 주문 대기 중: %s", stock_code)
                 return False
-
-        account_value = self._get_account_value(exchange)
-        if qty_override is not None and qty_override > 0:
-            qty = int(qty_override)
-            cap_pct = position_pct_override if position_pct_override is not None and position_pct_override > 0 else self.risk.position_size_pct
-            max_qty = int((account_value * cap_pct / 100) / price) if price > 0 else 0
-            if max_qty <= 0:
-                logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
-                return False
-            if qty > max_qty:
-                logger.warning(
-                    "AI 요청 수량 clamp: %s requested=%d max=%d cap_pct=%.2f",
-                    stock_code, qty, max_qty, cap_pct,
-                )
-                qty = max_qty
-        elif position_pct_override is not None and position_pct_override > 0:
-            qty = int((account_value * position_pct_override / 100) / price) if price > 0 else 0
-        else:
-            qty = self.risk.calc_position_qty(account_value, price)
-        if qty <= 0:
-            logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
-            return False
+            # API 호출 전 sentinel 등록 — 동시 open_position 중복 차단 (TOCTOU 방지)
+            self._pending_orders[sentinel_key] = PendingOrder(
+                order_no=sentinel_key, side="BUY", stock_code=stock_code,
+                name=name, exchange=exchange, qty=0, requested_price=price,
+            )
 
         try:
+            account_value = self._get_account_value(exchange)
+            if qty_override is not None and qty_override > 0:
+                qty = int(qty_override)
+                cap_pct = position_pct_override if position_pct_override is not None and position_pct_override > 0 else self.risk.position_size_pct
+                max_qty = int((account_value * cap_pct / 100) / price) if price > 0 else 0
+                if max_qty <= 0:
+                    logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
+                    return False
+                if qty > max_qty:
+                    logger.warning(
+                        "AI 요청 수량 clamp: %s requested=%d max=%d cap_pct=%.2f",
+                        stock_code, qty, max_qty, cap_pct,
+                    )
+                    qty = max_qty
+            elif position_pct_override is not None and position_pct_override > 0:
+                qty = int((account_value * position_pct_override / 100) / price) if price > 0 else 0
+            else:
+                qty = self.risk.calc_position_qty(account_value, price)
+            if qty <= 0:
+                logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
+                return False
+
             if exchange == _KRX:
                 result = self.domestic.buy(stock_code, qty)
             else:
@@ -191,7 +199,6 @@ class OrderManager:
             order_no = result.get("ODNO", "") or ""
             if self._uses_fill_confirmation():
                 if not order_no:
-                    # 주문은 나갔으나 주문번호 없음 — 즉시 확정 처리 (미추적 포지션 방지)
                     logger.warning("[매수주문] %s 주문번호 없음 → 즉시 체결 확정 처리", stock_code)
                     with self._lock:
                         self._confirm_buy(stock_code, name, exchange, qty, price, "", strategy)
@@ -211,6 +218,9 @@ class OrderManager:
         except Exception as e:
             logger.error("매수 실패 (%s): %s", stock_code, e)
             return False
+        finally:
+            with self._lock:
+                self._pending_orders.pop(sentinel_key, None)
 
     # ── 매도 ────────────────────────────────────────────────────────────
 
@@ -265,21 +275,33 @@ class OrderManager:
     # ── 실시간 모니터링 ──────────────────────────────────────────────────
 
     def on_price_update(self, stock_code: str, current_price: float, signal: TradeSignal | None):
+        close_reason: CloseReason | None = None
+        has_pos = False
         with self._lock:
             pos = self._positions.get(stock_code)
-        if pos:
-            self._last_prices[stock_code] = current_price
-            if self.risk.is_stop_loss(pos.entry_price, current_price):
-                logger.warning("손절: %s @ %.2f", stock_code, current_price)
-                self.close_position(stock_code, current_price, CloseReason.STOP_LOSS)
-            elif self.risk.is_take_profit(pos.entry_price, current_price):
-                logger.info("익절: %s @ %.2f", stock_code, current_price)
-                self.close_position(stock_code, current_price, CloseReason.TAKE_PROFIT)
-            elif signal == TradeSignal.SELL:
-                self.close_position(stock_code, current_price, CloseReason.SIGNAL)
-        else:
-            if signal == TradeSignal.BUY:
-                logger.info("매수 신호: %s @ %.2f", stock_code, current_price)
+            if pos:
+                has_pos = True
+                self._last_prices[stock_code] = current_price
+                if not self._has_pending(stock_code, "SELL"):
+                    if self.risk.is_stop_loss(pos.entry_price, current_price):
+                        close_reason = CloseReason.STOP_LOSS
+                    elif self.risk.is_take_profit(pos.entry_price, current_price):
+                        close_reason = CloseReason.TAKE_PROFIT
+                    elif signal == TradeSignal.SELL:
+                        close_reason = CloseReason.SIGNAL
+            else:
+                self._last_prices[stock_code] = current_price
+
+        if close_reason == CloseReason.STOP_LOSS:
+            logger.warning("손절: %s @ %.2f", stock_code, current_price)
+            self.close_position(stock_code, current_price, CloseReason.STOP_LOSS)
+        elif close_reason == CloseReason.TAKE_PROFIT:
+            logger.info("익절: %s @ %.2f", stock_code, current_price)
+            self.close_position(stock_code, current_price, CloseReason.TAKE_PROFIT)
+        elif close_reason == CloseReason.SIGNAL:
+            self.close_position(stock_code, current_price, CloseReason.SIGNAL)
+        elif not has_pos and signal == TradeSignal.BUY:
+            logger.info("매수 신호: %s @ %.2f", stock_code, current_price)
 
     def get_open_positions(self) -> dict[str, Position]:
         with self._lock:
@@ -343,7 +365,8 @@ class OrderManager:
         )
 
     def record_price(self, stock_code: str, current_price: float):
-        self._last_prices[stock_code] = current_price  # float 대입은 GIL로 안전
+        with self._lock:
+            self._last_prices[stock_code] = current_price
 
     def get_live_positions(self) -> list[dict]:
         rows = []
