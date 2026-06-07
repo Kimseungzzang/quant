@@ -139,8 +139,16 @@ class OrderManager:
 
     # ── 매수 ────────────────────────────────────────────────────────────
 
-    def open_position(self, stock_code: str, name: str, exchange: str, price: float,
-                      strategy: str = "") -> bool:
+    def open_position(
+        self,
+        stock_code: str,
+        name: str,
+        exchange: str,
+        price: float,
+        strategy: str = "",
+        qty_override: int | None = None,
+        position_pct_override: float | None = None,
+    ) -> bool:
         with self._lock:
             if not self.risk.can_open_position(len(self._positions)):
                 logger.warning("최대 보유 종목 초과: %s", stock_code)
@@ -153,7 +161,23 @@ class OrderManager:
                 return False
 
         account_value = self._get_account_value(exchange)
-        qty = self.risk.calc_position_qty(account_value, price)
+        if qty_override is not None and qty_override > 0:
+            qty = int(qty_override)
+            cap_pct = position_pct_override if position_pct_override is not None and position_pct_override > 0 else self.risk.position_size_pct
+            max_qty = int((account_value * cap_pct / 100) / price) if price > 0 else 0
+            if max_qty <= 0:
+                logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
+                return False
+            if qty > max_qty:
+                logger.warning(
+                    "AI 요청 수량 clamp: %s requested=%d max=%d cap_pct=%.2f",
+                    stock_code, qty, max_qty, cap_pct,
+                )
+                qty = max_qty
+        elif position_pct_override is not None and position_pct_override > 0:
+            qty = int((account_value * position_pct_override / 100) / price) if price > 0 else 0
+        else:
+            qty = self.risk.calc_position_qty(account_value, price)
         if qty <= 0:
             logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
             return False

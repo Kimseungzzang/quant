@@ -1,5 +1,22 @@
 mode: mock   # paper | live | mock
 
+database:
+  host: "localhost"
+  port: 5432
+  name: "quant_trading"
+  user: ""
+  password: ""
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+
+ai:
+  provider: "gemini"
+  morning_brief_hour: 8
+  morning_brief_minute: 30
+
 kis:
   app_key: "mock_app_key_1234567890"
   app_secret: "mock_app_secret_abcdefghijklmnopqrstuvwxyz"

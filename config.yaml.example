@@ -1,5 +1,22 @@
 mode: paper   # paper | live | mock
 
+database:
+  host: "localhost"
+  port: 5432
+  name: "quant_trading"
+  user: ""                  # 비우면 현재 OS 사용자 사용
+  password: ""              # 비밀번호 없으면 빈 문자열
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+
+ai:
+  provider: "gemini"        # gemini | groq | anthropic
+  morning_brief_hour: 8
+  morning_brief_minute: 30
+
 kis:
   paper_app_key: ""          # KIS Developers 모의투자 앱키
   paper_app_secret: ""       # KIS Developers 모의투자 앱시크릿

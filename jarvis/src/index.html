@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src http://127.0.0.1:8000;" />
+  <title>JARVIS — AI Trader</title>
+  <link rel="stylesheet" href="styles/main.css" />
+  <script src="../node_modules/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div id="app">
+    <!-- 상단: 구체 + 동적 패널 영역 -->
+    <div id="top-area">
+      <div id="status-bar">
+        <span id="mode-badge" class="badge">■ LIVE</span>
+        <span id="time-display"></span>
+        <span id="connection-dot" class="dot connected"></span>
+      </div>
+
+      <div id="sphere-container">
+        <canvas id="sphere-canvas"></canvas>
+        <div id="sphere-label">
+          <div id="ai-state">STANDBY</div>
+        </div>
+      </div>
+
+      <!-- 동적 패널 (AI 응답에 따라 표시) -->
+      <div id="dynamic-panel" class="hidden">
+        <div id="panel-header">
+          <span id="panel-title"></span>
+          <button id="panel-close">✕</button>
+        </div>
+        <div id="panel-content"></div>
+      </div>
+    </div>
+
+    <!-- 하단: 채팅 패널 -->
+    <div id="chat-area">
+      <div id="chat-messages"></div>
+      <div id="chat-input-row" style="position:relative">
+        <div id="slash-menu" class="hidden"></div>
+        <input id="chat-input" type="text" placeholder="메시지 또는 /명령어..." autocomplete="off" />
+        <button id="send-btn">▶</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="renderer/index.js"></script>
+</body>
+</html>

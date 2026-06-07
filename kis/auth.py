@@ -15,14 +15,20 @@ logger = logging.getLogger(__name__)
 
 class KISAuth:
     def __init__(self, config: dict, redis_client=None):
+        self.config = config
         kis_cfg = config["kis"]
         mode = TradingMode(config["mode"])
+        self.mode = mode
         if mode in (TradingMode.PAPER, TradingMode.MOCK):
             self.app_key    = kis_cfg.get("paper_app_key") or kis_cfg.get("app_key", "")
             self.app_secret = kis_cfg.get("paper_app_secret") or kis_cfg.get("app_secret", "")
+            self.account_no = kis_cfg.get("paper_account_no") or kis_cfg.get("account_no", "")
+            self.account_product_code = kis_cfg.get("paper_account_product_code") or kis_cfg.get("account_product_code", "01")
         else:
             self.app_key    = kis_cfg.get("live_app_key") or kis_cfg.get("app_key", "")
             self.app_secret = kis_cfg.get("live_app_secret") or kis_cfg.get("app_secret", "")
+            self.account_no = kis_cfg.get("live_account_no") or kis_cfg.get("account_no", "")
+            self.account_product_code = kis_cfg.get("live_account_product_code") or kis_cfg.get("account_product_code", "01")
         self.is_mock  = mode == TradingMode.MOCK
         self.is_paper = mode in (TradingMode.PAPER, TradingMode.MOCK)
         self._redis = redis_client
@@ -73,6 +79,9 @@ class KISAuth:
         }
         headers.update(extra)
         return headers
+
+    def get_account_no(self) -> str:
+        return self.account_no
 
     def _is_token_valid(self) -> bool:
         if not self._access_token or not self._token_expired_at:

@@ -25,6 +25,8 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "stock_code": {"type": "string", "description": "종목 코드 (예: 005930, NVDA)"},
+                "market": {"type": "string", "enum": ["domestic", "overseas"], "description": "시장. 비우면 종목 코드로 추정"},
+                "exchange": {"type": "string", "description": "해외 거래소 NAS | NYS | AMS. 비우면 자동 판별"},
             },
             "required": ["stock_code"],
         },
@@ -70,8 +72,24 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "stock_code": {"type": "string", "description": "종목 코드"},
                 "market": {"type": "string", "enum": ["domestic", "overseas"], "default": "domestic"},
+                "exchange": {"type": "string", "description": "해외 거래소 NAS | NYS | AMS. 비우면 자동 판별"},
                 "candle_type": {"type": "string", "enum": ["minute", "daily"], "default": "minute"},
                 "count": {"type": "integer", "description": "가져올 봉 개수", "default": 30},
+            },
+            "required": ["stock_code"],
+        },
+    },
+    {
+        "name": "get_indicators",
+        "description": (
+            "종목의 현재 기술 지표를 조회합니다. "
+            "RSI, MACD, 이동평균(MA5/10/20/60), 볼린저밴드(%B), 스토캐스틱(K/D)을 반환합니다. "
+            "지표 확인, 과매도/과매수 판단, 감시 조건 수립 전에 사용하세요."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stock_code": {"type": "string", "description": "종목 코드 (예: 005930, NVDA)"},
             },
             "required": ["stock_code"],
         },
@@ -115,6 +133,7 @@ TOOL_DEFINITIONS = [
                 "stock_name": {"type": "string", "description": "종목명"},
                 "side": {"type": "string", "enum": ["BUY", "SELL"]},
                 "quantity": {"type": "integer", "description": "주문 수량"},
+                "position_pct": {"type": "number", "description": "Portfolio allocation percentage. The AI decides this from risk."},
                 "price": {"type": "number", "description": "주문 가격 (0이면 시장가)"},
                 "reason": {"type": "string", "description": "매매 이유 (필수)"},
             },
@@ -223,13 +242,22 @@ TOOL_DEFINITIONS = [
                         "properties": {
                             "type": {
                                 "type": "string",
-                                "enum": ["price_change", "price_above", "price_below", "volume_spike"],
-                                "description": "price_change: 현재가 대비 ±X% | price_above: X원 이상 | price_below: X원 이하 | volume_spike: 평균 거래량의 X배",
+                                "enum": ["price_change", "price_above", "price_below", "volume_spike", "expr"],
+                                "description": (
+                                    "price_change: 설정 시점 대비 ±X% | price_above: X원 이상 | price_below: X원 이하 | volume_spike: 평균 거래량의 X배 | "
+                                    "expr: 자유 수식 — formula 필드에 파이썬 비교식 작성. "
+                                    "사용 가능 변수: price, volume, change_pct, volume_ratio, baseline_price, baseline_volume, "
+                                    "rsi, macd, ma5, ma10, ma20, ma60, avg_volume, "
+                                    "bb_pct(볼린저 %B: 0=하단,1=상단), bb_upper, bb_lower, stoch_k, stoch_d. "
+                                    "과매도: rsi<30 or stoch_k<20 or bb_pct<0.1 | 과매수: rsi>70 or stoch_k>80 or bb_pct>0.9. "
+                                    "예시: 'rsi < 30 and bb_pct < 0.1', 'stoch_k < 20 and change_pct < -2'"
+                                ),
                             },
-                            "threshold": {"type": "number"},
+                            "threshold": {"type": "number", "description": "expr 타입에서는 불필요 (생략 가능)"},
+                            "formula": {"type": "string", "description": "expr 타입일 때 평가할 파이썬 비교식"},
                             "note": {"type": "string", "description": "이 조건을 거는 이유"},
                         },
-                        "required": ["type", "threshold"],
+                        "required": ["type"],
                     },
                 },
             },
@@ -255,6 +283,26 @@ TOOL_DEFINITIONS = [
             "properties": {},
         },
     },
+    {
+        "name": "get_system_status",
+        "description": "서버 시스템 상태를 조회합니다. Redis 연결, WebSocket 구독, 지표 캐시, 감시 종목 수, 에이전트 히스토리 등을 확인할 수 있습니다.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    {
+        "name": "get_logs",
+        "description": "서버 로그를 조회합니다. 최근 이벤트, 에러, 툴 실행 내역 등을 확인할 수 있습니다.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "level": {"type": "string", "enum": ["ALL", "INFO", "WARNING", "ERROR"], "default": "INFO", "description": "조회할 최소 로그 레벨"},
+                "limit": {"type": "integer", "default": 30, "description": "가져올 줄 수"},
+                "name": {"type": "string", "default": "", "description": "모듈명 필터 (예: detector, agent, tools)"},
+            },
+        },
+    },
 ]
 
 
@@ -269,6 +317,8 @@ class ToolExecutor:
         ws: Any = None,
         domestic_api: Any = None,
         overseas_api: Any = None,
+        config: dict | None = None,
+        regime_fn: Any = None,
     ):
         self._market = market_data
         self._account = account
@@ -278,31 +328,61 @@ class ToolExecutor:
         self._ws = ws
         self._domestic = domestic_api
         self._overseas = overseas_api
+        self._config = config or {}
+        self._regime_fn = regime_fn
+        self._overseas_exchange_by_code = self._build_overseas_exchange_map(self._config)
+        self.executed_tools: list[str] = []
+        self.allow_orders = False
+
+    def reset_executed_tools(self) -> None:
+        self.executed_tools.clear()
 
     async def execute(self, tool_name: str, tool_input: dict) -> str:
         logger.info("도구 실행: %s %s", tool_name, tool_input)
+        self.executed_tools.append(tool_name)
         try:
             match tool_name:
                 case "get_price":
-                    return self._get_price(tool_input["stock_code"])
+                    return self._get_price(
+                        tool_input["stock_code"],
+                        tool_input.get("market"),
+                        tool_input.get("exchange"),
+                    )
                 case "get_orderbook":
                     return self._get_orderbook(tool_input["stock_code"])
                 case "get_portfolio":
                     return self._get_portfolio(tool_input.get("market", "both"))
                 case "get_rankings":
-                    return self._get_rankings(tool_input["rank_type"], tool_input.get("market", "domestic"))
+                    return self._get_rankings(tool_input.get("rank_type", "volume"), tool_input.get("market", "domestic"))
                 case "get_candles":
+                    stock_code = tool_input["stock_code"]
+                    market = tool_input.get("market") or ("domestic" if self._is_domestic_code(stock_code) else "overseas")
                     return await self._get_candles(
-                        tool_input["stock_code"],
-                        tool_input.get("market", "domestic"),
-                        tool_input.get("candle_type", "minute"),
+                        stock_code,
+                        market,
+                        tool_input.get("exchange"),
+                        tool_input.get("candle_type") or ("daily" if market == "overseas" else "minute"),
                         tool_input.get("count", 30),
                     )
+                case "get_indicators":
+                    return self._get_indicators(tool_input["stock_code"])
                 case "set_trading_mode":
                     return self._set_trading_mode(tool_input["mode"])
                 case "search_web":
                     return self._search_web(tool_input["query"], tool_input.get("max_results", 5))
                 case "place_order":
+                    if not self.allow_orders:
+                        return json.dumps({"error": "주문 실행 차단: 명시적 주문 실행 요청이 없어서 계획/감시만 설정합니다."}, ensure_ascii=False)
+                    missing_precheck = [
+                        name for name in ("get_portfolio", "get_price", "get_candles")
+                        if name not in set(self.executed_tools)
+                    ]
+                    if missing_precheck:
+                        return json.dumps({
+                            "error": "주문 실행 차단: 주문 전 필수 확인 도구가 누락되었습니다.",
+                            "missing_precheck": missing_precheck,
+                            "instruction": "같은 판단 루프에서 get_portfolio, get_price, get_candles를 먼저 호출한 뒤 주문하세요.",
+                        }, ensure_ascii=False)
                     return await self._place_order(tool_input)
                 case "cancel_order":
                     return self._cancel_order(tool_input["order_id"])
@@ -323,22 +403,42 @@ class ToolExecutor:
                         tool_input.get("limit", 20),
                     )
                 case "set_watch":
-                    return self._set_watch(tool_input)
+                    return await self._set_watch(tool_input)
                 case "clear_watch":
                     return self._clear_watch(tool_input["stock_code"])
                 case "list_watches":
                     return self._list_watches()
+                case "get_system_status":
+                    return await self._get_system_status()
+                case "get_logs":
+                    return await self._get_logs(
+                        tool_input.get("level", "INFO"),
+                        tool_input.get("limit", 30),
+                        tool_input.get("name", ""),
+                    )
                 case _:
                     return json.dumps({"error": f"알 수 없는 도구: {tool_name}"})
         except Exception as e:
             logger.exception("도구 실행 오류: %s", tool_name)
             return json.dumps({"error": str(e)})
 
-    def _get_price(self, stock_code: str) -> str:
+    def _get_price(self, stock_code: str, market: str | None = None, exchange: str | None = None) -> str:
         data = self._market.get_price(stock_code)
-        if not data:
-            return json.dumps({"error": f"{stock_code} 가격 데이터 없음"})
-        return json.dumps(data, ensure_ascii=False)
+        if data:
+            return json.dumps(data, ensure_ascii=False)
+
+        market = market or ("domestic" if self._is_domestic_code(stock_code) else "overseas")
+        try:
+            if market == "domestic" and self._domestic:
+                data = self._domestic.get_price(stock_code)
+                return json.dumps({"stock_code": stock_code, "market": "domestic", "source": "rest", "data": data}, ensure_ascii=False, default=str)
+            if market == "overseas" and self._overseas:
+                exch, data = self._get_overseas_price_auto(stock_code, exchange)
+                if data:
+                    return json.dumps({"stock_code": stock_code, "market": "overseas", "exchange": str(exch), "source": "rest", "data": data}, ensure_ascii=False, default=str)
+        except Exception as e:
+            return json.dumps({"error": f"{stock_code} 가격 조회 실패: {e}"}, ensure_ascii=False)
+        return json.dumps({"error": f"{stock_code} 가격 데이터 없음"}, ensure_ascii=False)
 
     def _get_orderbook(self, stock_code: str) -> str:
         data = self._market.get_orderbook(stock_code)
@@ -375,7 +475,7 @@ class ToolExecutor:
         ]
         return json.dumps({"rank_type": rank_type, "market": market, "items": slim}, ensure_ascii=False)
 
-    async def _get_candles(self, stock_code: str, market: str, candle_type: str, count: int) -> str:
+    async def _get_candles(self, stock_code: str, market: str, exchange: str | None, candle_type: str, count: int) -> str:
         import asyncio
         loop = asyncio.get_event_loop()
         try:
@@ -384,30 +484,88 @@ class ToolExecutor:
                 end = date.today()
                 start = end - timedelta(days=count * 2)
                 if market == "overseas":
-                    from kis.constants import ExchangeCode
-                    df = await loop.run_in_executor(
-                        None, lambda: self._overseas.get_daily_ohlcv(stock_code, ExchangeCode.NASDAQ, start, end)
-                    )
+                    df = await asyncio.wait_for(loop.run_in_executor(
+                        None, lambda: self._get_overseas_daily_ohlcv_auto(stock_code, exchange, start, end)[1]
+                    ), timeout=12)
                 else:
-                    df = await loop.run_in_executor(
+                    df = await asyncio.wait_for(loop.run_in_executor(
                         None, lambda: self._domestic.get_daily_ohlcv(stock_code, start, end)
-                    )
+                    ), timeout=12)
             else:
                 if market == "overseas":
-                    df = await loop.run_in_executor(
-                        None, lambda: self._overseas.get_historical_minute_ohlcv(stock_code, lookback_days=3)
-                    )
+                    try:
+                        df = await asyncio.wait_for(loop.run_in_executor(
+                            None, lambda: self._get_overseas_minute_ohlcv_auto(stock_code, exchange)
+                        ), timeout=8)
+                    except Exception:
+                        from datetime import date, timedelta
+                        end = date.today()
+                        start = end - timedelta(days=count * 2)
+                        df = await asyncio.wait_for(loop.run_in_executor(
+                            None, lambda: self._get_overseas_daily_ohlcv_auto(stock_code, exchange, start, end)[1]
+                        ), timeout=12)
+                        candle_type = "daily_fallback"
                 else:
-                    df = await loop.run_in_executor(
+                    df = await asyncio.wait_for(loop.run_in_executor(
                         None, lambda: self._domestic.get_historical_minute_ohlcv(stock_code, lookback_days=3, candle_minutes=1)
-                    )
+                    ), timeout=12)
             if df is None or df.empty:
                 return json.dumps({"error": f"{stock_code} 차트 데이터 없음"})
             tail = df.tail(count)
             records = tail[["datetime", "open", "high", "low", "close", "volume"]].to_dict("records")
-            return json.dumps({"stock_code": stock_code, "candle_type": candle_type, "count": len(records), "candles": records}, ensure_ascii=False, default=str)
+            used_exchange = getattr(df, "attrs", {}).get("exchange")
+            return json.dumps({"stock_code": stock_code, "market": market, "exchange": used_exchange, "candle_type": candle_type, "count": len(records), "candles": records}, ensure_ascii=False, default=str)
         except Exception as e:
             return json.dumps({"error": f"차트 조회 실패: {e}"})
+
+    def _get_indicators(self, stock_code: str) -> str:
+        if not self._r:
+            return json.dumps({"error": "Redis 미연결"})
+        raw = self._r.get(f"ai:indicators:{stock_code}")
+        if not raw:
+            return json.dumps({
+                "stock_code": stock_code,
+                "status": "캐시 없음 — 감시 설정 후 5분 이내 자동 계산됩니다.",
+            }, ensure_ascii=False)
+        try:
+            indicators = json.loads(raw)
+        except Exception:
+            return json.dumps({"error": "지표 파싱 실패"})
+
+        labels = {
+            "rsi": "RSI(14)",
+            "macd": "MACD",
+            "ma5": "MA5", "ma10": "MA10", "ma20": "MA20", "ma60": "MA60",
+            "bb_upper": "볼린저 상단", "bb_lower": "볼린저 하단",
+            "bb_pct": "볼린저 %B (0=하단,1=상단)",
+            "stoch_k": "스토캐스틱 %K", "stoch_d": "스토캐스틱 %D",
+            "avg_volume": "20일 평균 거래량",
+        }
+        rsi = indicators.get("rsi")
+        bb_pct = indicators.get("bb_pct")
+        stoch_k = indicators.get("stoch_k")
+        signals = []
+        if rsi is not None:
+            if rsi < 30:
+                signals.append(f"RSI {rsi} → 과매도")
+            elif rsi > 70:
+                signals.append(f"RSI {rsi} → 과매수")
+        if bb_pct is not None:
+            if bb_pct < 0.1:
+                signals.append(f"볼린저 %B {bb_pct} → 하단 이탈(과매도)")
+            elif bb_pct > 0.9:
+                signals.append(f"볼린저 %B {bb_pct} → 상단 돌파(과매수)")
+        if stoch_k is not None:
+            if stoch_k < 20:
+                signals.append(f"스토캐스틱 K {stoch_k} → 과매도")
+            elif stoch_k > 80:
+                signals.append(f"스토캐스틱 K {stoch_k} → 과매수")
+
+        return json.dumps({
+            "stock_code": stock_code,
+            "indicators": {labels.get(k, k): round(v, 4) if isinstance(v, float) else v for k, v in indicators.items()},
+            "signals": signals or ["특이 신호 없음"],
+        }, ensure_ascii=False)
 
     def _set_trading_mode(self, mode: str) -> str:
         if mode not in ("paper", "live"):
@@ -442,8 +600,9 @@ class ToolExecutor:
         stock_code = inp["stock_code"]
         stock_name = inp["stock_name"]
         side = inp["side"]
-        quantity = inp["quantity"]
-        price = inp.get("price", 0)
+        quantity = int(inp.get("quantity") or 0)
+        position_pct = float(inp.get("position_pct") or 0)
+        price = float(inp.get("price") or 0)
         reason = inp["reason"]
 
         pending = self._order_manager.get_pending_orders()
@@ -452,38 +611,167 @@ class ToolExecutor:
 
         positions = self._order_manager.get_open_positions()
         if side == "BUY":
-            exchange = "KRX" if len(stock_code) == 6 and stock_code.isdigit() else "NAS"
-            from trading.order_manager import TradeSignal
-            signal = TradeSignal(
-                action="BUY",
-                stock_code=stock_code,
-                stock_name=stock_name,
-                exchange=exchange,
-                confidence=1.0,
-                reason=reason,
-            )
+            exchange = "KRX" if self._is_domestic_code(stock_code) else str(self._exchange_candidates(stock_code, inp.get("exchange"))[0])
+            price = price or self._resolve_order_price(stock_code, exchange)
+            if price <= 0:
+                return json.dumps({"error": f"{stock_code} 주문 기준가 확인 실패"})
             result = self._order_manager.open_position(
                 stock_code=stock_code,
                 name=stock_name,
                 exchange=exchange,
                 price=price,
-                signal=signal,
+                strategy=reason[:80],
+                qty_override=quantity if quantity > 0 else None,
+                position_pct_override=position_pct if position_pct > 0 else None,
             )
         else:
             if stock_code not in positions:
                 return json.dumps({"error": f"{stock_code} 보유 포지션 없음"})
+            exchange = positions[stock_code].exchange
+            price = price or self._resolve_order_price(stock_code, exchange)
+            if price <= 0:
+                return json.dumps({"error": f"{stock_code} 주문 기준가 확인 실패"})
             result = self._order_manager.close_position(
                 stock_code=stock_code,
                 current_price=price,
                 reason=reason,
             )
 
-        return json.dumps({"status": "주문 요청 완료", "side": side, "stock_code": stock_code, "quantity": quantity, "result": str(result)}, ensure_ascii=False)
+        return json.dumps({
+            "status": "주문 요청 완료" if result else "주문 요청 실패",
+            "side": side,
+            "stock_code": stock_code,
+            "requested_quantity": quantity,
+            "position_pct": position_pct,
+            "order_price": price,
+            "result": bool(result),
+            "pending_orders": self._order_manager.get_pending_order_rows(),
+        }, ensure_ascii=False, default=str)
+
+    def _resolve_order_price(self, stock_code: str, exchange: str) -> float:
+        cached = self._market.get_price(stock_code)
+        cached_price = self._first_float(cached or {}, ["current_price", "price", "last"])
+        if cached_price > 0:
+            return cached_price
+
+        try:
+            if exchange == "KRX" and self._domestic:
+                data = self._domestic.get_price(stock_code)
+                return self._first_float(data, ["stck_prpr", "price", "current_price", "last"])
+            if self._overseas:
+                data = self._overseas.get_price(stock_code, self._exchange_candidates(stock_code, exchange)[0])
+                price = self._first_float(data, [
+                    "last", "price", "current_price", "ovrs_nmix_prpr",
+                    "stck_prpr", "tlast", "base", "clos",
+                ])
+                if price > 0:
+                    return price
+                from datetime import date, timedelta
+                _, df = self._get_overseas_daily_ohlcv_auto(
+                    stock_code,
+                    exchange,
+                    date.today() - timedelta(days=10),
+                    date.today(),
+                )
+                if df is not None and not df.empty:
+                    return float(df.iloc[-1]["close"])
+        except Exception:
+            logger.exception("주문 기준가 조회 실패: %s", stock_code)
+        return 0.0
+
+    def _get_overseas_price_auto(self, stock_code: str, exchange: str | None = None) -> tuple[Any, dict]:
+        for exch in self._exchange_candidates(stock_code, exchange):
+            data = self._overseas.get_price(stock_code, exch)
+            if data and self._first_float(data, [
+                "last", "price", "current_price", "ovrs_nmix_prpr",
+                "stck_prpr", "tlast", "base", "clos",
+            ]) > 0:
+                return exch, data
+        return (None, {})
+
+    def _get_overseas_daily_ohlcv_auto(self, stock_code: str, exchange: str | None, start, end) -> tuple[Any, Any]:
+        for exch in self._exchange_candidates(stock_code, exchange):
+            df = self._overseas.get_daily_ohlcv(stock_code, exch, start, end)
+            if df is not None and not df.empty:
+                df.attrs["exchange"] = str(exch)
+                return exch, df
+        return (None, None)
+
+    def _get_overseas_minute_ohlcv_auto(self, stock_code: str, exchange: str | None):
+        for exch in self._exchange_candidates(stock_code, exchange):
+            df = self._overseas.get_historical_minute_ohlcv(stock_code, exch, lookback_days=3)
+            if df is not None and not df.empty:
+                df.attrs["exchange"] = str(exch)
+                return df
+        return None
+
+    def _exchange_candidates(self, stock_code: str, exchange: str | None = None) -> list[Any]:
+        from kis.constants import ExchangeCode
+
+        def parse(value: str | None):
+            if not value:
+                return None
+            normalized = value.upper()
+            aliases = {
+                "NASDAQ": ExchangeCode.NASDAQ,
+                "NAS": ExchangeCode.NASDAQ,
+                "NASD": ExchangeCode.NASDAQ,
+                "NYSE": ExchangeCode.NYSE,
+                "NYS": ExchangeCode.NYSE,
+                "AMEX": ExchangeCode.AMEX,
+                "AMS": ExchangeCode.AMEX,
+            }
+            return aliases.get(normalized)
+
+        ordered: list[Any] = []
+        for candidate in (
+            parse(exchange),
+            parse(self._overseas_exchange_by_code.get(stock_code.upper())),
+            ExchangeCode.NASDAQ,
+            ExchangeCode.NYSE,
+            ExchangeCode.AMEX,
+        ):
+            if candidate is not None and candidate not in ordered:
+                ordered.append(candidate)
+        return ordered
+
+    @staticmethod
+    def _build_overseas_exchange_map(config: dict) -> dict[str, str]:
+        result: dict[str, str] = {}
+        for item in config.get("universe", {}).get("overseas", {}).get("stocks", []):
+            if isinstance(item, dict) and item.get("code"):
+                result[str(item["code"]).upper()] = str(item.get("exchange", "")).upper()
+        result.setdefault("HPE", "NYS")
+        return result
+
+    @staticmethod
+    def _first_float(data: dict, keys: list[str]) -> float:
+        for key in keys:
+            try:
+                value = data.get(key)
+                if value is None or value == "":
+                    continue
+                parsed = float(str(value).replace(",", ""))
+                if parsed > 0:
+                    return parsed
+            except Exception:
+                continue
+        return 0.0
 
     def _cancel_order(self, order_id: str) -> str:
         return json.dumps({"status": "취소 기능 미구현 — order_manager에 추가 필요", "order_id": order_id})
 
     async def _save_plan(self, inp: dict) -> str:
+        blocked = [
+            stock for stock in inp.get("watch_stocks", [])
+            if self._is_domestic_code(str(stock.get("code", ""))) and not self._is_domestic_market_open()
+        ]
+        if blocked:
+            return json.dumps({
+                "error": "국내장 시간 외 국내 종목 계획 저장 차단",
+                "blocked_symbols": blocked,
+                "instruction": "현재 KRX 정규장이 아니므로 해외/미국 후보를 선택하거나 국내장은 장 시작 전 전용 계획으로만 다루세요.",
+            }, ensure_ascii=False)
         session_id = await self._memory.save_plan(
             market_outlook=inp["market_outlook"],
             watch_stocks=inp["watch_stocks"],
@@ -511,21 +799,74 @@ class ToolExecutor:
         rows = await self._memory.get_chat_history(date=date, source=source, limit=limit)
         return json.dumps(rows, ensure_ascii=False, default=str)
 
-    def _set_watch(self, inp: dict) -> str:
+    async def _set_watch(self, inp: dict) -> str:
         if not self._r:
             return json.dumps({"error": "Redis 미연결"})
         stock_code = inp["stock_code"]
         market = inp["market"]
+        if market == "domestic" and not self._is_domestic_market_open():
+            return json.dumps({
+                "error": "국내장 시간 외 국내 종목 감시 설정 차단",
+                "stock_code": stock_code,
+                "instruction": "현재 한국 정규장이 닫혀 있습니다. 이 시간대에는 해외/미국 후보를 선택하세요.",
+            }, ensure_ascii=False)
 
         price_data = self._market.get_price(stock_code)
-        baseline_price = float(price_data.get("current_price", 0)) if price_data else 0.0
-        baseline_volume = float(price_data.get("acml_volume", 0)) if price_data else 0.0
+        exchange = "KRX"
+        baseline_price = self._first_float(price_data or {}, ["current_price", "price", "last"])
+        baseline_volume = self._first_float(price_data or {}, ["acml_volume", "volume", "acml_vol"])
+        if baseline_price <= 0 and market == "overseas" and self._overseas:
+            try:
+                exchange_obj, rest_price = self._get_overseas_price_auto(stock_code, inp.get("exchange"))
+                if exchange_obj:
+                    exchange = str(exchange_obj)
+                baseline_price = self._first_float(rest_price or {}, [
+                    "last", "price", "current_price", "ovrs_nmix_prpr",
+                    "stck_prpr", "tlast", "base", "clos",
+                ])
+                baseline_volume = self._first_float(rest_price or {}, ["acml_vol", "volume", "tvol"])
+                if baseline_price <= 0:
+                    from datetime import date, timedelta
+                    exchange_obj, df = self._get_overseas_daily_ohlcv_auto(
+                        stock_code,
+                        inp.get("exchange"),
+                        date.today() - timedelta(days=10),
+                        date.today(),
+                    )
+                    if exchange_obj:
+                        exchange = str(exchange_obj)
+                    if df is not None and not df.empty:
+                        last = df.iloc[-1]
+                        baseline_price = float(last.get("close") or 0)
+                        baseline_volume = float(last.get("volume") or 0)
+            except Exception:
+                logger.exception("감시 기준가 조회 실패: %s", stock_code)
+        elif market == "overseas":
+            exchange = str(self._exchange_candidates(stock_code, inp.get("exchange"))[0])
+
+        # expr 아닌 조건 reject
+        bad = [
+            c.get("type") for c in inp.get("conditions", [])
+            if c.get("type") not in ("expr", "price_above", "price_below")
+        ]
+        if bad:
+            return json.dumps({
+                "error": f"조건 타입 거부: {bad}. price_change/volume_spike는 사용 불가.",
+                "instruction": (
+                    "반드시 expr 타입을 사용하고 formula 필드에 파이썬 비교식을 작성하세요. "
+                    "2개 이상 지표를 조합해야 합니다. "
+                    "예시: 'rsi < 30 and bb_pct < 0.15 and change_pct < -2' "
+                    "사용 가능 변수: price, volume, change_pct, volume_ratio, "
+                    "rsi, macd, ma5, ma10, ma20, ma60, bb_pct, bb_upper, bb_lower, stoch_k, stoch_d"
+                ),
+            }, ensure_ascii=False)
 
         watches = self._load_watches()
         watches[stock_code] = {
             "stock_code": stock_code,
             "stock_name": inp["stock_name"],
             "market": market,
+            "exchange": exchange,
             "conditions": inp["conditions"],
             "baseline_price": baseline_price,
             "baseline_volume": baseline_volume,
@@ -536,9 +877,7 @@ class ToolExecutor:
 
         ws_subscribed = False
         if self._ws is not None:
-            import asyncio
             from kis.constants import WebSocketTRID
-            loop = asyncio.get_event_loop()
 
             def _on_price(tr_id, fields):
                 from kis.websocket import parse_domestic_price, parse_overseas_price
@@ -549,25 +888,26 @@ class ToolExecutor:
                         "stock_code": code,
                         "current_price": parsed.get("price", 0),
                         "volume": parsed.get("vol", 0),
+                        "acml_volume": parsed.get("acml_vol", 0),
                         "time": parsed.get("time", ""),
-                        "exchange": "KRX" if market == "domestic" else "NAS",
+                        "exchange": exchange,
                         "stock_name": inp["stock_name"],
                     })
 
             tr_id = WebSocketTRID.DOMESTIC_PRICE if market == "domestic" else WebSocketTRID.OVERSEAS_PRICE
-            tr_key = stock_code if market == "domestic" else f"DNAS{stock_code}"
-            future = asyncio.run_coroutine_threadsafe(
-                self._ws.add_live_subscription(tr_id, tr_key, _on_price), loop
-            )
+            tr_key = stock_code if market == "domestic" else f"D{exchange}{stock_code}"
             try:
-                ws_subscribed = future.result(timeout=3)
+                ws_subscribed = await self._ws.add_live_subscription(tr_id, tr_key, _on_price)
             except Exception:
+                logger.exception("감시 종목 동적 구독 실패: %s", stock_code)
                 ws_subscribed = False
 
         return json.dumps({
             "status": "감시 설정 완료",
             "stock_code": stock_code,
             "baseline_price": baseline_price,
+            "baseline_volume": baseline_volume,
+            "exchange": exchange,
             "ws_subscribed": ws_subscribed,
             "conditions": inp["conditions"],
         }, ensure_ascii=False)
@@ -586,6 +926,29 @@ class ToolExecutor:
         watches = self._load_watches()
         return json.dumps({"watches": list(watches.values()), "count": len(watches)}, ensure_ascii=False, default=str)
 
+    async def _get_system_status(self) -> str:
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get("http://127.0.0.1:8000/ai/system/status", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    data = await r.json()
+            return json.dumps(data, ensure_ascii=False, default=str)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    async def _get_logs(self, level: str, limit: int, name: str) -> str:
+        import aiohttp
+        try:
+            params = f"level={level}&limit={limit}&name={name}"
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"http://127.0.0.1:8000/ai/system/logs?{params}", timeout=aiohttp.ClientTimeout(total=5)) as r:
+                    data = await r.json()
+            logs = data.get("logs", [])
+            lines = [f"[{l['ts']}] {l['level']:7} {l['name']:12} {l['msg']}" for l in logs]
+            return "\n".join(lines) if lines else "로그 없음"
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
     def _load_watches(self) -> dict:
         if not self._r:
             return {}
@@ -596,3 +959,16 @@ class ToolExecutor:
             return json.loads(raw)
         except Exception:
             return {}
+
+    @staticmethod
+    def _is_domestic_code(stock_code: str) -> bool:
+        return len(stock_code) == 6 and stock_code.isdigit()
+
+    @staticmethod
+    def _is_domestic_market_open() -> bool:
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return False
+        start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        return start <= now <= end

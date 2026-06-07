@@ -14,6 +14,7 @@ class WatchConditionType(str, Enum):
     PRICE_ABOVE = "price_above"      # 가격이 X 이상
     PRICE_BELOW = "price_below"      # 가격이 X 이하
     VOLUME_SPIKE = "volume_spike"    # 거래량이 평균의 X배
+    EXPR = "expr"                    # 자유 수식 (price, volume, rsi, macd, ma5/10/20/60, change_pct, volume_ratio)
 
 
 class Market(str, Enum):
@@ -24,7 +25,8 @@ class Market(str, Enum):
 @dataclass
 class WatchCondition:
     type: WatchConditionType
-    threshold: float
+    threshold: float = 0.0
+    formula: str = ""   # expr 타입일 때 사용
     note: str = ""
 
 

@@ -4,7 +4,7 @@ import redis
 
 logger = logging.getLogger(__name__)
 
-_PRICE_TTL = 300
+_PRICE_TTL = 1800
 _ORDERBOOK_TTL = 60
 
 

@@ -39,6 +39,7 @@ from collector.account import AccountCollector
 from events.types import Market, EventKind, MarketEvent
 from events.detector import EventDetector
 from events.engine import EventEngine
+from events.indicator_cache import IndicatorCache
 
 from ai.memory import AgentMemory
 from ai.tools import ToolExecutor
@@ -217,7 +218,7 @@ def make_ws_callbacks(comp: dict, aggregators: dict, event_engine: EventEngine):
     order_mgr: OrderManager = comp["order_mgr"]
     loop = asyncio.get_event_loop()
 
-    def on_domestic_price(raw: dict) -> None:
+    def on_domestic_price(tr_id, raw: dict) -> None:
         parsed = parse_domestic_price(list(raw.values()) if isinstance(raw, dict) else raw)
         code = parsed.get("stock_code", "")
         if not code:
@@ -235,13 +236,13 @@ def make_ws_callbacks(comp: dict, aggregators: dict, event_engine: EventEngine):
             aggregators[code].update({"price": tick["current_price"], "vol": tick["volume"], "time": tick["time"]})
         order_mgr.record_price(code, tick["current_price"])
 
-    def on_domestic_askbid(raw: dict) -> None:
+    def on_domestic_askbid(tr_id, raw: dict) -> None:
         parsed = parse_domestic_askbid(list(raw.values()) if isinstance(raw, dict) else raw)
         code = parsed.get("stock_code", "")
         if code:
             market_data.on_orderbook_tick(code, parsed)
 
-    def on_overseas_price(raw: dict) -> None:
+    def on_overseas_price(tr_id, raw: dict) -> None:
         parsed = parse_overseas_price(list(raw.values()) if isinstance(raw, dict) else raw)
         code = parsed.get("stock_code", "")
         if not code:
@@ -257,15 +258,23 @@ def make_ws_callbacks(comp: dict, aggregators: dict, event_engine: EventEngine):
         market_data.on_price_tick(code, tick)
         order_mgr.record_price(code, tick["current_price"])
 
-    def on_fill_notice(parsed: dict) -> None:
-        order_mgr.on_order_notice(parsed)
+    def on_fill_notice(tr_id, raw: dict) -> None:
+        fields = list(raw.values()) if isinstance(raw, dict) else raw
+        parser = parse_domestic_fill_notice if tr_id in (
+            WebSocketTRID.DOMESTIC_FILL_PAPER,
+            WebSocketTRID.DOMESTIC_FILL_LIVE,
+        ) else parse_overseas_fill_notice
+        order_mgr.on_order_notice(parser(fields))
+
+    domestic_fill_trid = WebSocketTRID.DOMESTIC_FILL_PAPER if comp["auth"].is_paper else WebSocketTRID.DOMESTIC_FILL_LIVE
+    overseas_fill_trid = WebSocketTRID.OVERSEAS_FILL_PAPER if comp["auth"].is_paper else WebSocketTRID.OVERSEAS_FILL_LIVE
 
     return {
         WebSocketTRID.DOMESTIC_PRICE: on_domestic_price,
         WebSocketTRID.DOMESTIC_ASKBID: on_domestic_askbid,
         WebSocketTRID.OVERSEAS_PRICE: on_overseas_price,
-        WebSocketTRID.DOMESTIC_FILL: on_fill_notice,
-        WebSocketTRID.OVERSEAS_FILL: on_fill_notice,
+        domestic_fill_trid: on_fill_notice,
+        overseas_fill_trid: on_fill_notice,
     }
 
 
@@ -316,6 +325,7 @@ async def main_async(config_path: str = "config.yaml") -> None:
         memory=memory,
         domestic_api=comp["domestic"],
         overseas_api=comp["overseas"],
+        config=config,
         regime_fn=regime_fn,
     )
 
@@ -327,8 +337,13 @@ async def main_async(config_path: str = "config.yaml") -> None:
         on_message=on_message,
     )
 
-    detector = EventDetector(comp["market_data"], comp["redis"])
-    engine = EventEngine(detector)
+    indicator_cache = IndicatorCache(
+        redis_client=comp["redis"],
+        domestic=comp.get("domestic"),
+        overseas=comp.get("overseas"),
+    )
+    detector = EventDetector(comp["market_data"], comp["redis"], indicator_cache=indicator_cache)
+    engine = EventEngine(detector, indicator_cache=indicator_cache)
     engine.register(agent.handle_event)
 
     aggregators: dict[str, CandleAggregator] = {}

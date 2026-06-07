@@ -1,6 +1,7 @@
 import json
 import asyncio
 import logging
+from datetime import datetime
 from base64 import b64decode
 from typing import Callable
 
@@ -50,6 +51,12 @@ class KISWebSocket:
         self._handlers: dict[str, Callable] = {}
         # 구독 목록: [(tr_id, stock_code)]
         self._subscriptions: list[tuple[str, str]] = []
+        self.last_message_at: str | None = None
+        self.last_realtime_at: str | None = None
+        self.last_realtime_sample: str | None = None
+        self.last_unmatched_key: str | None = None
+        self.realtime_count = 0
+        self.unmatched_count = 0
 
     def subscribe(self, tr_id: WebSocketTRID | str, stock_code: str, handler: Callable):
         """실시간 데이터 구독 등록. handler(tr_id, fields: list[str])"""
@@ -86,6 +93,11 @@ class KISWebSocket:
 
     async def add_live_subscription(self, tr_id: WebSocketTRID | str, stock_code: str, handler: Callable) -> bool:
         """연결 중인 WebSocket에 실시간으로 구독 추가. 연결 전이면 False 반환."""
+        max_subscriptions = int(self.auth.config.get("kis", {}).get("max_ws_subscriptions", 3))
+        existing = (tr_id, stock_code) in self._subscriptions
+        if max_subscriptions > 0 and not existing and len(self._subscriptions) >= max_subscriptions:
+            logger.warning("동적 구독 제한 초과: max=%d [%s] %s", max_subscriptions, tr_id, stock_code)
+            return False
         self.subscribe(tr_id, stock_code, handler)
         if self._ws is None or self._approval_key is None:
             return False
@@ -111,33 +123,41 @@ class KISWebSocket:
         domestic_codes: list[str],
         overseas_codes: list[str],
         callbacks: dict,
+        overseas_exchanges: dict[str, str] | None = None,
     ) -> None:
         """편의 메서드: 종목 목록으로 구독 등록 후 run() 실행."""
         from kis.constants import WebSocketTRID as _TRID
 
         price_cb = callbacks.get(_TRID.DOMESTIC_PRICE)
         askbid_cb = callbacks.get(_TRID.DOMESTIC_ASKBID)
-        fill_cb = callbacks.get(_TRID.DOMESTIC_FILL)
         ovs_price_cb = callbacks.get(_TRID.OVERSEAS_PRICE)
-        ovs_fill_cb = callbacks.get(_TRID.OVERSEAS_FILL)
+        domestic_fill_trid = _TRID.DOMESTIC_FILL_PAPER if self.auth.is_paper else _TRID.DOMESTIC_FILL_LIVE
+        overseas_fill_trid = _TRID.OVERSEAS_FILL_PAPER if self.auth.is_paper else _TRID.OVERSEAS_FILL_LIVE
+        fill_cb = callbacks.get(domestic_fill_trid)
+        ovs_fill_cb = callbacks.get(overseas_fill_trid)
+        kis_cfg = self.auth.config.get("kis", {})
+        subscribe_orderbook = bool(kis_cfg.get("subscribe_orderbook", False))
+        subscribe_fills = bool(kis_cfg.get("subscribe_fills", False))
 
         for code in domestic_codes:
             if price_cb:
                 self.subscribe(_TRID.DOMESTIC_PRICE, code, price_cb)
-            if askbid_cb:
+            if askbid_cb and subscribe_orderbook:
                 self.subscribe(_TRID.DOMESTIC_ASKBID, code, askbid_cb)
 
+        overseas_exchanges = overseas_exchanges or {}
         for code in overseas_codes:
             if ovs_price_cb:
-                tr_key = f"DNAS{code}"
+                exchange = overseas_exchanges.get(str(code).upper(), "NAS")
+                tr_key = f"D{exchange}{code}"
                 self.subscribe(_TRID.OVERSEAS_PRICE, tr_key, ovs_price_cb)
 
-        hts_id = self.auth.config.get("kis", {}).get("hts_id", "")
+        hts_id = kis_cfg.get("hts_id", "")
         account_no = self.auth.get_account_no()
-        if fill_cb and hts_id:
-            self.subscribe_global(_TRID.DOMESTIC_FILL, hts_id, fill_cb)
-        if ovs_fill_cb and account_no:
-            self.subscribe_global(_TRID.OVERSEAS_FILL, account_no, ovs_fill_cb)
+        if fill_cb and hts_id and subscribe_fills:
+            self.subscribe_global(domestic_fill_trid, hts_id, fill_cb)
+        if ovs_fill_cb and account_no and subscribe_fills:
+            self.subscribe_global(overseas_fill_trid, account_no, ovs_fill_cb)
 
         await self.run()
 
@@ -165,14 +185,35 @@ class KISWebSocket:
     def stop(self):
         self._running = False
 
+    def status(self) -> dict:
+        return {
+            "connected": self._ws is not None,
+            "subscription_count": len(self._subscriptions),
+            "subscriptions": [f"{tr_id}:{stock_code}" for tr_id, stock_code in self._subscriptions],
+            "last_message_at": self.last_message_at,
+            "last_realtime_at": self.last_realtime_at,
+            "last_realtime_sample": self.last_realtime_sample,
+            "last_unmatched_key": self.last_unmatched_key,
+            "realtime_count": self.realtime_count,
+            "unmatched_count": self.unmatched_count,
+        }
+
     async def _recv_loop(self, ws):
-        async for raw in ws:
+        while self._running:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=120)
+            except asyncio.TimeoutError as e:
+                raise TimeoutError("WebSocket realtime receive timeout") from e
             if isinstance(raw, bytes):
                 raw = raw.decode("utf-8")
             await self._dispatch(ws, raw)
 
     async def _dispatch(self, ws, raw: str):
+        self.last_message_at = datetime.now().isoformat()
         if raw[0] in _MSG_REALTIME:
+            self.last_realtime_at = self.last_message_at
+            self.last_realtime_sample = raw[:300]
+            self.realtime_count += 1
             # 데이터 메시지: {0|1}|{TR_ID}|{COUNT}|{DATA}
             parts = raw.split("|", 3)
             if len(parts) < 4:
@@ -220,10 +261,15 @@ class KISWebSocket:
                     continue
                 stock_code = fields[0]
                 handler = self._handlers.get(f"{tr_id}:{stock_code}")
+                if handler is None and tr_id == str(WebSocketTRID.OVERSEAS_PRICE) and len(fields) > 1:
+                    handler = self._handlers.get(f"{tr_id}:{fields[1]}")
                 if handler is None:
                     handler = self._handlers.get(f"{tr_id}:*")
                 if handler:
                     handler(tr_id, fields)
+                else:
+                    self.unmatched_count += 1
+                    self.last_unmatched_key = f"{tr_id}:{stock_code}"
         else:
             await self._handle_system(ws, raw)
 
@@ -336,15 +382,21 @@ def parse_overseas_price(fields: list[str]) -> dict:
     """HDFSCNT0 해외주식 체결 데이터 파싱."""
     get = lambda i, d="": fields[i] if len(fields) > i else d
     return {
-        "stock_code": get(0),
-        "date":       get(1),
-        "time":       get(2),
-        "price":      get(3),
-        "sign":       get(4),
-        "change":     get(5),
-        "change_pct": get(6),
-        "vol":        get(7),
-        "acml_val":   get(8),
+        "subscription_key": get(0),
+        "stock_code": get(1),
+        "date":       get(3),
+        "time":       get(5),
+        "kst_time":   get(7),
+        "open":       get(8),
+        "high":       get(9),
+        "low":        get(10),
+        "price":      get(11),
+        "sign":       get(12),
+        "change":     get(13),
+        "change_pct": get(14),
+        "vol":        get(17),
+        "acml_vol":   get(20),
+        "acml_val":   get(21),
     }
 
 

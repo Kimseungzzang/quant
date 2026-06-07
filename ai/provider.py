@@ -120,6 +120,8 @@ class OpenAICompatibleProvider(BaseProvider):
         messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}, *past_history, {"role": "user", "content": current_message}]
         tools = self._to_openai_tools(TOOL_DEFINITIONS)
         final_text = ""
+        text_parts: list[str] = []
+        empty_response_retries = 0
 
         while True:
             for attempt in range(3):
@@ -165,8 +167,9 @@ class OpenAICompatibleProvider(BaseProvider):
             tool_calls = msg.tool_calls or []
 
             if text:
-                final_text = text
-                on_text(final_text)
+                text_parts.append(text)
+                final_text = "\n\n".join(text_parts)
+                on_text(text)
 
             assistant_msg: dict = {"role": "assistant", "content": msg.content}
             if tool_calls:
@@ -174,6 +177,17 @@ class OpenAICompatibleProvider(BaseProvider):
             messages.append(assistant_msg)
 
             if choice.finish_reason == "stop" or not tool_calls:
+                if not final_text.strip() and empty_response_retries < 1:
+                    empty_response_retries += 1
+                    logger.warning("빈 AI 응답 수신, 최종 답변 재요청")
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "방금 응답이 비었습니다. 지금까지의 대화와 도구 결과를 바탕으로 "
+                            "사용자에게 보여줄 최종 답변을 한국어로 작성하세요."
+                        ),
+                    })
+                    continue
                 break
 
             for tc in tool_calls:
@@ -186,6 +200,12 @@ class OpenAICompatibleProvider(BaseProvider):
                 on_tool(tc.function.name, result)
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
+        if not final_text.strip():
+            fallback = "응답 생성이 비어 종료되었습니다. 같은 요청을 한 번 더 보내 주세요."
+            logger.warning("빈 AI 응답 fallback 반환")
+            on_text(fallback)
+            return fallback
+
         return final_text
 
 
@@ -194,7 +214,7 @@ _PROVIDERS = {
     "gemini":    lambda key: OpenAICompatibleProvider(
         key,
         "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "gemini-2.5-flash-lite",
+        "gemini-2.5-flash",
     ),
     "groq":      lambda key: OpenAICompatibleProvider(
         key,

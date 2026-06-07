@@ -1,0 +1,16 @@
+{
+  "name": "jarvis-trader",
+  "version": "1.0.0",
+  "description": "AI Trader - Jarvis Interface",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "lightweight-charts": "^5.2.0",
+    "three": "^0.165.0"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}
