@@ -25,3 +25,9 @@ data/
 .DS_Store
 *.log
 .env
+
+# Redis
+dump.rdb
+
+# Java/Maven (미사용 스캐폴드)
+api/
