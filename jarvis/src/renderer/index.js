@@ -1,5 +1,5 @@
 import { JarvisSphere } from './sphere.js';
-import { detectAndShowPanel, hidePanel, showChartPanelDirect, showWatchPanelDirect, showIndicatorPanelDirect, onPriceTick } from './panels.js';
+import { detectAndShowPanel, hidePanel, showChartPanelDirect, showWatchPanelDirect, showIndicatorPanelDirect, showPnlPanelDirect, onPriceTick } from './panels.js';
 
 const BASE = window.api?.baseUrl || 'http://127.0.0.1:8000';
 
@@ -91,7 +91,7 @@ const SLASH_HELP = `사용 가능한 명령어:
 /min [CODE]     — 분봉 차트  (예: /min AAPL)
 /watch          — 감시 종목 목록
 /ind [CODE]     — 기술 지표  (예: /ind NVDA)
-/mode paper|live — 거래 모드 전환
+/pnl            — 수익률 패널
 /help           — 이 목록`;
 
 async function handleSlashCommand(text) {
@@ -122,6 +122,10 @@ async function handleSlashCommand(text) {
     case '/ind':
       await showIndicatorPanelDirect(code);
       addMessage('ai', `${code} 기술 지표를 표시합니다.`);
+      return true;
+    case '/pnl':
+      await showPnlPanelDirect();
+      addMessage('ai', '수익률 패널을 표시합니다.');
       return true;
     case '/mode': {
       const mode = args[0] || 'paper';
@@ -191,7 +195,7 @@ const COMMANDS = [
   { cmd: '/min',    arg: '[종목]',   desc: '분봉 차트 표시' },
   { cmd: '/watch',  arg: '',         desc: '감시 종목 목록' },
   { cmd: '/ind',    arg: '[종목]',   desc: '기술 지표 표시' },
-  { cmd: '/mode',   arg: 'paper|live', desc: '거래 모드 전환' },
+  { cmd: '/pnl',    arg: '',         desc: '수익률 패널' },
   { cmd: '/clear',  arg: '',         desc: '채팅 초기화' },
   { cmd: '/help',   arg: '',         desc: '명령어 목록' },
 ];

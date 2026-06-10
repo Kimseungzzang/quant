@@ -95,6 +95,30 @@ def set_mode(req: ModeRequest):
     )
 
 
+@router.get("/trade/pnl")
+async def get_pnl_summary():
+    config = state.components.get("config") or {}
+    mode = config.get("mode", "paper")
+    try:
+        summary = await PGWriter().get_pnl_summary(mode=mode)
+        # 미실현 손익은 KIS 잔고에서 실시간으로 추가
+        unrealized = 0.0
+        domestic = state.components.get("domestic")
+        if domestic:
+            try:
+                bal = domestic.get_balance()
+                positions = bal.get("positions") or []
+                unrealized = sum(_to_float(p.get("evlu_pfls_amt")) for p in positions)
+            except Exception:
+                pass
+        summary["unrealizedPnl"] = unrealized
+        summary["mode"] = mode
+        return summary
+    except Exception as e:
+        logger.exception("P&L 요약 조회 실패")
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.get("/trade/positions")
 async def get_positions():
     return await PGWriter().get_positions()

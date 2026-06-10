@@ -292,17 +292,20 @@ class PGWriter:
                 """
                 SELECT
                     COALESCE(SUM(realized_pnl), 0) AS total_realized_pnl,
+                    COALESCE(SUM(realized_pnl) FILTER (WHERE traded_at::date = CURRENT_DATE), 0) AS today_realized_pnl,
                     COUNT(*) FILTER (WHERE side = 'SELL') AS total_trades,
                     COUNT(*) FILTER (WHERE side = 'SELL' AND realized_pnl > 0) AS winning_trades
-                FROM trades WHERE mode = $1 AND realized_pnl IS NOT NULL
+                FROM trades WHERE mode = $1 AND side = 'SELL' AND realized_pnl IS NOT NULL
                 """,
                 mode,
             )
             total = int(row["total_trades"] or 0)
             wins = int(row["winning_trades"] or 0)
             pnl = float(row["total_realized_pnl"] or 0)
+            today = float(row["today_realized_pnl"] or 0)
             return {
                 "totalRealizedPnl": pnl,
+                "todayRealizedPnl": today,
                 "totalTrades": total,
                 "winningTrades": wins,
                 "winRate": round(wins / total * 100, 2) if total > 0 else 0,

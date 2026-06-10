@@ -582,8 +582,6 @@ class OrderManager:
             self._positions[stock_code] = pos
         self._last_prices[stock_code] = price
         self.trade_logger.log_buy(stock_code, name, exchange, qty, price, order_no)
-        if self.pg and self.mode != "mock":
-            self.pg.save_buy(stock_code, name, exchange, qty, price, order_no, mode=self.mode)
         logger.info("[매수체결] %s(%s) %d주 @ %.2f", name, stock_code, qty, price)
 
     def _confirm_sell(

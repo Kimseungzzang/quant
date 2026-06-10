@@ -123,6 +123,9 @@ export async function showWatchPanelDirect() {
 export async function showIndicatorPanelDirect(code) {
   return showIndicatorPanel(code);
 }
+export async function showPnlPanelDirect() {
+  return showPnlPanel();
+}
 
 export async function detectAndShowPanel(text) {
   const t = text.toLowerCase();
@@ -135,6 +138,8 @@ export async function detectAndShowPanel(text) {
     await showPortfolioPanel();
   } else if (t.includes('rsi') || t.includes('지표') || t.includes('볼린저') || t.includes('indicator')) {
     await showIndicatorPanel(text);
+  } else if (t.includes('수익률') || t.includes('손익') || t.includes('pnl') || t.includes('승률')) {
+    await showPnlPanel();
   }
 }
 
@@ -322,6 +327,54 @@ function _updateChartMeta(panelType, code, last, prev) {
     </span>
     <span style="color:#00ff99;font-size:10px">● LIVE</span>
   `;
+}
+
+// ── P&L 패널 ────────────────────────────────────────────────────────────────
+
+async function showPnlPanel() {
+  showPanel('pnl', '◈ 수익률', '<div style="color:var(--text-dim);font-size:12px">로딩 중...</div>');
+  try {
+    const res = await fetch(`${BASE}/trade/pnl`);
+    const d = await res.json();
+
+    const fmt = (v, currency = '원') => {
+      const n = Number(v || 0);
+      const sign = n >= 0 ? '+' : '';
+      const cls = n >= 0 ? '#00ff99' : '#ff4466';
+      return `<span style="color:${cls};font-weight:700">${sign}${n.toLocaleString()}${currency}</span>`;
+    };
+
+    const totalPnl = Number(d.totalRealizedPnl || 0);
+    const todayPnl = Number(d.todayRealizedPnl || 0);
+    const unrealized = Number(d.unrealizedPnl || 0);
+    const winRate = Number(d.winRate || 0);
+    const total = Number(d.totalTrades || 0);
+    const wins = Number(d.winningTrades || 0);
+
+    const html = `
+      <div class="panel-row" style="margin-bottom:8px">
+        <span class="panel-label">누적 실현</span>
+        ${fmt(totalPnl)}
+      </div>
+      <div class="panel-row" style="margin-bottom:8px">
+        <span class="panel-label">오늘 실현</span>
+        ${fmt(todayPnl)}
+      </div>
+      <div class="panel-row" style="margin-bottom:8px">
+        <span class="panel-label">미실현</span>
+        ${fmt(unrealized)}
+      </div>
+      <hr style="border-color:var(--border);margin:8px 0">
+      <div class="panel-row">
+        <span class="panel-label">승률</span>
+        <span style="color:var(--accent);font-weight:700">${winRate.toFixed(1)}%</span>
+        <span style="color:var(--text-dim);font-size:11px;margin-left:4px">(${wins}/${total})</span>
+      </div>
+    `;
+    showPanel('pnl', '◈ 수익률', html);
+  } catch {
+    showPanel('pnl', '◈ 수익률', '<div style="color:var(--danger)">데이터 로드 실패</div>');
+  }
 }
 
 // ── Indicator 패널 ──────────────────────────────────────────────────────────
