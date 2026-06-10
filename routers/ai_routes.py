@@ -83,10 +83,26 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
         is_domestic = stock_code.isdigit()
         if is_domestic and domestic:
             if candle_type == "minute":
+                import pandas as _pd
                 from datetime import datetime as _dt
-                df = domestic.get_minute_ohlcv(stock_code, input_hour=_dt.now().strftime("%H%M%S"))
-                if not df.empty:
+                now_str = _dt.now().strftime("%H%M%S")
+                # 장 마감(15:30) 이후면 마감 시각 기준으로 조회
+                cur_hour = "153000" if now_str > "153000" else now_str
+                dfs = []
+                for _ in range(13):  # 최대 390 1분봉 = 하루 전체
+                    chunk = domestic.get_minute_ohlcv(stock_code, input_hour=cur_hour)
+                    if chunk.empty:
+                        break
+                    dfs.append(chunk)
+                    earliest = chunk["datetime"].min()
+                    if earliest.strftime("%H%M%S") <= "090500":
+                        break
+                    cur_hour = (earliest - _pd.Timedelta(minutes=1)).strftime("%H%M%S")
+                if dfs:
+                    df = _pd.concat(dfs).drop_duplicates("datetime").sort_values("datetime").reset_index(drop=True)
                     df = domestic._aggregate(df, 5)
+                else:
+                    df = _pd.DataFrame()
             else:
                 end = date.today()
                 start = end - timedelta(days=max(count * 2, 60))
