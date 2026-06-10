@@ -96,12 +96,11 @@ def set_mode(req: ModeRequest):
 
 
 @router.get("/trade/pnl")
-async def get_pnl_summary():
+async def get_pnl_summary(period: str = "all"):
     config = state.components.get("config") or {}
     mode = config.get("mode", "paper")
     try:
-        summary = await PGWriter().get_pnl_summary(mode=mode)
-        # 미실현 손익은 KIS 잔고에서 실시간으로 추가
+        summary = await PGWriter().get_pnl_summary(mode=mode, period=period)
         unrealized = 0.0
         domestic = state.components.get("domestic")
         if domestic:

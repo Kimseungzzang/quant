@@ -331,50 +331,84 @@ function _updateChartMeta(panelType, code, last, prev) {
 
 // ── P&L 패널 ────────────────────────────────────────────────────────────────
 
-async function showPnlPanel() {
-  showPanel('pnl', '◈ 수익률', '<div style="color:var(--text-dim);font-size:12px">로딩 중...</div>');
+const _PNL_PERIODS = [
+  { key: 'today', label: '오늘' },
+  { key: 'week',  label: '이번주' },
+  { key: 'month', label: '이번달' },
+  { key: 'all',   label: '전체' },
+];
+
+async function _loadPnlContent(period = 'all') {
+  const el = _getContent('pnl');
+  if (!el) return;
+  el.querySelector('#pnl-body').innerHTML = '<div style="color:var(--text-dim);font-size:12px">로딩 중...</div>';
   try {
-    const res = await fetch(`${BASE}/trade/pnl`);
+    const res = await fetch(`${BASE}/trade/pnl?period=${period}`);
     const d = await res.json();
 
-    const fmt = (v, currency = '원') => {
+    const fmt = (v) => {
       const n = Number(v || 0);
       const sign = n >= 0 ? '+' : '';
       const cls = n >= 0 ? '#00ff99' : '#ff4466';
-      return `<span style="color:${cls};font-weight:700">${sign}${n.toLocaleString()}${currency}</span>`;
+      return `<span style="color:${cls};font-weight:700">${sign}${n.toLocaleString()}원</span>`;
     };
 
-    const totalPnl = Number(d.totalRealizedPnl || 0);
-    const todayPnl = Number(d.todayRealizedPnl || 0);
-    const unrealized = Number(d.unrealizedPnl || 0);
-    const winRate = Number(d.winRate || 0);
-    const total = Number(d.totalTrades || 0);
-    const wins = Number(d.winningTrades || 0);
-
-    const html = `
+    el.querySelector('#pnl-body').innerHTML = `
       <div class="panel-row" style="margin-bottom:8px">
-        <span class="panel-label">누적 실현</span>
-        ${fmt(totalPnl)}
-      </div>
-      <div class="panel-row" style="margin-bottom:8px">
-        <span class="panel-label">오늘 실현</span>
-        ${fmt(todayPnl)}
+        <span class="panel-label">실현 손익</span>
+        ${fmt(d.realizedPnl)}
       </div>
       <div class="panel-row" style="margin-bottom:8px">
         <span class="panel-label">미실현</span>
-        ${fmt(unrealized)}
+        ${fmt(d.unrealizedPnl)}
       </div>
       <hr style="border-color:var(--border);margin:8px 0">
       <div class="panel-row">
         <span class="panel-label">승률</span>
-        <span style="color:var(--accent);font-weight:700">${winRate.toFixed(1)}%</span>
-        <span style="color:var(--text-dim);font-size:11px;margin-left:4px">(${wins}/${total})</span>
+        <span style="color:var(--accent);font-weight:700">${Number(d.winRate || 0).toFixed(1)}%</span>
+        <span style="color:var(--text-dim);font-size:11px;margin-left:4px">(${d.winningTrades || 0}/${d.totalTrades || 0})</span>
       </div>
     `;
-    showPanel('pnl', '◈ 수익률', html);
   } catch {
-    showPanel('pnl', '◈ 수익률', '<div style="color:var(--danger)">데이터 로드 실패</div>');
+    const body = el.querySelector('#pnl-body');
+    if (body) body.innerHTML = '<div style="color:var(--danger)">데이터 로드 실패</div>';
   }
+}
+
+async function showPnlPanel(period = 'all') {
+  const filterHtml = _PNL_PERIODS.map(p => `
+    <button class="pnl-filter-btn${p.key === period ? ' active' : ''}" data-period="${p.key}"
+      style="padding:2px 8px;font-size:11px;border-radius:3px;border:1px solid var(--border);
+             background:${p.key === period ? 'var(--accent)' : 'transparent'};
+             color:${p.key === period ? '#000' : 'var(--text-dim)'};cursor:pointer;margin-right:4px">
+      ${p.label}
+    </button>
+  `).join('');
+
+  showPanel('pnl', '◈ 수익률', `
+    <div style="margin-bottom:10px">${filterHtml}</div>
+    <div id="pnl-body"></div>
+  `);
+
+  // 필터 버튼 클릭 이벤트
+  const el = _getContent('pnl');
+  if (el) {
+    el.querySelectorAll('.pnl-filter-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        el.querySelectorAll('.pnl-filter-btn').forEach(b => {
+          b.classList.remove('active');
+          b.style.background = 'transparent';
+          b.style.color = 'var(--text-dim)';
+        });
+        btn.classList.add('active');
+        btn.style.background = 'var(--accent)';
+        btn.style.color = '#000';
+        await _loadPnlContent(btn.dataset.period);
+      });
+    });
+  }
+
+  await _loadPnlContent(period);
 }
 
 // ── Indicator 패널 ──────────────────────────────────────────────────────────
