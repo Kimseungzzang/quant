@@ -1,8 +1,11 @@
 import asyncio
 import json
 import logging
-from datetime import date, timedelta
+import pickle
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
+import pandas as pd
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -10,6 +13,88 @@ from routers import state
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+_CHART_CACHE_DIR = Path("data/cache")
+
+
+async def _fetch_today_minute_candles(domestic, stock_code: str) -> pd.DataFrame:
+    """오늘 1분봉을 캐시 + delta 방식으로 반환.
+
+    캐시 없음 → 오늘 전체 페이지네이션 후 저장.
+    캐시 있음 → 로드 후 마지막 시각 이후 1회 delta 호출만.
+    """
+    _CHART_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = _CHART_CACHE_DIR / f"{stock_code}_chart_1min.pkl"
+
+    today = date.today()
+    now_str = datetime.now().strftime("%H%M%S")
+    cap_hour = "180000" if now_str > "180000" else now_str
+
+    # 오늘 캐시 로드
+    cached: pd.DataFrame = pd.DataFrame()
+    if cache_file.exists():
+        try:
+            with cache_file.open("rb") as f:
+                loaded: pd.DataFrame = pickle.load(f)
+            if not loaded.empty and loaded["datetime"].dt.date.max() == today:
+                cached = loaded
+        except Exception:
+            cache_file.unlink(missing_ok=True)
+
+    if not cached.empty:
+        last_hour = cached["datetime"].max().strftime("%H%M%S")
+        if last_hour >= cap_hour:
+            return cached  # 이미 최신
+        # delta: 마지막 캐시 이후 새 1분봉 1회 호출
+        try:
+            delta = domestic.get_minute_ohlcv(stock_code, input_hour=cap_hour)
+            if not delta.empty:
+                new_rows = delta[delta["datetime"] > cached["datetime"].max()]
+                if not new_rows.empty:
+                    cached = (
+                        pd.concat([cached, new_rows])
+                        .drop_duplicates("datetime")
+                        .sort_values("datetime")
+                        .reset_index(drop=True)
+                    )
+                    with cache_file.open("wb") as f:
+                        pickle.dump(cached, f)
+        except Exception as e:
+            logger.warning("분봉 delta 조회 실패(%s): %s", stock_code, e)
+        return cached
+
+    # 캐시 없음: 오늘 전체 페이지네이션
+    cur_hour = cap_hour
+    dfs: list[pd.DataFrame] = []
+    for _ in range(20):
+        try:
+            chunk = domestic.get_minute_ohlcv(stock_code, input_hour=cur_hour)
+        except Exception as e:
+            logger.warning("분봉 페이지 조회 실패(%s@%s): %s", stock_code, cur_hour, e)
+            break
+        if chunk.empty:
+            break
+        today_chunk = chunk[chunk["datetime"].dt.date == today]
+        if not today_chunk.empty:
+            dfs.append(today_chunk)
+        earliest = chunk["datetime"].min()
+        if earliest.date() < today or earliest.strftime("%H%M%S") <= "090500":
+            break
+        cur_hour = (earliest - pd.Timedelta(minutes=1)).strftime("%H%M%S")
+        await asyncio.sleep(0.15)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    result = (
+        pd.concat(dfs)
+        .drop_duplicates("datetime")
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    with cache_file.open("wb") as f:
+        pickle.dump(result, f)
+    return result
 
 
 class ChatRequest(BaseModel):
@@ -83,31 +168,12 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
         is_domestic = stock_code.isdigit()
         if is_domestic and domestic:
             if candle_type == "minute":
-                import asyncio as _asyncio
-                import pandas as _pd
-                # 항상 15:30 기준 조회 — API는 실제 존재하는 데이터까지만 반환하므로
-                # 장중에도 미래 데이터는 포함되지 않으며, 장 마감 후 평탄 봉도 방지됨
-                cur_hour = "153000"
-                dfs = []
-                for _ in range(13):  # 최대 390 1분봉 = 하루 전체
-                    try:
-                        chunk = domestic.get_minute_ohlcv(stock_code, input_hour=cur_hour)
-                    except Exception as _e:
-                        logger.warning("분봉 페이지 조회 실패(%s@%s): %s", stock_code, cur_hour, _e)
-                        break
-                    if chunk.empty:
-                        break
-                    dfs.append(chunk)
-                    earliest = chunk["datetime"].min()
-                    if earliest.strftime("%H%M%S") <= "090500":
-                        break
-                    cur_hour = (earliest - _pd.Timedelta(minutes=1)).strftime("%H%M%S")
-                    await _asyncio.sleep(0.15)  # KIS paper API rate limit 방지
-                if dfs:
-                    df = _pd.concat(dfs).drop_duplicates("datetime").sort_values("datetime").reset_index(drop=True)
-                    df = domestic._aggregate(df, 5)
+                df_1min = await _fetch_today_minute_candles(domestic, stock_code)
+                if not df_1min.empty:
+                    df = domestic._aggregate(df_1min, 5)
+                    df = df[df["volume"] > 0].reset_index(drop=True)
                 else:
-                    df = _pd.DataFrame()
+                    df = pd.DataFrame()
             else:
                 end = date.today()
                 start = end - timedelta(days=max(count * 2, 60))
