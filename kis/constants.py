@@ -101,6 +101,7 @@ class TradeSignal(StrEnum):
 class DomesticTRID(StrEnum):
     # 시세 조회 (실전/모의 공통)
     PRICE         = "FHKST01010100"
+    OVERTIME_PRICE = "FHPST02300000"
     DAILY_CHART      = "FHKST03010100"
     MINUTE_CHART     = "FHKST03010200"
     HIST_MINUTE      = "FHKST03010230"
@@ -157,7 +158,11 @@ class OverseasTRID(StrEnum):
 
 class WebSocketTRID(StrEnum):
     DOMESTIC_PRICE  = "H0STCNT0"   # 국내주식 실시간체결가 (KRX)
+    DOMESTIC_PRICE_UNIFIED = "H0UNCNT0"  # 국내주식 실시간체결가 (통합)
+    DOMESTIC_PRICE_NXT = "H0NXCNT0"  # 국내주식 실시간체결가 (NXT)
     DOMESTIC_ASKBID = "H0STASP0"   # 국내주식 실시간호가
+    DOMESTIC_ASKBID_UNIFIED = "H0UNASP0"  # 국내주식 실시간호가 (통합)
+    DOMESTIC_ASKBID_NXT = "H0NXASP0"  # 국내주식 실시간호가 (NXT)
     OVERSEAS_PRICE  = "HDFSCNT0"   # 해외주식 실시간지연체결가
     DOMESTIC_FILL_LIVE  = "H0STCNI0"   # 국내주식 실시간 체결통보
     DOMESTIC_FILL_PAPER = "H0STCNI9"   # 국내주식 모의 실시간 체결통보
@@ -174,6 +179,7 @@ class DomesticPath(StrEnum):
     BUYABLE       = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"
     DAILY_ORDERS  = "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
     PRICE         = "/uapi/domestic-stock/v1/quotations/inquire-price"
+    OVERTIME_PRICE = "/uapi/domestic-stock/v1/quotations/inquire-overtime-price"
     DAILY_CHART   = "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
     MINUTE_CHART  = "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
     HIST_MINUTE   = "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice"

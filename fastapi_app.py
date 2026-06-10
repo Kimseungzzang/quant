@@ -175,10 +175,14 @@ async def _trading_loop(config: dict, comp: dict) -> None:
         code = parsed.get("stock_code", "")
         if not code:
             return
+        exchange = "UNIFIED" if str(tr_id) == str(WebSocketTRID.DOMESTIC_PRICE_UNIFIED) else (
+            "NXT" if str(tr_id) == str(WebSocketTRID.DOMESTIC_PRICE_NXT) else "KRX"
+        )
         tick = {
             "stock_code": code, "current_price": parsed.get("price", 0),
             "volume": parsed.get("vol", 0), "acml_volume": parsed.get("acml_vol", 0),
-            "time": parsed.get("time", ""), "exchange": "KRX",
+            "time": parsed.get("time", ""), "exchange": exchange,
+            "price_source": "websocket",
             "stock_name": parsed.get("stock_name", code),
             "received_at": datetime.now().isoformat(),
         }
@@ -240,7 +244,11 @@ async def _trading_loop(config: dict, comp: dict) -> None:
 
     callbacks = {
         WebSocketTRID.DOMESTIC_PRICE: on_domestic_price,
+        WebSocketTRID.DOMESTIC_PRICE_UNIFIED: on_domestic_price,
+        WebSocketTRID.DOMESTIC_PRICE_NXT: on_domestic_price,
         WebSocketTRID.DOMESTIC_ASKBID: on_domestic_askbid,
+        WebSocketTRID.DOMESTIC_ASKBID_UNIFIED: on_domestic_askbid,
+        WebSocketTRID.DOMESTIC_ASKBID_NXT: on_domestic_askbid,
         WebSocketTRID.OVERSEAS_PRICE: on_overseas_price,
         domestic_fill_trid: on_fill,
         overseas_fill_trid: on_fill,

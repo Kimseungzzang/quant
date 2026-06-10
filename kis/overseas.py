@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import date, timedelta, datetime, time as dtime
 from pathlib import Path
 import pickle
+from zoneinfo import ZoneInfo
 
 from .rest import KISRestClient
 from .constants import (
@@ -15,9 +16,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BALANCE_EXCHANGE = ExchangeCode.NASDAQ
 _CACHE_DIR = Path("data/cache")
 
-# 주간거래 시간대 (KST): 10:00~22:00
-_DAYTIME_START = dtime(10, 0)
-_DAYTIME_END   = dtime(22, 0)
+_KST = ZoneInfo("Asia/Seoul")
+_NY = ZoneInfo("America/New_York")
 
 _ORDER_EXCHANGE_CODE = {
     ExchangeCode.NASDAQ: "NASD",
@@ -28,8 +28,11 @@ _ORDER_EXCHANGE_CODE = {
 
 def _is_daytime() -> bool:
     """현재 시각이 KIS 주간거래 시간대인지 확인."""
-    now = datetime.now().time()
-    return _DAYTIME_START <= now < _DAYTIME_END
+    now = datetime.now(_KST)
+    if now.weekday() >= 5:
+        return False
+    daytime_end = dtime(17, 0) if datetime.now(_NY).dst() else dtime(18, 0)
+    return dtime(10, 0) <= now.time() < daytime_end
 
 
 class OverseasAPI:

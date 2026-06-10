@@ -27,6 +27,7 @@ kis:
   live_account_no: ""        # 실전투자 계좌번호 (8자리)
   live_account_product_code: "01"
   hts_id: ""                 # KIS HTS 이용자 ID (체결통보 WebSocket tr_key)
+  domestic_market: "UN"      # UN=통합(KRX+NXT), J=KRX
 
 trading:
   stop_loss_pct: 5.0

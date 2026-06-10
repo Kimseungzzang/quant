@@ -137,16 +137,36 @@ def get_live_positions(mode: str | None = None):
                 qty = int(p.get("hldg_qty") or 0)
                 if qty <= 0:
                     continue
+                balance_price = _to_float(p.get("prpr"))
+                market_price = balance_price
+                price_source = "balance"
+                try:
+                    quote = domestic.get_price(p.get("pdno"))
+                    quoted_price = _to_float(quote.get("stck_prpr"))
+                    if quoted_price > 0:
+                        market_price = quoted_price
+                        price_source = "unified_rest"
+                except Exception as e:
+                    logger.warning("통합 현재가 조회 실패(%s): %s", p.get("pdno"), e)
+                avg_price = _to_float(p.get("pchs_avg_pric"))
+                eval_amount = market_price * qty
+                pnl = (market_price - avg_price) * qty
+                cost = avg_price * qty
                 positions.append({
                     "market": "domestic",
                     "stock_code": p.get("pdno"),
                     "stock_name": p.get("prdt_name"),
                     "quantity": qty,
-                    "avg_price": float(p.get("pchs_avg_pric") or 0),
-                    "current_price": float(p.get("prpr") or 0),
-                    "eval_amount": float(p.get("evlu_amt") or 0),
-                    "pnl": float(p.get("evlu_pfls_amt") or 0),
-                    "pnl_pct": float(p.get("evlu_pfls_rt") or 0),
+                    "avg_price": avg_price,
+                    "current_price": market_price,
+                    "balance_price": balance_price,
+                    "price_source": price_source,
+                    "eval_amount": eval_amount,
+                    "pnl": pnl,
+                    "pnl_pct": round(pnl / cost * 100, 4) if cost > 0 else 0,
+                    "balance_eval_amount": _to_float(p.get("evlu_amt")),
+                    "balance_pnl": _to_float(p.get("evlu_pfls_amt")),
+                    "balance_pnl_pct": _to_float(p.get("evlu_pfls_rt")),
                 })
     except Exception as e:
         logger.warning("국내 포지션 조회 실패: %s", e)

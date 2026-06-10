@@ -41,37 +41,43 @@ async def _fetch_today_minute_candles(domestic, stock_code: str) -> pd.DataFrame
         except Exception:
             cache_file.unlink(missing_ok=True)
 
+    loop = asyncio.get_event_loop()
+
+    async def _call_minute_ohlcv(hour: str) -> pd.DataFrame:
+        """sync KIS 호출을 스레드풀로 격리. no-retry fast session → 4초 내 성공/실패."""
+        try:
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, domestic.get_minute_ohlcv, stock_code, hour),
+                timeout=6.0,
+            )
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("분봉 조회 실패/타임아웃(%s@%s): %s", stock_code, hour, e)
+            return pd.DataFrame()
+
     if not cached.empty:
         last_hour = cached["datetime"].max().strftime("%H%M%S")
         if last_hour >= cap_hour:
             return cached  # 이미 최신
         # delta: 마지막 캐시 이후 새 1분봉 1회 호출
-        try:
-            delta = domestic.get_minute_ohlcv(stock_code, input_hour=cap_hour)
-            if not delta.empty:
-                new_rows = delta[delta["datetime"] > cached["datetime"].max()]
-                if not new_rows.empty:
-                    cached = (
-                        pd.concat([cached, new_rows])
-                        .drop_duplicates("datetime")
-                        .sort_values("datetime")
-                        .reset_index(drop=True)
-                    )
-                    with cache_file.open("wb") as f:
-                        pickle.dump(cached, f)
-        except Exception as e:
-            logger.warning("분봉 delta 조회 실패(%s): %s", stock_code, e)
+        delta = await _call_minute_ohlcv(cap_hour)
+        if not delta.empty:
+            new_rows = delta[delta["datetime"] > cached["datetime"].max()]
+            if not new_rows.empty:
+                cached = (
+                    pd.concat([cached, new_rows])
+                    .drop_duplicates("datetime")
+                    .sort_values("datetime")
+                    .reset_index(drop=True)
+                )
+                with cache_file.open("wb") as f:
+                    pickle.dump(cached, f)
         return cached
 
     # 캐시 없음: 오늘 전체 페이지네이션
     cur_hour = cap_hour
     dfs: list[pd.DataFrame] = []
     for _ in range(20):
-        try:
-            chunk = domestic.get_minute_ohlcv(stock_code, input_hour=cur_hour)
-        except Exception as e:
-            logger.warning("분봉 페이지 조회 실패(%s@%s): %s", stock_code, cur_hour, e)
-            break
+        chunk = await _call_minute_ohlcv(cur_hour)
         if chunk.empty:
             break
         today_chunk = chunk[chunk["datetime"].dt.date == today]

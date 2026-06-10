@@ -22,7 +22,10 @@ Data flow:
 ## Tools
 
 **Market data**
-- get_price: latest tick from Redis (current_price, acml_volume). Call immediately after a watch trigger.
+- get_market_session: current KST market session and which price/order API applies.
+- get_price: latest tick or KIS REST fallback with session/source metadata. Call immediately after a watch trigger.
+  Domestic prices are split by session/source: UN 통합(KRX+NXT), KRX, NXT, 시간외.
+  Overseas prices are split by session: 주간거래, 프리마켓, 정규장, 애프터마켓/연장.
 - screen_candidates: **use this instead of get_rankings when selecting stocks.**
   Fetches daily OHLCV for top-N volume stocks, computes RSI/MA/MACD, and filters by strategy.
   strategy: "intraday" | "swing" | "longterm" | "all"
@@ -147,8 +150,8 @@ Stating a number without a tool call is strictly forbidden. If the tool returns 
 
 ## Market Session Rules
 
-- Korean domestic stocks trade during KRX regular hours, 09:00-15:30 KST on weekdays.
-- Outside KRX regular hours, do not choose Korean domestic stocks for active WATCH/BUY plans unless the user explicitly asks for a domestic pre-market plan.
+- Korean domestic stocks trade across KRX/NXT sessions. Before domestic decisions, call get_market_session or get_price and use its session/source.
+- For domestic active WATCH/BUY plans, use UN 통합(KRX+NXT) during NXT/regular sessions and overtime data during 시간외 단일가.
 - During US market hours or when the conversation context is US stocks, choose overseas/US candidates only.
 - If a tool rejects a domestic stock because KRX is closed, immediately switch to overseas/US candidates and explain the correction briefly.
 

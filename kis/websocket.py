@@ -18,7 +18,11 @@ _MSG_REALTIME = ("0", "1")
 # KIS WebSocket TR별 레코드당 필드 수 (공식 문서 기준)
 _KNOWN_FIELD_COUNTS: dict[str, int] = {
     "H0STCNT0": 46,   # 국내주식 실시간체결가
+    "H0UNCNT0": 46,   # 국내주식 실시간체결가 (통합)
+    "H0NXCNT0": 46,   # 국내주식 실시간체결가 (NXT)
     "H0STASP0": 57,   # 국내주식 실시간호가
+    "H0UNASP0": 57,   # 국내주식 실시간호가 (통합)
+    "H0NXASP0": 57,   # 국내주식 실시간호가 (NXT)
     "HDFSCNT0": 26,   # 해외주식 실시간체결가
 }
 
@@ -128,22 +132,25 @@ class KISWebSocket:
         """편의 메서드: 종목 목록으로 구독 등록 후 run() 실행."""
         from kis.constants import WebSocketTRID as _TRID
 
-        price_cb = callbacks.get(_TRID.DOMESTIC_PRICE)
-        askbid_cb = callbacks.get(_TRID.DOMESTIC_ASKBID)
+        kis_cfg = self.auth.config.get("kis", {})
+        domestic_market = str(kis_cfg.get("domestic_market", "UN")).upper()
+        domestic_price_trid = _TRID.DOMESTIC_PRICE_UNIFIED if domestic_market == "UN" else _TRID.DOMESTIC_PRICE
+        domestic_askbid_trid = _TRID.DOMESTIC_ASKBID_UNIFIED if domestic_market == "UN" else _TRID.DOMESTIC_ASKBID
+        price_cb = callbacks.get(domestic_price_trid) or callbacks.get(_TRID.DOMESTIC_PRICE)
+        askbid_cb = callbacks.get(domestic_askbid_trid) or callbacks.get(_TRID.DOMESTIC_ASKBID)
         ovs_price_cb = callbacks.get(_TRID.OVERSEAS_PRICE)
         domestic_fill_trid = _TRID.DOMESTIC_FILL_PAPER if self.auth.is_paper else _TRID.DOMESTIC_FILL_LIVE
         overseas_fill_trid = _TRID.OVERSEAS_FILL_PAPER if self.auth.is_paper else _TRID.OVERSEAS_FILL_LIVE
         fill_cb = callbacks.get(domestic_fill_trid)
         ovs_fill_cb = callbacks.get(overseas_fill_trid)
-        kis_cfg = self.auth.config.get("kis", {})
         subscribe_orderbook = bool(kis_cfg.get("subscribe_orderbook", False))
         subscribe_fills = bool(kis_cfg.get("subscribe_fills", False))
 
         for code in domestic_codes:
             if price_cb:
-                self.subscribe(_TRID.DOMESTIC_PRICE, code, price_cb)
+                self.subscribe(domestic_price_trid, code, price_cb)
             if askbid_cb and subscribe_orderbook:
-                self.subscribe(_TRID.DOMESTIC_ASKBID, code, askbid_cb)
+                self.subscribe(domestic_askbid_trid, code, askbid_cb)
 
         overseas_exchanges = overseas_exchanges or {}
         for code in overseas_codes:

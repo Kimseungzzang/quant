@@ -31,10 +31,18 @@ class DomesticAPI:
 
     # ── 시세 조회 ──────────────────────────────────────────────────────
 
-    def get_price(self, stock_code: str, market: MarketCode = MarketCode.KRX) -> dict:
+    def get_price(self, stock_code: str, market: MarketCode = MarketCode.ALL) -> dict:
         data = self.client.get(
             DomesticPath.PRICE,
             DomesticTRID.PRICE,
+            {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": stock_code},
+        )
+        return data["output"]
+
+    def get_overtime_price(self, stock_code: str, market: MarketCode = MarketCode.KRX) -> dict:
+        data = self.client.get(
+            DomesticPath.OVERTIME_PRICE,
+            DomesticTRID.OVERTIME_PRICE,
             {"FID_COND_MRKT_DIV_CODE": market, "FID_INPUT_ISCD": stock_code},
         )
         return data["output"]
@@ -78,6 +86,7 @@ class DomesticAPI:
         stock_code: str,
         input_hour: str = "153000",
         market: MarketCode = MarketCode.KRX,
+        timeout: int = 4,
     ) -> pd.DataFrame:
         """당일 분봉 조회. 한 번에 최대 30건. input_hour: HHMMSS."""
         data = self.client.get(
@@ -90,6 +99,8 @@ class DomesticAPI:
                 "FID_PW_DATA_INCU_YN":    "Y",
                 "FID_ETC_CLS_CODE":       "",
             },
+            timeout=timeout,
+            fast=True,
         )
         rows = data.get("output2", [])
         if not rows:

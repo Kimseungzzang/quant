@@ -27,20 +27,44 @@ class KISRestClient:
         self.auth = auth
         self.base_url = auth.base_url
         self.session = self._build_session()
+        self.fast_session = self._build_fast_session()
 
-    def get(self, path: str, tr_id: str, params: dict) -> dict:
-        _throttle()
+    def get(self, path: str, tr_id: str, params: dict, timeout: int = 10, fast: bool = False) -> dict:
         url = f"{self.base_url}{path}"
         headers = self.auth.get_headers(tr_id)
-        resp = self.session.get(url, headers=headers, params=params, timeout=10)
+        sess = self.fast_session if fast else self.session
+        resp = self._send_with_rate_retry(
+            lambda: sess.get(url, headers=headers, params=params, timeout=timeout),
+            retry_limit=0 if fast else 2,
+        )
         return self._handle(resp)
 
     def post(self, path: str, tr_id: str, body: dict) -> dict:
-        _throttle()
         url = f"{self.base_url}{path}"
         headers = self.auth.get_headers(tr_id)
-        resp = self.session.post(url, headers=headers, json=body, timeout=10)
+        resp = self._send_with_rate_retry(
+            lambda: self.session.post(url, headers=headers, json=body, timeout=10),
+            retry_limit=3,
+        )
         return self._handle(resp)
+
+    def _send_with_rate_retry(self, send, retry_limit: int) -> requests.Response:
+        for attempt in range(retry_limit + 1):
+            _throttle()
+            resp = send()
+            if self._is_kis_rate_limited(resp) and attempt < retry_limit:
+                wait = 1.0 + attempt * 0.5
+                logger.warning("KIS rate limit 응답 — %.1f초 후 재시도 (%d/%d)", wait, attempt + 1, retry_limit)
+                time.sleep(wait)
+                continue
+            return resp
+        raise RuntimeError("unreachable")
+
+    @staticmethod
+    def _is_kis_rate_limited(resp: requests.Response) -> bool:
+        if resp.status_code not in (429, 500):
+            return False
+        return "EGW00201" in (resp.text or "")
 
     def _handle(self, resp: requests.Response) -> dict:
         try:
@@ -64,6 +88,14 @@ class KISRestClient:
         session = requests.Session()
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503])
         adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
+
+    def _build_fast_session(self) -> requests.Session:
+        """분봉 조회 등 best-effort read용 — retry 없이 즉시 실패."""
+        session = requests.Session()
+        adapter = HTTPAdapter(max_retries=0)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         return session

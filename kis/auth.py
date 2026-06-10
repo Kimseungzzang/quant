@@ -40,7 +40,10 @@ class KISAuth:
             self.ws_full_url = config["kis"].get("ws_url",  KIS_WS_URL_MOCK)
         elif mode == TradingMode.PAPER:
             self.base_url    = KIS_REST_URL_PAPER
-            self.ws_full_url = KIS_WS_BASE_PAPER + KIS_WS_PATH_PAPER
+            ws_path = KIS_WS_PATH_PAPER
+            if ws_path == "/tryitout/H0STCNT0" and str(kis_cfg.get("domestic_market", "UN")).upper() == "UN":
+                ws_path = "/tryitout/H0UNCNT0"
+            self.ws_full_url = KIS_WS_BASE_PAPER + ws_path
         else:
             self.base_url    = KIS_REST_URL_LIVE
             self.ws_full_url = KIS_WS_BASE_LIVE + KIS_WS_PATH_LIVE

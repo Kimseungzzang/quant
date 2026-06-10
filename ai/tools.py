@@ -1,7 +1,8 @@
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
 import redis
@@ -15,18 +16,46 @@ _WATCHES_KEY = "ai:watches"
 
 logger = logging.getLogger(__name__)
 
+_KST = ZoneInfo("Asia/Seoul")
+_NY = ZoneInfo("America/New_York")
+
+
+def _to_float(value) -> float:
+    try:
+        return float(str(value or "0").replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(value) -> int:
+    try:
+        return int(float(str(value or "0").replace(",", "")))
+    except (TypeError, ValueError):
+        return 0
+
 
 
 TOOL_DEFINITIONS = [
     {
+        "name": "get_market_session",
+        "description": "현재 한국시간 기준 국내/해외 주식 거래 세션과 사용할 가격/주문 API 기준을 확인합니다.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "market": {"type": "string", "enum": ["domestic", "overseas", "both"], "default": "both"},
+            },
+        },
+    },
+    {
         "name": "get_price",
-        "description": "특정 종목의 현재가, 거래량, 등락률을 조회합니다.",
+        "description": "특정 종목의 현재가, 거래량, 등락률을 조회합니다. 국내/해외 거래 세션과 가격 출처를 함께 반환합니다.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "stock_code": {"type": "string", "description": "종목 코드 (예: 005930, NVDA)"},
                 "market": {"type": "string", "enum": ["domestic", "overseas"], "description": "시장. 비우면 종목 코드로 추정"},
                 "exchange": {"type": "string", "description": "해외 거래소 NAS | NYS | AMS. 비우면 자동 판별"},
+                "detail": {"type": "boolean", "default": False, "description": "국내 KRX/NXT/통합/시간외 원천별 시세를 함께 조회"},
             },
             "required": ["stock_code"],
         },
@@ -365,6 +394,8 @@ class ToolExecutor:
         self.executed_tools.append(tool_name)
         try:
             match tool_name:
+                case "get_market_session":
+                    return self._get_market_session(tool_input.get("market", "both"))
                 case "get_price":
                     # KIS REST fallback이 동기 HTTP — 이벤트 루프 블로킹 방지
                     return await _asyncio.to_thread(
@@ -372,6 +403,7 @@ class ToolExecutor:
                         tool_input["stock_code"],
                         tool_input.get("market"),
                         tool_input.get("exchange"),
+                        bool(tool_input.get("detail", False)),
                     )
                 case "get_orderbook":
                     return self._get_orderbook(tool_input["stock_code"])
@@ -460,23 +492,74 @@ class ToolExecutor:
             logger.exception("도구 실행 오류: %s", tool_name)
             return json.dumps({"error": str(e)})
 
-    def _get_price(self, stock_code: str, market: str | None = None, exchange: str | None = None) -> str:
-        data = self._market.get_price(stock_code)
-        if data:
-            return json.dumps(data, ensure_ascii=False)
+    def _get_market_session(self, market: str = "both") -> str:
+        result: dict[str, Any] = {"timestamp": datetime.now(_KST).isoformat()}
+        if market in ("domestic", "both"):
+            result["domestic"] = self._domestic_market_session()
+        if market in ("overseas", "both"):
+            result["overseas"] = self._overseas_market_session()
+        return json.dumps(result, ensure_ascii=False, default=str)
 
-        market = market or ("domestic" if self._is_domestic_code(stock_code) else "overseas")
+    def _get_price(self, stock_code: str, market: str | None = None, exchange: str | None = None, detail: bool = False) -> str:
+        data = self._market.get_price(stock_code)
+        inferred = market or ("domestic" if self._is_domestic_code(stock_code) else "overseas")
+        if data and not (detail and inferred == "domestic"):
+            session = self._domestic_market_session() if inferred == "domestic" else self._overseas_market_session()
+            return json.dumps({
+                "stock_code": stock_code,
+                "market": inferred,
+                "source": data.get("price_source", "websocket"),
+                "session": session,
+                "data": data,
+            }, ensure_ascii=False, default=str)
+
+        market = inferred
         try:
             if market == "domestic" and self._domestic:
-                data = self._domestic.get_price(stock_code)
-                return json.dumps({"stock_code": stock_code, "market": "domestic", "source": "rest", "data": data}, ensure_ascii=False, default=str)
+                return self._get_domestic_price(stock_code, detail=detail)
             if market == "overseas" and self._overseas:
                 exch, data = self._fetch_overseas_data(stock_code, exchange, "price")
                 if data:
-                    return json.dumps({"stock_code": stock_code, "market": "overseas", "exchange": str(exch), "source": "rest", "data": data}, ensure_ascii=False, default=str)
+                    return json.dumps({
+                        "stock_code": stock_code,
+                        "market": "overseas",
+                        "exchange": str(exch),
+                        "source": "rest",
+                        "session": self._overseas_market_session(),
+                        "data": data,
+                    }, ensure_ascii=False, default=str)
         except Exception as e:
             return json.dumps({"error": f"{stock_code} 가격 조회 실패: {e}"}, ensure_ascii=False)
         return json.dumps({"error": f"{stock_code} 가격 데이터 없음"}, ensure_ascii=False)
+
+    def _get_domestic_price(self, stock_code: str, detail: bool = False) -> str:
+        from kis.constants import MarketCode
+
+        session = self._domestic_market_session()
+        quotes: dict[str, Any] = {}
+        primary = self._domestic.get_price(stock_code, MarketCode.ALL)
+        quotes["unified"] = primary
+
+        if detail:
+            for key, market_code in (("krx", MarketCode.KRX), ("nxt", MarketCode.NXT)):
+                try:
+                    quotes[key] = self._domestic.get_price(stock_code, market_code)
+                except Exception as e:
+                    quotes[key] = {"error": str(e)}
+        if detail or session["session"] in ("after_hours_single", "nxt_after", "closed"):
+            try:
+                quotes["overtime"] = self._domestic.get_overtime_price(stock_code)
+            except Exception as e:
+                quotes["overtime"] = {"error": str(e)}
+
+        return json.dumps({
+            "stock_code": stock_code,
+            "market": "domestic",
+            "source": "unified_rest",
+            "session": session,
+            "data": primary,
+            "quotes": quotes,
+        }, ensure_ascii=False, default=str)
 
     def _get_orderbook(self, stock_code: str) -> str:
         data = self._market.get_orderbook(stock_code)
@@ -485,9 +568,63 @@ class ToolExecutor:
         return json.dumps(data, ensure_ascii=False)
 
     def _get_portfolio(self, market: str) -> str:
-        positions = self._account.get_positions()
+        positions = []
         domestic_balance = self._account.get_balance("domestic")
         overseas_balance = self._account.get_balance("overseas")
+        errors: dict[str, str] = {}
+
+        if market in ("domestic", "both") and self._domestic:
+            try:
+                balance = self._domestic.get_balance()
+                summary = balance.get("summary") or {}
+                domestic_balance = {
+                    "cash": _to_float(summary.get("dnca_tot_amt")),
+                    "totalAssets": _to_float(summary.get("tot_evlu_amt") or summary.get("nass_amt")),
+                    "positionValue": _to_float(summary.get("evlu_amt_smtl_amt")),
+                    "positionCount": len(balance.get("positions") or []),
+                    "raw": summary,
+                }
+                for p in balance.get("positions") or []:
+                    qty = _to_int(p.get("hldg_qty"))
+                    if qty <= 0:
+                        continue
+                    balance_price = _to_float(p.get("prpr"))
+                    market_price = balance_price
+                    price_source = "balance"
+                    try:
+                        quote = self._domestic.get_price(p.get("pdno"))
+                        quoted_price = _to_float(quote.get("stck_prpr"))
+                        if quoted_price > 0:
+                            market_price = quoted_price
+                            price_source = "unified_rest"
+                    except Exception as e:
+                        errors[f"price:{p.get('pdno')}"] = str(e)
+                    avg_price = _to_float(p.get("pchs_avg_pric"))
+                    eval_amount = market_price * qty
+                    pnl = (market_price - avg_price) * qty
+                    cost = avg_price * qty
+                    positions.append({
+                        "market": "domestic",
+                        "stock_code": p.get("pdno"),
+                        "stock_name": p.get("prdt_name"),
+                        "quantity": qty,
+                        "avg_price": avg_price,
+                        "current_price": market_price,
+                        "balance_price": balance_price,
+                        "price_source": price_source,
+                        "eval_amount": eval_amount,
+                        "pnl": pnl,
+                        "pnl_pct": round(pnl / cost * 100, 4) if cost > 0 else 0,
+                        "balance_eval_amount": _to_float(p.get("evlu_amt")),
+                        "balance_pnl": _to_float(p.get("evlu_pfls_amt")),
+                        "balance_pnl_pct": _to_float(p.get("evlu_pfls_rt")),
+                    })
+            except Exception as e:
+                errors["domestic"] = str(e)
+                positions.extend(self._account.get_positions())
+        else:
+            positions.extend(self._account.get_positions())
+
         result = {
             "positions": positions,
             "balance": {
@@ -495,6 +632,8 @@ class ToolExecutor:
                 "overseas": overseas_balance,
             },
         }
+        if errors:
+            result["errors"] = errors
         return json.dumps(result, ensure_ascii=False, default=str)
 
     def _get_rankings(self, rank_type: str, market: str) -> str:
@@ -1072,10 +1211,18 @@ class ToolExecutor:
                     "acml_volume": parsed.get("acml_vol", 0),
                     "time": parsed.get("time", ""),
                     "exchange": exchange,
+                    "price_source": "websocket",
                     "stock_name": stock_name,
                 })
 
-        tr_id = WebSocketTRID.DOMESTIC_PRICE if market == "domestic" else WebSocketTRID.OVERSEAS_PRICE
+        if market == "domestic":
+            tr_id = (
+                WebSocketTRID.DOMESTIC_PRICE_UNIFIED
+                if str(self._config.get("kis", {}).get("domestic_market", "UN")).upper() == "UN"
+                else WebSocketTRID.DOMESTIC_PRICE
+            )
+        else:
+            tr_id = WebSocketTRID.OVERSEAS_PRICE
         tr_key = stock_code if market == "domestic" else f"D{exchange}{stock_code}"
         try:
             return await self._ws.add_live_subscription(tr_id, tr_key, _on_price)
@@ -1132,14 +1279,118 @@ class ToolExecutor:
             return {}
 
     @staticmethod
+    def _between(now: dtime, start: dtime, end: dtime) -> bool:
+        if start <= end:
+            return start <= now < end
+        return now >= start or now < end
+
+    @staticmethod
+    def _us_summer_time() -> bool:
+        return bool(datetime.now(_NY).dst())
+
+    def _domestic_market_session(self) -> dict[str, Any]:
+        now = datetime.now(_KST)
+        t = now.time()
+        weekday = now.weekday()
+        is_weekday = weekday < 5
+
+        session = "closed"
+        tradable = False
+        order_market = None
+        price_api = "closed_reference"
+        websocket_tr = None
+
+        if is_weekday and self._between(t, dtime(8, 0), dtime(8, 50)):
+            session, tradable, order_market, price_api, websocket_tr = (
+                "nxt_pre", True, "NXT/SOR", "unified_rest", "H0UNCNT0"
+            )
+        elif is_weekday and self._between(t, dtime(8, 50), dtime(9, 0)):
+            session, tradable, order_market, price_api, websocket_tr = (
+                "opening_auction", True, "KRX/SOR", "unified_rest", "H0UNCNT0"
+            )
+        elif is_weekday and self._between(t, dtime(9, 0), dtime(15, 20)):
+            session, tradable, order_market, price_api, websocket_tr = (
+                "regular_unified", True, "KRX+NXT/SOR", "unified_rest", "H0UNCNT0"
+            )
+        elif is_weekday and self._between(t, dtime(15, 20), dtime(15, 30)):
+            session, tradable, order_market, price_api, websocket_tr = (
+                "krx_closing_auction", True, "KRX/SOR", "unified_rest", "H0UNCNT0"
+            )
+        elif is_weekday and self._between(t, dtime(15, 30), dtime(16, 0)):
+            session, tradable, order_market, price_api, websocket_tr = (
+                "nxt_after", True, "NXT/SOR", "unified_rest", "H0UNCNT0"
+            )
+        elif is_weekday and self._between(t, dtime(16, 0), dtime(18, 0)):
+            session, tradable, order_market, price_api, websocket_tr = (
+                "after_hours_single", True, "NXT or KRX overtime", "unified_rest+overtime_price", "H0UNCNT0"
+            )
+        elif is_weekday and self._between(t, dtime(18, 0), dtime(20, 0)):
+            session, tradable, order_market, price_api, websocket_tr = (
+                "nxt_after", True, "NXT/SOR", "unified_rest", "H0UNCNT0"
+            )
+
+        return {
+            "market": "domestic",
+            "timezone": "Asia/Seoul",
+            "now": now.isoformat(),
+            "session": session,
+            "tradable": tradable,
+            "order_market": order_market,
+            "price_api": price_api,
+            "websocket_tr": websocket_tr,
+            "notes": "UN=통합(KRX+NXT). 시간외 단일가 구간은 overtime_price도 함께 확인.",
+        }
+
+    def _overseas_market_session(self) -> dict[str, Any]:
+        now = datetime.now(_KST)
+        t = now.time()
+        wd = now.weekday()
+        summer = self._us_summer_time()
+        daytime_end = dtime(17, 0) if summer else dtime(18, 0)
+        pre_start = daytime_end
+        regular_start = dtime(22, 30) if summer else dtime(23, 30)
+        regular_end = dtime(5, 0) if summer else dtime(6, 0)
+        after_start = regular_end
+
+        session = "closed"
+        tradable = False
+        order_api = None
+        price_api = "overseas_price_reference"
+        realtime = False
+
+        if wd < 5 and self._between(t, dtime(10, 0), daytime_end):
+            session, tradable, order_api, realtime = "daytime", True, "daytime-order", False
+        elif wd < 5 and self._between(t, pre_start, regular_start):
+            session, tradable, order_api, realtime = "pre_market", True, "order", True
+        elif (wd < 5 and t >= regular_start) or (1 <= wd <= 5 and t < regular_end):
+            session, tradable, order_api, realtime = "regular", True, "order", True
+        elif 1 <= wd <= 5 and self._between(t, after_start, dtime(7, 0)):
+            session, tradable, order_api, realtime = "after_market", True, "order", True
+        elif 1 <= wd <= 5 and self._between(t, dtime(7, 0), dtime(9, 0)):
+            session, tradable, order_api, realtime = "after_market_extended", True, "order", True
+
+        return {
+            "market": "overseas",
+            "timezone": "Asia/Seoul",
+            "now": now.isoformat(),
+            "us_summer_time": summer,
+            "session": session,
+            "tradable": tradable,
+            "order_api": order_api,
+            "price_api": price_api,
+            "websocket_realtime_expected": realtime,
+            "hours_kst": {
+                "daytime": f"10:00-{daytime_end.strftime('%H:%M')}",
+                "pre_market": f"{pre_start.strftime('%H:%M')}-{regular_start.strftime('%H:%M')}",
+                "regular": f"{regular_start.strftime('%H:%M')}-{regular_end.strftime('%H:%M')}",
+                "after_market": f"{after_start.strftime('%H:%M')}-07:00",
+                "after_market_extended": "07:00-09:00",
+            },
+        }
+
+    @staticmethod
     def _is_domestic_code(stock_code: str) -> bool:
         return len(stock_code) == 6 and stock_code.isdigit()
 
-    @staticmethod
-    def _is_domestic_market_open() -> bool:
-        now = datetime.now()
-        if now.weekday() >= 5:
-            return False
-        start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-        return start <= now <= end
+    def _is_domestic_market_open(self) -> bool:
+        return bool(self._domestic_market_session().get("tradable"))
