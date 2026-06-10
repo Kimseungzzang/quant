@@ -61,7 +61,7 @@ class AIAgent:
         self._executor.allow_orders = True
         final_text = await self._run_loop(source="event", past_history=past, current_message=user_msg)
         missing = [
-            name for name in ("get_price", "get_candles", "save_memo")
+            name for name in ("get_price", "save_memo")
             if name not in set(self._executor.executed_tools)
         ]
         if missing:
@@ -76,7 +76,8 @@ Previous response:
 {(final_text or "")[:2000]}
 
 Now call the missing tools as real tool calls before making a decision.
-For this event, you must use get_price and get_candles for the triggered symbol, then save_memo.
+For this event, you must use get_price for the triggered symbol, then save_memo.
+Use get_candles only if the trigger payload is insufficient for the decision.
 Only call place_order if the fresh tool data justifies BUY or SELL. Otherwise HOLD or adjust the watch.
 Respond in Korean only.
 """.strip()
