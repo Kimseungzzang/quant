@@ -82,7 +82,15 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
         from kis.constants import ExchangeCode
         is_domestic = stock_code.isdigit()
         if is_domestic and domestic:
-            df = domestic.get_daily_ohlcv(stock_code, count)
+            if candle_type == "minute":
+                from datetime import datetime as _dt
+                df = domestic.get_minute_ohlcv(stock_code, input_hour=_dt.now().strftime("%H%M%S"))
+                if not df.empty:
+                    df = domestic._aggregate(df, 5)
+            else:
+                end = date.today()
+                start = end - timedelta(days=max(count * 2, 60))
+                df = domestic.get_daily_ohlcv(stock_code, start, end)
         elif overseas:
             exch = ExchangeCode.NASDAQ
             if candle_type == "minute":
@@ -96,7 +104,7 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
         df = df.tail(count)
         candles = [
             {
-                "datetime": str(row.get("datetime", idx))[:10],
+                "datetime": str(row.get("datetime", idx)),
                 "open": float(row.get("open", 0)),
                 "high": float(row.get("high", 0)),
                 "low": float(row.get("low", 0)),

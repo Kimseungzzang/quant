@@ -65,6 +65,25 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "screen_candidates",
+        "description": (
+            "거래량 상위 종목에 대해 일봉 데이터를 조회하고 기술 지표(RSI, MA20, MA60, MACD)를 계산해 "
+            "전략에 맞는 후보를 필터링합니다. "
+            "종목 선정 시 get_rankings 대신 이 툴을 사용하세요. "
+            "strategy: 'intraday'=단타(필터 없음), 'swing'=스윙(MA20>MA60 + RSI 30~65), "
+            "'longterm'=장기(MA20>MA60 + RSI>50), 'all'=필터 없이 전체 지표만 반환."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "market":   {"type": "string", "enum": ["domestic", "overseas"], "default": "domestic"},
+                "strategy": {"type": "string", "enum": ["intraday", "swing", "longterm", "all"], "default": "all"},
+                "top_n":    {"type": "integer", "description": "스크리닝할 거래량 상위 종목 수 (기본 20)", "default": 20},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "get_candles",
         "description": "특정 종목의 최근 분봉 또는 일봉 차트 데이터를 조회합니다. 추세 파악에 사용하세요.",
         "input_schema": {
@@ -82,9 +101,12 @@ TOOL_DEFINITIONS = [
     {
         "name": "get_indicators",
         "description": (
-            "종목의 현재 기술 지표를 조회합니다. "
-            "RSI, MACD, 이동평균(MA5/10/20/60), 볼린저밴드(%B), 스토캐스틱(K/D)을 반환합니다. "
-            "지표 확인, 과매도/과매수 판단, 감시 조건 수립 전에 사용하세요."
+            "종목의 기술 지표를 5분봉(단기)과 일봉(중장기) 두 타임프레임으로 조회합니다. "
+            "5분봉 지표(rsi, macd, ma5~60, bb_pct, stoch_k/d): 단타 진입 타이밍 판단에 사용. "
+            "일봉 지표(rsi_daily, macd_daily, ma20_daily, ma60_daily, bb_pct_daily 등): 추세 방향·스윙·장기 판단에 사용. "
+            "두 타임프레임을 함께 읽어 전략을 결정하세요: "
+            "단타 = 5분봉 신호 중심 / 스윙 = 일봉 추세 + 5분봉 타이밍 / 장기 = 일봉 MA60·추세 위주. "
+            "감시 조건 수립 전, 과매도/과매수 판단 시 반드시 호출하세요."
         ),
         "input_schema": {
             "type": "object",
@@ -361,6 +383,13 @@ class ToolExecutor:
                         tool_input.get("rank_type", "volume"),
                         tool_input.get("market", "domestic"),
                     )
+                case "screen_candidates":
+                    return await _asyncio.to_thread(
+                        self._screen_candidates,
+                        tool_input.get("market", "domestic"),
+                        tool_input.get("strategy", "all"),
+                        tool_input.get("top_n", 20),
+                    )
                 case "get_candles":
                     stock_code = tool_input["stock_code"]
                     market = tool_input.get("market") or ("domestic" if self._is_domestic_code(stock_code) else "overseas")
@@ -383,14 +412,14 @@ class ToolExecutor:
                     if not self.allow_orders:
                         return json.dumps({"error": "주문 실행 차단: 명시적 주문 실행 요청이 없어서 계획/감시만 설정합니다."}, ensure_ascii=False)
                     missing_precheck = [
-                        name for name in ("get_portfolio", "get_price", "get_candles")
+                        name for name in ("get_portfolio", "get_price")
                         if name not in set(self.executed_tools)
                     ]
                     if missing_precheck:
                         return json.dumps({
                             "error": "주문 실행 차단: 주문 전 필수 확인 도구가 누락되었습니다.",
                             "missing_precheck": missing_precheck,
-                            "instruction": "같은 판단 루프에서 get_portfolio, get_price, get_candles를 먼저 호출한 뒤 주문하세요.",
+                            "instruction": "같은 판단 루프에서 get_portfolio, get_price를 먼저 호출한 뒤 주문하세요.",
                         }, ensure_ascii=False)
                     return await self._place_order(tool_input)
                 case "cancel_order":
@@ -484,6 +513,81 @@ class ToolExecutor:
         ]
         return json.dumps({"rank_type": rank_type, "market": market, "items": slim}, ensure_ascii=False)
 
+    def _screen_candidates(self, market: str, strategy: str, top_n: int) -> str:
+        from datetime import date, timedelta
+        from events.detector import _compute_indicators
+
+        try:
+            if market == "overseas":
+                from kis.constants import ExchangeCode
+                raw = self._overseas.get_volume_ranking(ExchangeCode.NASDAQ) if self._overseas else []
+            else:
+                raw = self._domestic.get_volume_ranking() if self._domestic else []
+        except Exception as e:
+            return json.dumps({"error": f"순위 조회 실패: {e}"})
+
+        end = date.today()
+        start = end - timedelta(days=180)
+        results = []
+
+        for item in raw[:top_n]:
+            code = item.get("mksc_shrn_iscd", "")
+            name = item.get("hts_kor_isnm", code)
+            if not code:
+                continue
+            try:
+                if market == "domestic" and self._domestic:
+                    df = self._domestic.get_daily_ohlcv(code, start, end)
+                elif market == "overseas" and self._overseas:
+                    from kis.constants import ExchangeCode as _EC
+                    df = self._overseas.get_daily_ohlcv(code, _EC.NASDAQ, start, end)
+                else:
+                    continue
+                if df is None or df.empty or len(df) < 20:
+                    continue
+
+                ind = _compute_indicators(
+                    df["close"].tolist(),
+                    df["volume"].tolist() if "volume" in df.columns else [],
+                    highs=df["high"].tolist() if "high" in df.columns else None,
+                    lows=df["low"].tolist() if "low" in df.columns else None,
+                )
+                rsi = ind.get("rsi")
+                ma20 = ind.get("ma20")
+                ma60 = ind.get("ma60")
+                macd = ind.get("macd")
+                bb_pct = ind.get("bb_pct")
+                uptrend = (ma20 or 0) > (ma60 or 0)
+
+                # 전략 필터
+                if strategy == "swing" and not (uptrend and rsi is not None and 30 <= rsi <= 65):
+                    continue
+                if strategy == "longterm" and not (uptrend and rsi is not None and rsi > 50):
+                    continue
+
+                results.append({
+                    "code": code,
+                    "name": name,
+                    "price": item.get("stck_prpr", ""),
+                    "change_rate": item.get("prdy_ctrt", ""),
+                    "rsi_daily": round(rsi, 1) if rsi is not None else None,
+                    "ma20_daily": round(ma20, 0) if ma20 is not None else None,
+                    "ma60_daily": round(ma60, 0) if ma60 is not None else None,
+                    "macd_daily": round(macd, 2) if macd is not None else None,
+                    "bb_pct_daily": round(bb_pct, 3) if bb_pct is not None else None,
+                    "trend": "상승" if uptrend else "하락",
+                })
+            except Exception:
+                logger.warning("스크리닝 실패: %s", code)
+                continue
+
+        return json.dumps({
+            "strategy": strategy,
+            "screened": len(raw[:top_n]),
+            "filtered": len(results),
+            "candidates": results,
+        }, ensure_ascii=False)
+
     async def _get_candles(self, stock_code: str, market: str, exchange: str | None, candle_type: str, count: int) -> str:
         import asyncio
         loop = asyncio.get_event_loop()
@@ -515,9 +619,11 @@ class ToolExecutor:
                         ), timeout=12)
                         candle_type = "daily_fallback"
                 else:
+                    from datetime import datetime as _dt
+                    input_hour = _dt.now().strftime("%H%M%S")
                     df = await asyncio.wait_for(loop.run_in_executor(
-                        None, lambda: self._domestic.get_historical_minute_ohlcv(stock_code, lookback_days=3, candle_minutes=1)
-                    ), timeout=12)
+                        None, lambda h=input_hour: self._domestic.get_minute_ohlcv(stock_code, input_hour=h)
+                    ), timeout=10)
             if df is None or df.empty:
                 return json.dumps({"error": f"{stock_code} 차트 데이터 없음"})
             tail = df.tail(count)
@@ -541,53 +647,78 @@ class ToolExecutor:
         except Exception:
             return json.dumps({"error": "지표 파싱 실패"})
 
-        labels = {
-            "rsi": "RSI(14)",
-            "macd": "MACD",
-            "ma5": "MA5", "ma10": "MA10", "ma20": "MA20", "ma60": "MA60",
-            "bb_upper": "볼린저 상단", "bb_lower": "볼린저 하단",
-            "bb_pct": "볼린저 %B (0=하단,1=상단)",
-            "stoch_k": "스토캐스틱 %K", "stoch_d": "스토캐스틱 %D",
-            "avg_volume": "20일 평균 거래량",
+        intraday_keys = {"rsi", "macd", "ma5", "ma10", "ma20", "ma60",
+                         "bb_upper", "bb_lower", "bb_pct", "stoch_k", "stoch_d", "avg_volume"}
+        labels_5min = {
+            "rsi": "RSI(14) [5분봉]", "macd": "MACD [5분봉]",
+            "ma5": "MA5 [5분봉]", "ma10": "MA10 [5분봉]",
+            "ma20": "MA20 [5분봉]", "ma60": "MA60 [5분봉]",
+            "bb_upper": "볼린저 상단 [5분봉]", "bb_lower": "볼린저 하단 [5분봉]",
+            "bb_pct": "볼린저 %B [5분봉]", "stoch_k": "스토캐스틱 %K [5분봉]",
+            "stoch_d": "스토캐스틱 %D [5분봉]", "avg_volume": "평균거래량 [5분봉]",
         }
+        labels_daily = {
+            "rsi_daily": "RSI(14) [일봉]", "macd_daily": "MACD [일봉]",
+            "ma5_daily": "MA5 [일봉]", "ma10_daily": "MA10 [일봉]",
+            "ma20_daily": "MA20 [일봉]", "ma60_daily": "MA60 [일봉]",
+            "bb_upper_daily": "볼린저 상단 [일봉]", "bb_lower_daily": "볼린저 하단 [일봉]",
+            "bb_pct_daily": "볼린저 %B [일봉]", "stoch_k_daily": "스토캐스틱 %K [일봉]",
+            "stoch_d_daily": "스토캐스틱 %D [일봉]",
+        }
+
+        intraday = {k: v for k, v in indicators.items() if k in intraday_keys}
+        daily = {k: v for k, v in indicators.items() if k.endswith("_daily")}
+
+        def _fmt(d: dict, lbls: dict) -> dict:
+            return {lbls.get(k, k): round(v, 4) if isinstance(v, float) else v for k, v in d.items()}
+
+        signals = []
         rsi = indicators.get("rsi")
         bb_pct = indicators.get("bb_pct")
         stoch_k = indicators.get("stoch_k")
-        signals = []
+        rsi_d = indicators.get("rsi_daily")
+        ma20_d = indicators.get("ma20_daily")
+        ma60_d = indicators.get("ma60_daily")
+
         if rsi is not None:
-            if rsi < 30:
-                signals.append(f"RSI {rsi} → 과매도")
-            elif rsi > 70:
-                signals.append(f"RSI {rsi} → 과매수")
+            if rsi < 30:   signals.append(f"5분봉 RSI {rsi} → 단기 과매도")
+            elif rsi > 70: signals.append(f"5분봉 RSI {rsi} → 단기 과매수")
         if bb_pct is not None:
-            if bb_pct < 0.1:
-                signals.append(f"볼린저 %B {bb_pct} → 하단 이탈(과매도)")
-            elif bb_pct > 0.9:
-                signals.append(f"볼린저 %B {bb_pct} → 상단 돌파(과매수)")
+            if bb_pct < 0.1:  signals.append(f"5분봉 볼린저 %B {bb_pct} → 하단 이탈")
+            elif bb_pct > 0.9: signals.append(f"5분봉 볼린저 %B {bb_pct} → 상단 돌파")
         if stoch_k is not None:
-            if stoch_k < 20:
-                signals.append(f"스토캐스틱 K {stoch_k} → 과매도")
-            elif stoch_k > 80:
-                signals.append(f"스토캐스틱 K {stoch_k} → 과매수")
+            if stoch_k < 20:  signals.append(f"5분봉 스토캐스틱 K {stoch_k} → 단기 과매도")
+            elif stoch_k > 80: signals.append(f"5분봉 스토캐스틱 K {stoch_k} → 단기 과매수")
+        if rsi_d is not None:
+            if rsi_d < 30:   signals.append(f"일봉 RSI {rsi_d} → 중기 과매도 (스윙 진입 고려)")
+            elif rsi_d > 70: signals.append(f"일봉 RSI {rsi_d} → 중기 과매수 (스윙 청산 고려)")
+        if ma20_d is not None and ma60_d is not None:
+            if ma20_d > ma60_d: signals.append("일봉 MA20 > MA60 → 중기 상승 추세")
+            else:               signals.append("일봉 MA20 < MA60 → 중기 하락 추세")
+
+        strategy_hint = []
+        if rsi is not None and rsi_d is not None:
+            if rsi < 35 and rsi_d < 40:
+                strategy_hint.append("단타+스윙 동시 과매도 — 반등 시 단타/스윙 진입 고려")
+            elif rsi_d > 50 and ma20_d and ma60_d and ma20_d > ma60_d:
+                strategy_hint.append("일봉 추세 양호 — 스윙 or 장기 보유 전략 적합")
+            else:
+                strategy_hint.append("5분봉 단기 신호 위주로 판단 — 단타 전략 적합")
 
         return json.dumps({
             "stock_code": stock_code,
-            "indicators": {labels.get(k, k): round(v, 4) if isinstance(v, float) else v for k, v in indicators.items()},
+            "intraday_indicators": _fmt(intraday, labels_5min),
+            "daily_indicators": _fmt(daily, labels_daily) if daily else "일봉 지표 계산 중 (watch 등록 후 30분 이내 갱신)",
             "signals": signals or ["특이 신호 없음"],
+            "strategy_hint": strategy_hint,
         }, ensure_ascii=False)
 
     def _set_trading_mode(self, mode: str) -> str:
-        if mode not in ("paper", "live"):
-            return json.dumps({"error": "mode는 paper 또는 live 중 하나입니다."})
-        try:
-            resp = requests.post(
-                "http://localhost:8000/mode",
-                json={"mode": mode},
-                timeout=5,
-            )
-            return json.dumps(resp.json(), ensure_ascii=False)
-        except Exception as e:
-            return json.dumps({"error": f"모드 변경 실패: {e}"})
+        current = self._config.get("mode", "unknown")
+        return json.dumps({
+            "error": f"런타임 모드 변경 불가. config.yaml의 mode를 '{mode}'로 수정 후 서버를 재시작해야 합니다.",
+            "current_mode": current,
+        }, ensure_ascii=False)
 
     def _search_web(self, query: str, max_results: int) -> str:
         try:
@@ -833,13 +964,16 @@ class ToolExecutor:
             stock_code, inp["stock_name"], market, exchange,
             baseline_price, baseline_volume, inp["conditions"],
         )
+        ws_status = "WebSocket 실시간 구독 성공" if ws_subscribed else "WebSocket 구독 실패 — 실시간 가격 수신 불가, 감시 조건이 평가되지 않습니다"
         return json.dumps({
             "status": "감시 설정 완료",
             "stock_code": stock_code,
+            "market": market,
             "baseline_price": baseline_price,
             "baseline_volume": baseline_volume,
             "exchange": exchange,
             "ws_subscribed": ws_subscribed,
+            "ws_status": ws_status,
             "conditions": inp["conditions"],
         }, ensure_ascii=False)
 

@@ -1,12 +1,13 @@
 """
 기술 지표 캐시.
-- 최초 로드: 3일치 5분봉 전체
-- 이후 5분마다: 신규 캔들만 append → 지표 증분 업데이트
+- 5분봉: watch 등록 시 3일치 전체 로드, 이후 5분마다 증분 업데이트
+- 일봉:  watch 등록 시 180일치 로드, 이후 30분마다 갱신
 - EventDetector는 Redis에서 읽기만 함 (REST 직접 호출 없음)
 """
 import asyncio
 import json
 import logging
+import time
 
 import pandas as pd
 import redis
@@ -17,8 +18,10 @@ logger = logging.getLogger(__name__)
 
 _CACHE_KEY_PREFIX = "ai:indicators:"
 _WATCHES_KEY = "ai:watches"
-_REFRESH_INTERVAL_SEC = 300  # 5분
-_MAX_CANDLES = 500           # ~3일치 5분봉
+_REFRESH_INTERVAL_SEC = 300    # 5분봉 갱신 주기
+_DAILY_REFRESH_INTERVAL_SEC = 1800  # 일봉 갱신 주기 (30분)
+_MAX_CANDLES = 500             # ~3일치 5분봉
+_DAILY_LOOKBACK_DAYS = 180     # MA60 계산에 충분한 일봉 수
 
 
 class IndicatorCache:
@@ -26,7 +29,9 @@ class IndicatorCache:
         self._r = redis_client
         self._domestic = domestic
         self._overseas = overseas
-        self._candles: dict[str, pd.DataFrame] = {}  # 메모리 내 캔들 시계열
+        self._candles: dict[str, pd.DataFrame] = {}
+        self._daily_candles: dict[str, pd.DataFrame] = {}
+        self._daily_last_refresh: dict[str, float] = {}
 
     def get(self, stock_code: str) -> dict:
         raw = self._r.get(f"{_CACHE_KEY_PREFIX}{stock_code}")
@@ -63,20 +68,19 @@ class IndicatorCache:
                         json.dumps(indicators, ensure_ascii=False),
                         ex=_REFRESH_INTERVAL_SEC * 3,
                     )
-                    logger.debug("지표 갱신: %s rows=%d", stock_code, len(self._candles.get(stock_code, [])))
+                    logger.debug("지표 갱신: %s", stock_code)
             except Exception:
                 logger.warning("지표 계산 실패: %s", stock_code, exc_info=True)
 
     def _update(self, stock_code: str, market: str, exchange: str | None) -> dict:
+        # ── 5분봉 지표 ──────────────────────────────────────────────
         if stock_code not in self._candles:
-            # 최초: 3일치 전체 로드
             df = self._fetch_full(stock_code, market, exchange)
             if df is None or df.empty:
                 return {}
             self._candles[stock_code] = df.tail(_MAX_CANDLES).reset_index(drop=True)
-            logger.info("최초 로드: %s %d개 캔들", stock_code, len(self._candles[stock_code]))
+            logger.info("5분봉 최초 로드: %s %d개", stock_code, len(self._candles[stock_code]))
         else:
-            # 이후: 최신 캔들만 가져와서 신규분 append
             new_df = self._fetch_recent(stock_code, market, exchange)
             if new_df is not None and not new_df.empty:
                 existing = self._candles[stock_code]
@@ -86,15 +90,54 @@ class IndicatorCache:
                     self._candles[stock_code] = pd.concat(
                         [existing, added], ignore_index=True
                     ).tail(_MAX_CANDLES).reset_index(drop=True)
-                    logger.debug("캔들 append: %s +%d개", stock_code, len(added))
+                    logger.debug("5분봉 append: %s +%d개", stock_code, len(added))
 
-        df = self._candles[stock_code]
-        return _compute_indicators(
-            df["close"].tolist(),
-            df["volume"].tolist() if "volume" in df.columns else [],
-            highs=df["high"].tolist() if "high" in df.columns else None,
-            lows=df["low"].tolist() if "low" in df.columns else None,
+        df5 = self._candles[stock_code]
+        indicators_5min = _compute_indicators(
+            df5["close"].tolist(),
+            df5["volume"].tolist() if "volume" in df5.columns else [],
+            highs=df5["high"].tolist() if "high" in df5.columns else None,
+            lows=df5["low"].tolist() if "low" in df5.columns else None,
         )
+
+        # ── 일봉 지표 ──────────────────────────────────────────────
+        indicators_daily = self._update_daily(stock_code, market, exchange)
+
+        return {**indicators_5min, **indicators_daily}
+
+    def _update_daily(self, stock_code: str, market: str, exchange: str | None) -> dict:
+        now = time.monotonic()
+        last = self._daily_last_refresh.get(stock_code, 0)
+        stale = (now - last) >= _DAILY_REFRESH_INTERVAL_SEC
+
+        if stale or stock_code not in self._daily_candles:
+            df = self._fetch_daily(stock_code, market, exchange)
+            if df is None or df.empty:
+                return {}
+            self._daily_candles[stock_code] = df
+            self._daily_last_refresh[stock_code] = now
+            logger.info("일봉 로드: %s %d개", stock_code, len(df))
+
+        df_d = self._daily_candles[stock_code]
+        ind = _compute_indicators(
+            df_d["close"].tolist(),
+            df_d["volume"].tolist() if "volume" in df_d.columns else [],
+            highs=df_d["high"].tolist() if "high" in df_d.columns else None,
+            lows=df_d["low"].tolist() if "low" in df_d.columns else None,
+        )
+        return {f"{k}_daily": v for k, v in ind.items()}
+
+    def _fetch_daily(self, stock_code: str, market: str, exchange: str | None) -> pd.DataFrame | None:
+        from datetime import date, timedelta
+        end = date.today()
+        start = end - timedelta(days=_DAILY_LOOKBACK_DAYS)
+        if market == "domestic" and self._domestic:
+            return self._domestic.get_daily_ohlcv(stock_code, start, end)
+        if market == "overseas" and self._overseas:
+            return self._overseas.get_daily_ohlcv(
+                stock_code, self._exch(exchange), start_date=start, end_date=end
+            )
+        return None
 
     def _fetch_full(self, stock_code: str, market: str, exchange: str | None) -> pd.DataFrame | None:
         if market == "domestic" and self._domestic:
@@ -108,7 +151,6 @@ class IndicatorCache:
         return None
 
     def _fetch_recent(self, stock_code: str, market: str, exchange: str | None) -> pd.DataFrame | None:
-        """최근 캔들만 가져옴 (lookback_days=1)."""
         if market == "domestic" and self._domestic:
             return self._domestic.get_historical_minute_ohlcv(
                 stock_code, lookback_days=1, candle_minutes=5

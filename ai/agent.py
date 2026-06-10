@@ -174,6 +174,8 @@ Respond in Korean only.
         normalized = user_input.lower()
         execution_keywords = (
             "주문해", "매수해", "매도해", "실행해",
+            "사줘", "사봐", "사라", "사달라", "팔아줘", "팔아봐", "팔아라",
+            "매수", "매도", "주문",
             "buy now", "sell now", "place real orders", "real orders automatically",
         )
         return any(keyword in normalized for keyword in execution_keywords)

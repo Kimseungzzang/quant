@@ -116,27 +116,35 @@ body {
 #ai-state.speaking { color: var(--success); text-shadow: 0 0 8px var(--success); }
 
 /* ── 동적 패널 ── */
-#dynamic-panel {
+#panels-container {
   position: absolute;
   top: 50px;
   right: 20px;
   width: 360px;
   max-height: calc(100% - 70px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  pointer-events: none;
+}
+
+.dynamic-panel {
   background: var(--panel-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   backdrop-filter: blur(12px);
   overflow: hidden;
-  transition: opacity 0.3s, transform 0.3s;
+  pointer-events: all;
+  animation: panel-in 0.2s ease;
 }
 
-#dynamic-panel.hidden {
-  opacity: 0;
-  pointer-events: none;
-  transform: translateX(20px);
+@keyframes panel-in {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
 }
 
-#panel-header {
+.panel-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -147,7 +155,7 @@ body {
   color: var(--accent);
 }
 
-#panel-close {
+.panel-close {
   background: none;
   border: none;
   color: var(--text-dim);
@@ -155,12 +163,12 @@ body {
   font-size: 12px;
   padding: 2px 4px;
 }
-#panel-close:hover { color: var(--text); }
+.panel-close:hover { color: var(--text); }
 
-#panel-content {
+.panel-content {
   padding: 14px;
   overflow-y: auto;
-  max-height: 400px;
+  max-height: 340px;
   font-size: 12px;
 }
 

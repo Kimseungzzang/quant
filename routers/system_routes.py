@@ -43,9 +43,10 @@ async def system_status():
     ws_info = state.components.get("ws")
     ws_status: dict = {}
     if ws_info:
+        raw = ws_info.status() if hasattr(ws_info, "status") else {}
         subs = getattr(ws_info, "_subscriptions", [])
         ws_status = {
-            "connected": getattr(ws_info, "connected", False),
+            "connected": raw.get("connected", False),
             "subscriptions": list(subs) if isinstance(subs, list) else list(subs.keys()),
             "last_message_at": str(getattr(ws_info, "_last_message_at", None)),
         }

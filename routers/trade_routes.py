@@ -85,14 +85,14 @@ class ModeRequest(BaseModel):
 
 @router.post("/mode")
 def set_mode(req: ModeRequest):
-    if req.mode not in {"paper", "live"}:
-        raise HTTPException(status_code=400, detail="mode는 paper/live 중 하나")
-    cfg = state.components.get("config") or {}
-    cfg["mode"] = req.mode
-    order_mgr = state.components.get("order_mgr")
-    if order_mgr:
-        order_mgr.mode = req.mode
-    return {"status": "ok", "mode": req.mode}
+    # 런타임 모드 변경은 KISAuth.base_url, DomesticAPI.is_paper 등이 재초기화되지 않아
+    # DB 기록과 실제 API 호출 대상이 불일치하는 critical한 오작동을 유발한다.
+    # 모드 변경은 config.yaml 수정 후 서버 재시작으로만 가능하다.
+    current = (state.components.get("config") or {}).get("mode", "unknown")
+    raise HTTPException(
+        status_code=400,
+        detail=f"런타임 모드 변경 불가. config.yaml의 mode를 '{req.mode}'로 수정 후 서버를 재시작하세요. (현재: {current})",
+    )
 
 
 @router.get("/trade/positions")
@@ -101,11 +101,33 @@ async def get_positions():
 
 
 @router.get("/trade/positions/live")
-async def get_live_positions(mode: str | None = None):
-    order_mgr = state.components.get("order_mgr")
-    if order_mgr is None:
+def get_live_positions(mode: str | None = None):
+    domestic = state.components.get("domestic")
+    overseas = state.components.get("overseas")
+    if not domestic and not overseas:
         raise HTTPException(status_code=503, detail="초기화 중")
-    return order_mgr.get_live_positions()
+    positions = []
+    try:
+        if domestic:
+            bal = domestic.get_balance()
+            for p in bal.get("positions") or []:
+                qty = int(p.get("hldg_qty") or 0)
+                if qty <= 0:
+                    continue
+                positions.append({
+                    "market": "domestic",
+                    "stock_code": p.get("pdno"),
+                    "stock_name": p.get("prdt_name"),
+                    "quantity": qty,
+                    "avg_price": float(p.get("pchs_avg_pric") or 0),
+                    "current_price": float(p.get("prpr") or 0),
+                    "eval_amount": float(p.get("evlu_amt") or 0),
+                    "pnl": float(p.get("evlu_pfls_amt") or 0),
+                    "pnl_pct": float(p.get("evlu_pfls_rt") or 0),
+                })
+    except Exception as e:
+        logger.warning("국내 포지션 조회 실패: %s", e)
+    return positions
 
 
 @router.get("/trade/orders/pending")

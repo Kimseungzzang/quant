@@ -1,5 +1,5 @@
 import { JarvisSphere } from './sphere.js';
-import { detectAndShowPanel, hidePanel, showChartPanelDirect, showWatchPanelDirect, showIndicatorPanelDirect } from './panels.js';
+import { detectAndShowPanel, hidePanel, showChartPanelDirect, showWatchPanelDirect, showIndicatorPanelDirect, onPriceTick } from './panels.js';
 
 const BASE = window.api?.baseUrl || 'http://127.0.0.1:8000';
 
@@ -113,7 +113,7 @@ async function handleSlashCommand(text) {
       return true;
     case '/min':
       await showChartPanelDirect(code, 'minute');
-      addMessage('ai', `${code} 분봉 차트를 표시합니다.`);
+      addMessage('ai', `${code} 5분봉 차트를 표시합니다.`);
       return true;
     case '/watch':
       await showWatchPanelDirect();
@@ -284,3 +284,39 @@ setTimeout(() => {
   addMessage('ai', 'JARVIS 온라인. 안녕하세요. 트레이딩을 시작하겠습니다.');
   setTimeout(() => setSphereState('idle'), 2500);
 }, 500);
+
+// ── 실시간 가격 스트림 (WebSocket)
+function connectPriceStream() {
+  const wsUrl = BASE.replace(/^http/, 'ws') + '/ws/stream';
+  const ws = new WebSocket(wsUrl);
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'price' && msg.code) {
+        onPriceTick(msg.code, msg.price, msg.ts);
+      }
+    } catch {}
+  };
+  ws.onclose = () => setTimeout(connectPriceStream, 3000);
+}
+connectPriceStream();
+
+// ── 서버 알림 polling (이벤트/체결 알림)
+let _lastNotifTs = Date.now() / 1000;
+async function pollNotifications() {
+  try {
+    const res = await fetch(`${BASE}/ai/notifications?since=${_lastNotifTs}`);
+    const items = await res.json();
+    for (const item of items) {
+      if (item._ts) _lastNotifTs = Math.max(_lastNotifTs, item._ts);
+      if (item.type === 'ai_message') {
+        setSphereState('speaking');
+        addMessage('ai', `[${item.source}] ${item.message}`);
+        setTimeout(() => setSphereState('idle'), 3000);
+      } else if (item.type === 'fill_notice') {
+        addMessage('ai', `🔔 ${item.message}`);
+      }
+    }
+  } catch { /* 서버 미응답 시 무시 */ }
+}
+setInterval(pollNotifications, 3000);

@@ -70,6 +70,7 @@ class OrderManager:
         self._last_prices: dict[str, float] = {}
         self._pending_orders: dict[str, PendingOrder] = {}
         self._lock = threading.Lock()  # positions/pending_orders 동시 접근 보호
+        self.on_fill_callback = None  # Callable[[dict], None] — 체결 시 호출
 
     _FILL_TIMEOUT_SEC = 30  # 이 시간 내 WebSocket 체결통보 없으면 접수가로 확정
 
@@ -442,11 +443,26 @@ class OrderManager:
 
             pending.filled_qty += fill_qty
             pending.filled_amount += fill_qty * fill_price
-            if pending.remaining_qty() <= 0:
+            fully_filled = pending.remaining_qty() <= 0
+            if fully_filled:
                 self._pending_orders.pop(order_no, None)
             else:
                 logger.info("부분 체결: %s %s %d/%d주", pending.side, pending.stock_code,
                             pending.filled_qty, pending.qty)
+
+        if self.on_fill_callback:
+            try:
+                self.on_fill_callback({
+                    "order_no": order_no,
+                    "stock_code": pending.stock_code,
+                    "stock_name": pending.name,
+                    "side": pending.side,
+                    "filled_qty": fill_qty,
+                    "fill_price": fill_price,
+                    "fully_filled": fully_filled,
+                })
+            except Exception:
+                pass
         return True
 
     def reconcile_order_rows(self, rows: list[dict]) -> int:

@@ -154,9 +154,10 @@ class KISWebSocket:
 
         hts_id = kis_cfg.get("hts_id", "")
         account_no = self.auth.get_account_no()
-        if fill_cb and hts_id and subscribe_fills:
+        # Paper WS 서버(31000)는 체결통보 TR을 지원하지 않으므로 live 전용 구독
+        if fill_cb and hts_id and subscribe_fills and not self.auth.is_paper:
             self.subscribe_global(domestic_fill_trid, hts_id, fill_cb)
-        if ovs_fill_cb and account_no and subscribe_fills:
+        if ovs_fill_cb and account_no and subscribe_fills and not self.auth.is_paper:
             self.subscribe_global(overseas_fill_trid, account_no, ovs_fill_cb)
 
         await self.run()

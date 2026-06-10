@@ -14,7 +14,8 @@ KIS_REST_URL_MOCK  = os.getenv("KIS_REST_URL_MOCK",  "http://localhost:8000")
 
 KIS_WS_BASE_LIVE  = os.getenv("KIS_WS_BASE_LIVE",  "ws://ops.koreainvestment.com:21000")
 KIS_WS_BASE_PAPER = os.getenv("KIS_WS_BASE_PAPER", "ws://ops.koreainvestment.com:31000")
-KIS_WS_PATH       = os.getenv("KIS_WS_PATH",       "/tryitout/H0STCNT0")
+KIS_WS_PATH_LIVE  = os.getenv("KIS_WS_PATH_LIVE",  "")
+KIS_WS_PATH_PAPER = os.getenv("KIS_WS_PATH_PAPER", "/tryitout/H0STCNT0")
 KIS_WS_URL_MOCK   = os.getenv("KIS_WS_URL_MOCK",   "ws://localhost:8000/ws")
 
 KIS_RATE_LIMIT_SEC = float(os.getenv("KIS_RATE_LIMIT_SEC", "0.06"))

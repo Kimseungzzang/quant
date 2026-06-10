@@ -45,7 +45,7 @@ from ai.tools import ToolExecutor
 from ai.agent import AIAgent
 from ai.provider import create_provider
 
-from utils import CandleAggregator, load_config, setup_logging
+from utils import load_config, setup_logging
 from routers import state
 from routers.ai_routes import router as ai_router
 from routers.trade_routes import router as trade_router
@@ -54,9 +54,24 @@ from routers.system_routes import router as system_router
 logger = logging.getLogger(__name__)
 
 
+# ── 알림 큐 (HTTP polling용) ─────────────────────────────────────────────
+_notification_queue: list[dict] = []
+_NOTIFICATION_MAX = 100
+
+
+def _push_notification(msg: dict) -> None:
+    _notification_queue.append(msg)
+    if len(_notification_queue) > _NOTIFICATION_MAX:
+        _notification_queue.pop(0)
+
+
 # ── 브로드캐스트 ─────────────────────────────────────────────────────────
 
 async def _broadcast(msg: dict) -> None:
+    import time
+    msg["_ts"] = time.time()
+    if msg.get("type") in ("ai_message", "fill_notice"):
+        _push_notification(msg)
     dead = set()
     for ws in list(state.ws_clients):  # snapshot — disconnect 시 set 변경 방지
         try:
@@ -67,7 +82,7 @@ async def _broadcast(msg: dict) -> None:
 
 
 def _on_ai_message(source: str, message: str) -> None:
-    if source == "chat":
+    if source in ("chat", "tool"):
         return
     asyncio.get_event_loop().call_soon_threadsafe(
         lambda: asyncio.create_task(
@@ -150,7 +165,6 @@ async def _build_async_components(config: dict, sync_comp: dict) -> dict:
 # ── WebSocket 거래 루프 ───────────────────────────────────────────────────
 
 async def _trading_loop(config: dict, comp: dict) -> None:
-    aggregators: dict[str, CandleAggregator] = {}
     order_mgr: OrderManager = comp["order_mgr"]
     market_data: MarketDataCollector = comp["market_data"]
     engine: EventEngine = comp["engine"]
@@ -169,8 +183,6 @@ async def _trading_loop(config: dict, comp: dict) -> None:
             "received_at": datetime.now().isoformat(),
         }
         market_data.on_price_tick(code, tick)
-        if code in aggregators:
-            aggregators[code].update({"price": tick["current_price"], "vol": tick["volume"], "time": tick["time"]})
         order_mgr.record_price(code, tick["current_price"])
         asyncio.get_event_loop().call_soon_threadsafe(
             lambda c=code, p=tick["current_price"]: asyncio.create_task(
@@ -207,6 +219,21 @@ async def _trading_loop(config: dict, comp: dict) -> None:
             WebSocketTRID.DOMESTIC_FILL_PAPER, WebSocketTRID.DOMESTIC_FILL_LIVE,
         ) else parse_overseas_fill_notice
         order_mgr.on_order_notice(parser(fields))
+
+    def _on_fill_broadcast(info: dict) -> None:
+        side_kr = "매수" if info["side"] == "BUY" else "매도"
+        status = "전량 체결" if info["fully_filled"] else "부분 체결"
+        msg = (
+            f"[{status}] {info.get('stock_name') or info['stock_code']} "
+            f"{side_kr} {info['filled_qty']}주 @ {info['fill_price']:,.0f}원"
+        )
+        asyncio.get_event_loop().call_soon_threadsafe(
+            lambda: asyncio.create_task(
+                _broadcast({"type": "fill_notice", "message": msg, "info": info, "ts": datetime.now().isoformat()})
+            )
+        )
+
+    order_mgr.on_fill_callback = _on_fill_broadcast
 
     domestic_fill_trid = WebSocketTRID.DOMESTIC_FILL_PAPER if comp["auth"].is_paper else WebSocketTRID.DOMESTIC_FILL_LIVE
     overseas_fill_trid = WebSocketTRID.OVERSEAS_FILL_PAPER if comp["auth"].is_paper else WebSocketTRID.OVERSEAS_FILL_LIVE
@@ -259,13 +286,10 @@ async def _trading_loop(config: dict, comp: dict) -> None:
         overseas_codes = [c for c in overseas_codes if c in watched_codes]
 
     if max_ws > 0:
-        selected = [("overseas", c) for c in overseas_codes] + [("domestic", c) for c in domestic_codes]
+        selected = [("domestic", c) for c in domestic_codes] + [("overseas", c) for c in overseas_codes]
         selected = selected[:max_ws]
         domestic_codes = [c for m, c in selected if m == "domestic"]
         overseas_codes = [c for m, c in selected if m == "overseas"]
-
-    for code in domestic_codes:
-        aggregators[code] = CandleAggregator(period_minutes=1)
 
     ws = KISWebSocket(comp["auth"])
     comp["ws"] = ws
@@ -400,6 +424,39 @@ def _start_pollers(comp: dict, stop: threading.Event) -> None:
     threading.Thread(target=_account_poll, daemon=True, name="account-poller").start()
 
 
+# ── Paper 체결 폴링 (paper WS 서버가 H0STCNI9를 지원하지 않으므로 REST 폴링) ──
+
+async def _paper_fill_poll_loop(comp: dict, stop: asyncio.Event) -> None:
+    """paper 모드: 30초마다 KIS REST로 국내+해외 주문체결내역 조회 → 체결 반영."""
+    order_mgr: OrderManager = comp["order_mgr"]
+    domestic = comp.get("domestic")
+    overseas = comp.get("overseas")
+    while not stop.is_set():
+        try:
+            if order_mgr.get_pending_order_rows():
+                rows: list[dict] = []
+                if domestic:
+                    try:
+                        rows += domestic.get_daily_orders()
+                    except Exception:
+                        logger.warning("국내 체결 폴링 실패", exc_info=True)
+                if overseas:
+                    try:
+                        rows += overseas.get_daily_orders()
+                    except Exception:
+                        logger.warning("해외 체결 폴링 실패", exc_info=True)
+                if rows:
+                    matched = order_mgr.reconcile_order_rows(rows)
+                    if matched:
+                        logger.info("paper 체결 폴링: %d건 반영", matched)
+        except Exception:
+            logger.exception("paper 체결 폴링 실패")
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            pass
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -421,6 +478,8 @@ async def lifespan(app: FastAPI):
     await state.event_engine.run()
     asyncio.create_task(_morning_brief_loop(state.agent, config, async_stop))
     asyncio.create_task(_auto_trading_schedule_loop(state.agent, config, async_stop))
+    if config.get("mode") == "paper":
+        asyncio.create_task(_paper_fill_poll_loop(state.components, async_stop))
     state.trading_task = asyncio.create_task(
         _trading_loop_supervisor(config, state.components, async_stop)
     )
@@ -451,6 +510,12 @@ app.add_middleware(
 app.include_router(ai_router)
 app.include_router(trade_router)
 app.include_router(system_router)
+
+
+@app.get("/ai/notifications")
+def get_notifications(since: float = 0):
+    """Jarvis가 폴링해서 새 알림을 가져가는 엔드포인트."""
+    return [m for m in _notification_queue if m.get("_ts", 0) > since]
 
 
 @app.websocket("/ws/stream")

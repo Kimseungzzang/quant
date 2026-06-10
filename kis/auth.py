@@ -8,7 +8,7 @@ from .constants import (
     TradingMode,
     AuthPath,
     KIS_REST_URL_LIVE, KIS_REST_URL_PAPER, KIS_REST_URL_MOCK,
-    KIS_WS_BASE_LIVE, KIS_WS_BASE_PAPER, KIS_WS_PATH, KIS_WS_URL_MOCK,
+    KIS_WS_BASE_LIVE, KIS_WS_BASE_PAPER, KIS_WS_PATH_LIVE, KIS_WS_PATH_PAPER, KIS_WS_URL_MOCK,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,10 +40,10 @@ class KISAuth:
             self.ws_full_url = config["kis"].get("ws_url",  KIS_WS_URL_MOCK)
         elif mode == TradingMode.PAPER:
             self.base_url    = KIS_REST_URL_PAPER
-            self.ws_full_url = KIS_WS_BASE_PAPER + KIS_WS_PATH
+            self.ws_full_url = KIS_WS_BASE_PAPER + KIS_WS_PATH_PAPER
         else:
             self.base_url    = KIS_REST_URL_LIVE
-            self.ws_full_url = KIS_WS_BASE_LIVE + KIS_WS_PATH
+            self.ws_full_url = KIS_WS_BASE_LIVE + KIS_WS_PATH_LIVE
 
         self._access_token: str | None = None
         self._token_expired_at: datetime | None = None
@@ -92,14 +92,21 @@ class KISAuth:
         return datetime.now() < self._token_expired_at
 
     def _issue_token(self) -> str:
+        import time
         url = f"{self.base_url}{AuthPath.TOKEN}"
         body = {
             "grant_type": "client_credentials",
             "appkey": self.app_key,
             "appsecret": self.app_secret,
         }
-        resp = requests.post(url, json=body, timeout=10)
-        resp.raise_for_status()
+        for attempt in range(3):
+            resp = requests.post(url, json=body, timeout=10)
+            if resp.status_code == 403 and "1분당" in resp.text:
+                logger.warning("토큰 발급 rate limit — 65초 후 재시도 (%d/3)", attempt + 1)
+                time.sleep(65)
+                continue
+            resp.raise_for_status()
+            break
         data = resp.json()
 
         self._access_token = data["access_token"]
