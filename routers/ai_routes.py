@@ -17,6 +17,53 @@ router = APIRouter()
 _CHART_CACHE_DIR = Path("data/cache")
 
 
+def _live_price(stock_code: str) -> float | None:
+    market_data = state.components.get("market_data")
+    if market_data is None:
+        return None
+    data = market_data.get_price(stock_code) or {}
+    price = data.get("current_price") or data.get("price") or data.get("last")
+    try:
+        value = float(price or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _merge_live_price(df: pd.DataFrame, stock_code: str, candle_type: str) -> pd.DataFrame:
+    live_price = _live_price(stock_code)
+    if live_price is None or df.empty:
+        return df
+
+    df = df.copy()
+    now = pd.Timestamp.now()
+    if candle_type == "minute":
+        bucket = now.floor("5min").to_pydatetime().replace(tzinfo=None)
+    else:
+        bucket = pd.Timestamp(date.today())
+
+    last_idx = df.index[-1]
+    last_dt = pd.Timestamp(df.at[last_idx, "datetime"]).to_pydatetime().replace(tzinfo=None)
+    if last_dt < bucket:
+        prev_close = float(df.at[last_idx, "close"] or live_price)
+        row = {
+            "datetime": bucket,
+            "open": prev_close,
+            "high": max(prev_close, live_price),
+            "low": min(prev_close, live_price),
+            "close": live_price,
+            "volume": 0,
+        }
+        if "trading_value" in df.columns:
+            row["trading_value"] = 0
+        return pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+    df.at[last_idx, "high"] = max(float(df.at[last_idx, "high"] or live_price), live_price)
+    df.at[last_idx, "low"] = min(float(df.at[last_idx, "low"] or live_price), live_price)
+    df.at[last_idx, "close"] = live_price
+    return df
+
+
 async def _fetch_today_minute_candles(domestic, stock_code: str) -> pd.DataFrame:
     """오늘 1분봉을 캐시 + delta 방식으로 반환.
 
@@ -184,6 +231,7 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
                 end = date.today()
                 start = end - timedelta(days=max(count * 2, 60))
                 df = domestic.get_daily_ohlcv(stock_code, start, end)
+            df = _merge_live_price(df, stock_code, candle_type)
         elif overseas:
             exch = ExchangeCode.NASDAQ
             if candle_type == "minute":
