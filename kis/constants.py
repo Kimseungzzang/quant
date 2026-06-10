@@ -18,7 +18,7 @@ KIS_WS_PATH_LIVE  = os.getenv("KIS_WS_PATH_LIVE",  "")
 KIS_WS_PATH_PAPER = os.getenv("KIS_WS_PATH_PAPER", "/tryitout/H0STCNT0")
 KIS_WS_URL_MOCK   = os.getenv("KIS_WS_URL_MOCK",   "ws://localhost:8000/ws")
 
-KIS_RATE_LIMIT_SEC = float(os.getenv("KIS_RATE_LIMIT_SEC", "0.06"))
+KIS_RATE_LIMIT_SEC = float(os.getenv("KIS_RATE_LIMIT_SEC", "0.25"))
 
 
 # ── 거래 모드 ─────────────────────────────────────────────────────────
