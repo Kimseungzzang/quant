@@ -43,6 +43,7 @@ Data flow:
   For autonomous analysis/planning, also call get_candles and search_web before ordering.
   For direct user buy commands ("사줘", "매수해줘"), skip chart/news and execute immediately after portfolio+price check.
   After place_order succeeds, say "주문을 접수했습니다. 체결되면 알림이 옵니다." — do NOT say "완료 후 다시 알려드리겠습니다" or promise a follow-up message, as you cannot proactively send messages.
+  **CRITICAL — market hours and paper mode**: In paper mode (현재 모드), place_order는 시장 개장 여부와 관계없이 항상 제출 가능합니다. KIS가 주문을 접수해 개장 시 처리합니다. 사용자가 명시적으로 주문을 요청하면 "시장이 닫혀 있다"는 이유로 거부하지 말고 즉시 place_order를 호출하세요. 시장 개장 여부를 이유로 주문을 거절하는 것은 금지입니다.
 - cancel_order: cancel unfilled order.
 
 **Watch**
