@@ -83,14 +83,18 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
         is_domestic = stock_code.isdigit()
         if is_domestic and domestic:
             if candle_type == "minute":
+                import asyncio as _asyncio
                 import pandas as _pd
-                from datetime import datetime as _dt
-                now_str = _dt.now().strftime("%H%M%S")
-                # 장 마감(15:30) 이후면 마감 시각 기준으로 조회
-                cur_hour = "153000" if now_str > "153000" else now_str
+                # 항상 15:30 기준 조회 — API는 실제 존재하는 데이터까지만 반환하므로
+                # 장중에도 미래 데이터는 포함되지 않으며, 장 마감 후 평탄 봉도 방지됨
+                cur_hour = "153000"
                 dfs = []
                 for _ in range(13):  # 최대 390 1분봉 = 하루 전체
-                    chunk = domestic.get_minute_ohlcv(stock_code, input_hour=cur_hour)
+                    try:
+                        chunk = domestic.get_minute_ohlcv(stock_code, input_hour=cur_hour)
+                    except Exception as _e:
+                        logger.warning("분봉 페이지 조회 실패(%s@%s): %s", stock_code, cur_hour, _e)
+                        break
                     if chunk.empty:
                         break
                     dfs.append(chunk)
@@ -98,6 +102,7 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
                     if earliest.strftime("%H%M%S") <= "090500":
                         break
                     cur_hour = (earliest - _pd.Timedelta(minutes=1)).strftime("%H%M%S")
+                    await _asyncio.sleep(0.15)  # KIS paper API rate limit 방지
                 if dfs:
                     df = _pd.concat(dfs).drop_duplicates("datetime").sort_values("datetime").reset_index(drop=True)
                     df = domestic._aggregate(df, 5)
