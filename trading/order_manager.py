@@ -69,6 +69,7 @@ class OrderManager:
         self._positions: dict[str, Position] = {}
         self._last_prices: dict[str, float] = {}
         self._pending_orders: dict[str, PendingOrder] = {}
+        self.last_order_error: str = ""
         self._lock = threading.Lock()  # positions/pending_orders 동시 접근 보호
         self.on_fill_callback = None  # Callable[[dict], None] — 체결 시 호출
 
@@ -142,6 +143,11 @@ class OrderManager:
 
     _PLACING_PREFIX = "__placing__"
 
+    def _fail_order(self, message: str, *args) -> bool:
+        self.last_order_error = message % args if args else message
+        logger.warning(self.last_order_error)
+        return False
+
     def open_position(
         self,
         stock_code: str,
@@ -152,17 +158,15 @@ class OrderManager:
         qty_override: int | None = None,
         position_pct_override: float | None = None,
     ) -> bool:
+        self.last_order_error = ""
         sentinel_key = f"{self._PLACING_PREFIX}{stock_code}"
         with self._lock:
             if not self.risk.can_open_position(len(self._positions)):
-                logger.warning("최대 보유 종목 초과: %s", stock_code)
-                return False
+                return self._fail_order("최대 보유 종목 초과: %s", stock_code)
             if stock_code in self._positions:
-                logger.warning("이미 보유 중: %s", stock_code)
-                return False
+                return self._fail_order("이미 보유 중: %s", stock_code)
             if self._has_pending(stock_code, "BUY"):
-                logger.warning("이미 매수 주문 대기 중: %s", stock_code)
-                return False
+                return self._fail_order("이미 매수 주문 대기 중: %s", stock_code)
             # API 호출 전 sentinel 등록 — 동시 open_position 중복 차단 (TOCTOU 방지)
             self._pending_orders[sentinel_key] = PendingOrder(
                 order_no=sentinel_key, side="BUY", stock_code=stock_code,
@@ -173,24 +177,22 @@ class OrderManager:
             account_value = self._get_account_value(exchange)
             if qty_override is not None and qty_override > 0:
                 qty = int(qty_override)
-                cap_pct = position_pct_override if position_pct_override is not None and position_pct_override > 0 else self.risk.position_size_pct
-                max_qty = int((account_value * cap_pct / 100) / price) if price > 0 else 0
-                if max_qty <= 0:
-                    logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
-                    return False
-                if qty > max_qty:
-                    logger.warning(
-                        "AI 요청 수량 clamp: %s requested=%d max=%d cap_pct=%.2f",
-                        stock_code, qty, max_qty, cap_pct,
+                required_cash = qty * price
+                if account_value <= 0:
+                    return self._fail_order("매수 가능 금액 조회 실패 또는 0원: %s", stock_code)
+                if price <= 0:
+                    return self._fail_order("주문 기준가 없음: %s", stock_code)
+                if required_cash > account_value:
+                    return self._fail_order(
+                        "매수 가능 금액 부족: %s requested_qty=%d required=%.2f available=%.2f",
+                        stock_code, qty, required_cash, account_value,
                     )
-                    qty = max_qty
             elif position_pct_override is not None and position_pct_override > 0:
                 qty = int((account_value * position_pct_override / 100) / price) if price > 0 else 0
             else:
                 qty = self.risk.calc_position_qty(account_value, price)
             if qty <= 0:
-                logger.warning("매수 수량 0 (자금 부족): %s", stock_code)
-                return False
+                return self._fail_order("매수 수량 0 (자금 부족): %s", stock_code)
 
             if exchange == _KRX:
                 result = self.domestic.buy(stock_code, qty)
@@ -217,6 +219,7 @@ class OrderManager:
                     self._confirm_buy(stock_code, name, exchange, qty, price, order_no, strategy)
             return True
         except Exception as e:
+            self.last_order_error = f"매수 API 실패: {stock_code} {e}"
             logger.error("매수 실패 (%s): %s", stock_code, e)
             return False
         finally:
@@ -231,14 +234,13 @@ class OrderManager:
         current_price: float,
         reason: CloseReason | str = CloseReason.SIGNAL,
     ) -> bool:
+        self.last_order_error = ""
         with self._lock:
             pos = self._positions.get(stock_code)
             if not pos:
-                logger.warning("보유하지 않은 종목: %s", stock_code)
-                return False
+                return self._fail_order("보유하지 않은 종목: %s", stock_code)
             if self._has_pending(stock_code, "SELL"):
-                logger.warning("이미 매도 주문 대기 중: %s", stock_code)
-                return False
+                return self._fail_order("이미 매도 주문 대기 중: %s", stock_code)
             qty = pos.qty
             exchange = pos.exchange
             name = pos.name
@@ -270,6 +272,7 @@ class OrderManager:
                     self._confirm_sell(stock_code, qty, current_price, order_no, reason)
             return True
         except Exception as e:
+            self.last_order_error = f"매도 API 실패: {stock_code} {e}"
             logger.error("매도 실패 (%s): %s", stock_code, e)
             return False
 

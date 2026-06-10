@@ -924,6 +924,7 @@ class ToolExecutor:
             "position_pct": position_pct,
             "order_price": price,
             "result": bool(result),
+            "failure_reason": None if result else self._order_manager.last_order_error,
             "pending_orders": self._order_manager.get_pending_order_rows(),
         }, ensure_ascii=False, default=str)
 
