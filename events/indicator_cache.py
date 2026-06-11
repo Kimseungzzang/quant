@@ -71,6 +71,7 @@ class IndicatorCache:
                     logger.debug("지표 갱신: %s", stock_code)
             except Exception:
                 logger.warning("지표 계산 실패: %s", stock_code, exc_info=True)
+            await asyncio.sleep(2)  # 종목 간 rate limit 방지
 
     def _update(self, stock_code: str, market: str, exchange: str | None) -> dict:
         # ── 5분봉 지표 ──────────────────────────────────────────────
@@ -140,13 +141,14 @@ class IndicatorCache:
         return None
 
     def _fetch_full(self, stock_code: str, market: str, exchange: str | None) -> pd.DataFrame | None:
+        # lookback_days=1: 오늘치만 — rate limit 부담 최소화
         if market == "domestic" and self._domestic:
             return self._domestic.get_historical_minute_ohlcv(
-                stock_code, lookback_days=3, candle_minutes=5
+                stock_code, lookback_days=1, candle_minutes=5
             )
         if market == "overseas" and self._overseas:
             return self._overseas.get_historical_minute_ohlcv(
-                stock_code, exchange=self._exch(exchange), lookback_days=3, candle_minutes=5
+                stock_code, exchange=self._exch(exchange), lookback_days=1, candle_minutes=5
             )
         return None
 
