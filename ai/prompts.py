@@ -56,20 +56,28 @@ Data flow:
   **RULE: Always use `expr` type. Never use price_change/volume_spike alone.**
   expr is a Python boolean expression in the `formula` field evaluated every 10 seconds.
   Available variables (evaluated every 10s — use only real-time + 5-min signals here):
-    price, volume, change_pct, volume_ratio   ← real-time (WebSocket tick)
-    rsi, macd, ma5, ma10, ma20, ma60          ← 5-min candle, refreshed every 5 min
-    bb_pct, bb_upper, bb_lower                ← 5-min Bollinger
-    stoch_k, stoch_d                          ← 5-min Stochastic
-    baseline_price, baseline_volume, avg_volume
+    price, volume, change_pct               ← real-time (WebSocket tick)
+    rsi, macd, ma5, ma10, ma20, ma60        ← 5-min candle, refreshed every 5 min
+    bb_pct, bb_upper, bb_lower              ← 5-min Bollinger
+    stoch_k, stoch_d                        ← 5-min Stochastic
+    avg_volume                              ← 20-period average volume (5-min candle)
+    baseline_price, baseline_volume         ← snapshot at set_watch time (DO NOT USE for volume)
+
+  **CRITICAL — DO NOT USE `volume_ratio`.**
+  `volume_ratio = volume / baseline_volume` where baseline_volume is the cumulative volume at watch-set time.
+  This value resets to ~0 at the start of each trading session, making `volume_ratio > X` permanently false.
+  Instead, use `volume > avg_volume * N` to compare against the rolling 20-bar average:
+    "volume > avg_volume * 1.5"  ← 평균 거래량의 1.5배 이상
+    "volume > avg_volume * 2.0"  ← 거래량 급등
 
   Daily indicators (rsi_daily, ma20_daily etc.) change slowly — do NOT use in watch expr.
   They are used in screen_candidates for pre-screening only.
 
   Strategy → entry method:
     단타:  set_watch → trigger → place_order
-           watch expr: "rsi < 30 and bb_pct < 0.15 and volume_ratio > 1.5"
+           watch expr: "rsi < 30 and bb_pct < 0.15 and volume > avg_volume * 1.5"
     스윙:  set_watch → trigger → place_order
-           watch expr: "rsi < 40 and ma20 > ma60 and volume_ratio > 1.3"
+           watch expr: "rsi < 40 and ma20 > ma60 and volume > avg_volume * 1.3"
     장기:  screen_candidates → place_order directly (NO entry watch needed)
            Daily indicators already confirmed the setup. Just buy.
            Only set watch for stop-loss and take-profit after buying.
@@ -77,7 +85,7 @@ Data flow:
   Signal reference:
     Oversold entry:  rsi < 30, stoch_k < 20, bb_pct < 0.1
     Overbought exit: rsi > 70, stoch_k > 80, bb_pct > 0.9
-    Trend entry:     price > ma20 and volume_ratio > 1.5
+    Trend entry:     price > ma20 and volume > avg_volume * 1.5
     Momentum:        macd > 0 and change_pct > 1
 
   You MUST combine at least 2 factors in every expr. Single-factor conditions are not allowed.
@@ -92,7 +100,7 @@ Data flow:
 
   Examples:
     단타 entry:  "rsi < 30 and bb_pct < 0.15 and change_pct < -2"
-    스윙 entry:  "rsi < 40 and ma20 > ma60 and volume_ratio > 1.3"
+    스윙 entry:  "rsi < 40 and ma20 > ma60 and volume > avg_volume * 1.3"
     Stop:        "change_pct < -5 or (rsi > 75 and bb_pct > 0.95)"
     Profit:      "change_pct > 8 or (rsi > 70 and stoch_k > 80)"
 

@@ -51,7 +51,7 @@ const sendBtn = document.getElementById('send-btn');
 function addMessage(role, text) {
   const msg = document.createElement('div');
   msg.className = `msg ${role}`;
-  const avatarText = role === 'ai' ? 'J' : 'U';
+  const avatarText = role === 'ai' ? 'J' : role === 'error' ? '!' : 'U';
   msg.innerHTML = `
     <div class="msg-avatar">${avatarText}</div>
     <div class="msg-bubble">${escHtml(text)}</div>
@@ -319,6 +319,8 @@ async function pollNotifications() {
         setTimeout(() => setSphereState('idle'), 3000);
       } else if (item.type === 'fill_notice') {
         addMessage('ai', `🔔 ${item.message}`);
+      } else if (item.type === 'error_notice') {
+        addMessage('error', `⚠ ${item.message}`);
       }
     }
   } catch { /* 서버 미응답 시 무시 */ }

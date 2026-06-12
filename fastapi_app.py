@@ -70,7 +70,7 @@ def _push_notification(msg: dict) -> None:
 async def _broadcast(msg: dict) -> None:
     import time
     msg["_ts"] = time.time()
-    if msg.get("type") in ("ai_message", "fill_notice"):
+    if msg.get("type") in ("ai_message", "fill_notice", "error_notice"):
         _push_notification(msg)
     dead = set()
     for ws in list(state.ws_clients):  # snapshot — disconnect 시 set 변경 방지
@@ -187,7 +187,7 @@ async def _trading_loop(config: dict, comp: dict) -> None:
             "received_at": datetime.now().isoformat(),
         }
         market_data.on_price_tick(code, tick)
-        order_mgr.record_price(code, tick["current_price"])
+        order_mgr.on_price_update(code, tick["current_price"], signal=None)
         asyncio.get_event_loop().call_soon_threadsafe(
             lambda c=code, p=tick["current_price"]: asyncio.create_task(
                 _broadcast({"type": "price", "code": c, "price": p, "ts": datetime.now().isoformat()})
@@ -216,7 +216,7 @@ async def _trading_loop(config: dict, comp: dict) -> None:
             "received_at": datetime.now().isoformat(),
         }
         market_data.on_price_tick(code, tick)
-        order_mgr.record_price(code, tick["current_price"])
+        order_mgr.on_price_update(code, tick["current_price"], signal=None)
 
     def on_fill(tr_id, fields: list) -> None:
         parser = parse_domestic_fill_notice if tr_id in (
@@ -237,7 +237,15 @@ async def _trading_loop(config: dict, comp: dict) -> None:
             )
         )
 
+    def _on_error_broadcast(message: str) -> None:
+        asyncio.get_event_loop().call_soon_threadsafe(
+            lambda: asyncio.create_task(
+                _broadcast({"type": "error_notice", "message": message})
+            )
+        )
+
     order_mgr.on_fill_callback = _on_fill_broadcast
+    order_mgr.on_error_callback = _on_error_broadcast
 
     domestic_fill_trid = WebSocketTRID.DOMESTIC_FILL_PAPER if comp["auth"].is_paper else WebSocketTRID.DOMESTIC_FILL_LIVE
     overseas_fill_trid = WebSocketTRID.OVERSEAS_FILL_PAPER if comp["auth"].is_paper else WebSocketTRID.OVERSEAS_FILL_LIVE
@@ -327,6 +335,7 @@ async def _trading_loop_supervisor(config: dict, comp: dict, stop: asyncio.Event
         except Exception as e:
             state.trading_last_error = f"{type(e).__name__}: {e}"
             logger.exception("KIS WebSocket loop failed — restarting in 5s")
+            await _broadcast({"type": "error_notice", "message": f"KIS WebSocket 연결 오류 (5초 후 재연결): {e}"})
         try:
             await asyncio.wait_for(stop.wait(), timeout=5)
         except asyncio.TimeoutError:
@@ -412,14 +421,15 @@ def _start_pollers(comp: dict, stop: threading.Event) -> None:
             try:
                 dom = comp["domestic"].get_balance()
                 comp["account"].update_balance("domestic", dom)
+                last_prices = comp["order_mgr"].get_last_prices()
                 positions = [
                     {
                         "stock_code": p.stock_code, "stock_name": p.name,
                         "market": "domestic" if p.is_domestic() else "overseas",
                         "quantity": p.qty, "avg_price": p.entry_price,
-                        "current_price": p.current_price,
+                        "current_price": last_prices.get(p.stock_code, p.entry_price),
                         "unrealized_pct": round(
-                            (p.current_price - p.entry_price) / p.entry_price * 100, 2
+                            (last_prices.get(p.stock_code, p.entry_price) - p.entry_price) / p.entry_price * 100, 2
                         ) if p.entry_price else 0,
                     }
                     for p in comp["order_mgr"].get_open_positions().values()
@@ -439,26 +449,30 @@ async def _paper_fill_poll_loop(comp: dict, stop: asyncio.Event) -> None:
     order_mgr: OrderManager = comp["order_mgr"]
     domestic = comp.get("domestic")
     overseas = comp.get("overseas")
+    loop = asyncio.get_event_loop()
     while not stop.is_set():
         try:
             if order_mgr.get_pending_order_rows():
                 rows: list[dict] = []
                 if domestic:
                     try:
-                        rows += domestic.get_daily_orders()
-                    except Exception:
+                        rows += await loop.run_in_executor(None, domestic.get_daily_orders)
+                    except Exception as e:
                         logger.warning("국내 체결 폴링 실패", exc_info=True)
+                        await _broadcast({"type": "error_notice", "message": f"체결 조회 실패 (국내): {e}"})
                 if overseas:
                     try:
-                        rows += overseas.get_daily_orders()
-                    except Exception:
+                        rows += await loop.run_in_executor(None, overseas.get_daily_orders)
+                    except Exception as e:
                         logger.warning("해외 체결 폴링 실패", exc_info=True)
+                        await _broadcast({"type": "error_notice", "message": f"체결 조회 실패 (해외): {e}"})
                 if rows:
                     matched = order_mgr.reconcile_order_rows(rows)
                     if matched:
                         logger.info("paper 체결 폴링: %d건 반영", matched)
-        except Exception:
+        except Exception as e:
             logger.exception("paper 체결 폴링 실패")
+            await _broadcast({"type": "error_notice", "message": f"체결 폴링 오류: {e}"})
         try:
             await asyncio.wait_for(stop.wait(), timeout=30)
         except asyncio.TimeoutError:

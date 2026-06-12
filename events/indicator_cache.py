@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 _CACHE_KEY_PREFIX = "ai:indicators:"
 _WATCHES_KEY = "ai:watches"
 _REFRESH_INTERVAL_SEC = 300    # 5분봉 갱신 주기
+_REDIS_TTL_SEC = 1800          # Redis TTL: 사이클이 느려도 30분간 유효
 _DAILY_REFRESH_INTERVAL_SEC = 1800  # 일봉 갱신 주기 (30분)
 _MAX_CANDLES = 500             # ~3일치 5분봉
 _DAILY_LOOKBACK_DAYS = 180     # MA60 계산에 충분한 일봉 수
@@ -58,17 +59,23 @@ class IndicatorCache:
         for stock_code, watch in watches.items():
             market = watch.get("market", "domestic")
             exchange = watch.get("exchange")
+            cached = self._r.exists(f"{_CACHE_KEY_PREFIX}{stock_code}")
             try:
-                indicators = await loop.run_in_executor(
-                    None, self._update, stock_code, market, exchange
+                indicators = await asyncio.wait_for(
+                    loop.run_in_executor(None, self._update, stock_code, market, exchange),
+                    timeout=30,
                 )
                 if indicators:
                     self._r.set(
                         f"{_CACHE_KEY_PREFIX}{stock_code}",
                         json.dumps(indicators, ensure_ascii=False),
-                        ex=_REFRESH_INTERVAL_SEC * 3,
+                        ex=_REDIS_TTL_SEC,
                     )
-                    logger.debug("지표 갱신: %s", stock_code)
+                    logger.info("지표 갱신: %s", stock_code)
+                elif not cached:
+                    logger.warning("지표 계산 결과 없음 (데이터 부족): %s", stock_code)
+            except asyncio.TimeoutError:
+                logger.warning("지표 계산 타임아웃 (30s): %s — 다음 주기에 재시도", stock_code)
             except Exception:
                 logger.warning("지표 계산 실패: %s", stock_code, exc_info=True)
             await asyncio.sleep(2)  # 종목 간 rate limit 방지
@@ -147,9 +154,14 @@ class IndicatorCache:
                 stock_code, lookback_days=1, candle_minutes=5
             )
         if market == "overseas" and self._overseas:
-            return self._overseas.get_historical_minute_ohlcv(
+            df = self._overseas.get_historical_minute_ohlcv(
                 stock_code, exchange=self._exch(exchange), lookback_days=1, candle_minutes=5
             )
+            if df is not None and not df.empty:
+                return df
+            # 분봉 미제공 시 일봉으로 폴백
+            logger.info("해외 분봉 없음, 일봉으로 폴백: %s", stock_code)
+            return self._fetch_daily(stock_code, market, exchange)
         return None
 
     def _fetch_recent(self, stock_code: str, market: str, exchange: str | None) -> pd.DataFrame | None:

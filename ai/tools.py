@@ -295,13 +295,15 @@ TOOL_DEFINITIONS = [
                                 "type": "string",
                                 "enum": ["price_change", "price_above", "price_below", "volume_spike", "expr"],
                                 "description": (
-                                    "price_change: 설정 시점 대비 ±X% | price_above: X원 이상 | price_below: X원 이하 | volume_spike: 평균 거래량의 X배 | "
+                                    "price_above: X원 이상 | price_below: X원 이하 | "
                                     "expr: 자유 수식 — formula 필드에 파이썬 비교식 작성. "
-                                    "사용 가능 변수: price, volume, change_pct, volume_ratio, baseline_price, baseline_volume, "
+                                    "사용 가능 변수: price, volume, change_pct, "
                                     "rsi, macd, ma5, ma10, ma20, ma60, avg_volume, "
                                     "bb_pct(볼린저 %B: 0=하단,1=상단), bb_upper, bb_lower, stoch_k, stoch_d. "
+                                    "⚠️ volume_ratio 사용 금지: 세션 시작 시 0으로 리셋되어 조건이 영원히 안 걸림. "
+                                    "거래량 조건은 반드시 'volume > avg_volume * N' 형식으로 작성. "
                                     "과매도: rsi<30 or stoch_k<20 or bb_pct<0.1 | 과매수: rsi>70 or stoch_k>80 or bb_pct>0.9. "
-                                    "예시: 'rsi < 30 and bb_pct < 0.1', 'stoch_k < 20 and change_pct < -2'"
+                                    "예시: 'rsi < 30 and bb_pct < 0.1', 'rsi < 40 and volume > avg_volume * 1.5'"
                                 ),
                             },
                             "threshold": {"type": "number", "description": "expr 타입에서는 불필요 (생략 가능)"},
@@ -1141,6 +1143,17 @@ class ToolExecutor:
         exchange = "KRX"
         baseline_price = self._first_float(price_data or {}, ["current_price", "price", "last"])
         baseline_volume = self._first_float(price_data or {}, ["acml_volume", "volume", "acml_vol"])
+
+        if market == "domestic" and self._domestic and baseline_price <= 0:
+            try:
+                from kis.constants import MarketCode
+                rest = self._domestic.get_price(stock_code, MarketCode.ALL)
+                baseline_price = self._first_float(rest or {}, ["stck_prpr", "current_price", "price"])
+                baseline_volume = self._first_float(rest or {}, ["acml_vol", "acml_volume", "volume"])
+                if baseline_price > 0:
+                    logger.info("국내 기준가 REST 조회: %s → %.0f", stock_code, baseline_price)
+            except Exception:
+                logger.warning("국내 기준가 REST 조회 실패: %s", stock_code)
 
         if market == "overseas" and self._overseas:
             if baseline_price <= 0:

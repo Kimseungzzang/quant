@@ -233,7 +233,7 @@ class EventDetector:
             detail = {"formula": formula, "variables": {k: round(v, 4) if isinstance(v, float) else v for k, v in names.items()}}
             return hit, detail
         except (FeatureNotAvailable, InvalidExpression, Exception) as e:
-            logger.warning("expr 평가 실패 '%s': %s", formula, e)
+            logger.debug("expr 평가 실패 '%s': %s", formula, e)
             return False, {}
 
     def _load_watches(self) -> dict:

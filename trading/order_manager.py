@@ -71,7 +71,8 @@ class OrderManager:
         self._pending_orders: dict[str, PendingOrder] = {}
         self.last_order_error: str = ""
         self._lock = threading.Lock()  # positions/pending_orders 동시 접근 보호
-        self.on_fill_callback = None  # Callable[[dict], None] — 체결 시 호출
+        self.on_fill_callback = None   # Callable[[dict], None] — 체결 시 호출
+        self.on_error_callback = None  # Callable[[str], None] — 주문 실패 시 호출
 
     _FILL_TIMEOUT_SEC = 30  # 이 시간 내 WebSocket 체결통보 없으면 접수가로 확정
 
@@ -221,6 +222,8 @@ class OrderManager:
         except Exception as e:
             self.last_order_error = f"매수 API 실패: {stock_code} {e}"
             logger.error("매수 실패 (%s): %s", stock_code, e)
+            if self.on_error_callback:
+                self.on_error_callback(f"매수 실패 [{stock_code}] {e}")
             return False
         finally:
             with self._lock:
@@ -274,6 +277,8 @@ class OrderManager:
         except Exception as e:
             self.last_order_error = f"매도 API 실패: {stock_code} {e}"
             logger.error("매도 실패 (%s): %s", stock_code, e)
+            if self.on_error_callback:
+                self.on_error_callback(f"매도 실패 [{stock_code}] {e}")
             return False
 
     # ── 실시간 모니터링 ──────────────────────────────────────────────────
@@ -310,6 +315,10 @@ class OrderManager:
     def get_open_positions(self) -> dict[str, Position]:
         with self._lock:
             return dict(self._positions)
+
+    def get_last_prices(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._last_prices)
 
     def get_pending_orders(self) -> dict[str, PendingOrder]:
         with self._lock:
