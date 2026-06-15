@@ -466,17 +466,6 @@ return json.dumps({
 
 이후 AI가 에러 응답을 받고 즉시 `expr` 타입으로 재시도하는 패턴이 정착됐다.
 
----
-
-## 주요 설계 결정
-
-| 결정 | 이유 |
-|------|------|
-| **EventDetector 10초 폴링** | RSI·볼린저 등 기술 지표는 수십 개 캔들 기반 → WebSocket 틱 1개로 계산 불가. Redis에서 최신 상태를 읽고 IndicatorCache와 조합하는 구조가 최적 |
-| **asyncio.Queue (내부 큐)** | 이벤트 빈도 하루 수십 건, 영속성 불필요 → Redis Pub/Sub 등 외부 브로커 과잉. in-process 큐가 충분하고 배포 복잡도가 낮음 |
-| **simpleeval** | AI가 작성한 임의 Python 수식을 `eval()` 대신 안전하게 실행. 허용 함수와 연산자를 화이트리스트로 제한 |
-| **routers/state.py** | FastAPI 라우터 분리 시 순환 임포트 발생 → 공유 상태를 단방향 단일 모듈로 격리. 라우터는 `state`만 import, `fastapi_app.py`가 lifespan에서 값을 주입 |
-| **런타임 모드 변경 차단** | `KISAuth.base_url`, WebSocket TR ID 등 초기화 시 고정 → 런타임 전환 시 일부만 바뀌어 paper 주문이 live DB에 기록되는 오작동 방지 |
 
 ---
 
