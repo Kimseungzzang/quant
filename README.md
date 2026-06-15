@@ -87,19 +87,31 @@ Jarvis:       LLM → get_price / place_order / set_watch 툴 → KIS API / Redi
 
 ### Tool-Use 반복 루프
 
+LLM 응답은 두 가지 중 하나다:
+
+| `stop_reason` | `content` | 루프 동작 |
+|--------------|-----------|-----------|
+| `"tool_use"` | `ToolUseBlock` (name, input) | 툴 실행 → 결과를 messages에 추가 → LLM 재호출 |
+| `"end_turn"` | `TextBlock` (text) | 루프 종료 → 사용자에게 텍스트 반환 |
+
 ```python
 # ai/provider.py
 while True:
     response = llm.call(messages, tools=TOOL_DEFINITIONS)
+    # response.content = [TextBlock | ToolUseBlock, ...]
+    # response.stop_reason = "tool_use" | "end_turn"
 
     if response.stop_reason == "end_turn":
-        break  # 텍스트 응답 → 루프 종료
+        break  # 최종 텍스트 응답 → 루프 종료
 
-    for tool_use in response.tool_uses:
+    for tool_use in response.tool_uses:           # ToolUseBlock: name, input
         result = await executor.execute(tool_use.name, tool_use.input)
         messages.append({"role": "tool", "content": result})
     # tool_result를 context에 추가하고 다시 LLM 호출
 ```
+
+한 번의 사용자 메시지에 툴이 여러 번 호출될 수 있다.  
+`stop_reason == "end_turn"`이 올 때까지 LLM → 툴 → LLM 사이클이 반복된다.
 
 ---
 
