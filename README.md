@@ -204,23 +204,43 @@ AIAgent.handle_event(event)
 
 ### 전체 흐름
 
+사용자가 "오늘 시장 분석하고 매매 계획 세워줘"라고 하면,  
+AI가 스스로 종목을 고르고 watch 조건을 결정한다.
+
 ```
-사용자: "NVDA 과매도 구간 진입하면 알려줘"
+사용자: "오늘 시장 분석하고 매매 계획 세워줘"
     ↓
-AI: get_indicators("NVDA") 호출
-    → RSI 51, bb_pct 0.38, avg_volume 2,140,000
+AI: search_web("나스닥 시황 2026-06-15")
+    → 반도체 섹터 강세, FOMC 대기 심리
     ↓
-AI: set_watch("NVDA", formula="rsi < 30 and bb_pct < 0.1 and volume > avg_volume * 1.5") 호출
-    → Redis ai:watches에 저장
+AI: screen_candidates(strategy="all", top_n=20)
+    → 거래량 상위 20종목 + 일봉 RSI/MA/MACD 필터
+    → 후보 압축: NVDA (RSI 44, 20일선 위), MSFT (RSI 38, 눌림목)
+    ↓
+AI: get_portfolio()
+    → 현금 $12,400 보유, 포지션 없음
+    ↓
+AI: save_plan(candidates=["NVDA","MSFT"], strategy="스윙 진입 대기")
+    ↓
+AI: get_indicators("NVDA")  ← set_watch 전 현재 지표 반드시 확인
+    → RSI 44, bb_pct 0.32, avg_volume 2,140,000
+AI: set_watch("NVDA", formula="rsi < 35 and bb_pct < 0.2 and volume > avg_volume * 1.3")
+
+AI: get_indicators("MSFT")
+    → RSI 38, bb_pct 0.18, avg_volume 890,000
+AI: set_watch("MSFT", formula="rsi < 35 and ma20 > ma60 and volume > avg_volume * 1.5")
     ↓
 EventDetector: 10초마다 Redis 폴링
-    ├── KIS WebSocket → Redis에서 NVDA 현재가·거래량 읽기
+    ├── KIS WebSocket → Redis에서 현재가·거래량 읽기
     └── IndicatorCache에서 RSI·볼린저 읽기 (5분봉, 5분마다 갱신)
     ↓ 조건 충족 시
 MarketEvent 발생 → AI handle_event()
     → get_price, get_portfolio 툴 호출
     → place_order("NVDA", "BUY") 또는 save_memo("관망")
 ```
+
+사람이 개별 종목을 지정하는 것이 아니라,  
+**AI가 스크리닝 → 후보 선정 → 전략 수립 → watch 조건 결정까지 자율적으로 수행**한다.
 
 ---
 
