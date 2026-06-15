@@ -205,7 +205,15 @@ AIAgent.handle_event(event)
 
 모든 툴은 `json.dumps({...})` 형태의 문자열을 반환한다. 에러도 예외 없이 JSON으로 반환해 LLM이 읽고 판단할 수 있게 한다.
 
-**에러 공통 포맷 — instruction/example 포함으로 AI 자기수정 유도:**
+**공통 구조 — 3가지 패턴:**
+
+| 패턴 | 필드 | 해당 툴 |
+|------|------|---------|
+| 데이터 조회 | `stock_code`, `data`, `market` 등 페이로드 직접 반환 | `get_price`, `get_portfolio`, `get_indicators`, `screen_candidates`, `get_candles` |
+| 액션 완료 | `"status": "...완료"` + 부가 정보 | `place_order`, `set_watch`, `save_plan`, `save_memo`, `clear_watch` |
+| 에러 | `"error"` + `"instruction"` + `"example"` | 모든 툴 공통 |
+
+**에러 포맷 — instruction/example로 AI 자기수정 유도:**
 ```json
 {
   "error": "price_change 타입은 사용 불가",
