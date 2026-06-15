@@ -197,6 +197,114 @@ AIAgent.handle_event(event)
 
 ---
 
+## AI가 직접 Watch 조건을 설정하는 방식
+
+이 시스템의 핵심 차별점은 AI가 **감시 조건을 직접 작성하고 등록한다**는 것이다.  
+사람이 하드코딩한 임계값이 아니라, LLM이 현재 시장 상황을 보고 판단해 조건을 만든다.
+
+### 전체 흐름
+
+```
+사용자: "NVDA 과매도 구간 진입하면 알려줘"
+    ↓
+AI: get_indicators("NVDA") 호출
+    → RSI 51, bb_pct 0.38, avg_volume 2,140,000
+    ↓
+AI: set_watch("NVDA", formula="rsi < 30 and bb_pct < 0.1 and volume > avg_volume * 1.5") 호출
+    → Redis ai:watches에 저장
+    ↓
+EventDetector: 10초마다 Redis 폴링
+    ├── KIS WebSocket → Redis에서 NVDA 현재가·거래량 읽기
+    └── IndicatorCache에서 RSI·볼린저 읽기 (5분봉, 5분마다 갱신)
+    ↓ 조건 충족 시
+MarketEvent 발생 → AI handle_event()
+    → get_price, get_portfolio 툴 호출
+    → place_order("NVDA", "BUY") 또는 save_memo("관망")
+```
+
+---
+
+### expr 수식 — AI가 작성하는 Python 불리언 식
+
+AI는 `formula` 필드에 Python 불리언 수식을 자유롭게 작성한다.  
+수식은 10초마다 `simpleeval`로 안전하게 평가된다.
+
+**사용 가능한 변수:**
+
+| 변수 | 출처 | 갱신 주기 |
+|------|------|-----------|
+| `price` | KIS WebSocket → Redis | 틱마다 (거의 실시간) |
+| `volume` | KIS WebSocket → Redis | 틱마다 |
+| `change_pct` | baseline_price 대비 등락률 | 틱마다 |
+| `rsi` | IndicatorCache (5분봉 14기간) | 5분 |
+| `macd` | IndicatorCache (EMA12−EMA26) | 5분 |
+| `ma5` / `ma10` / `ma20` / `ma60` | IndicatorCache | 5분 |
+| `bb_pct` | IndicatorCache (볼린저 %B, 0~1) | 5분 |
+| `bb_upper` / `bb_lower` | IndicatorCache (볼린저 상·하단) | 5분 |
+| `stoch_k` / `stoch_d` | IndicatorCache (스토캐스틱 14기간) | 5분 |
+| `avg_volume` | IndicatorCache (20봉 평균 거래량) | 5분 |
+
+**AI가 실제로 등록하는 조건 예시:**
+
+```python
+# 과매도 진입 (단타)
+"rsi < 30 and bb_pct < 0.15 and change_pct < -2"
+
+# 스윙 진입
+"rsi < 40 and ma20 > ma60 and volume > avg_volume * 1.3"
+
+# 돌파 + 거래량 급증
+"price > ma20 * 1.01 and volume > avg_volume * 2.0 and rsi < 65"
+
+# 손절 (보유 후 자동 청산용)
+"change_pct < -5 or (rsi > 75 and bb_pct > 0.95)"
+```
+
+---
+
+### IndicatorCache — 지표 계산 파이프라인
+
+EventDetector가 10초마다 조건을 평가할 때, 기술 지표는 **IndicatorCache**에서 읽는다.
+
+```
+KIS REST API
+    ↓ 5분봉 OHLCV 조회 (lookback 1일, 5분 캔들)
+IndicatorCache._update()
+    ↓ pandas_ta로 RSI / MACD / 볼린저 / 스토캐스틱 계산
+Redis ai:indicators:{stock_code}  (TTL 30분)
+    ↑ 읽기
+EventDetector._eval_expr()
+    ↓ simpleeval로 수식 평가
+```
+
+- 첫 등록 시: 1일치 5분봉 전체 로드 → 최대 500개 캔들 보관
+- 이후: 5분마다 증분 fetch → 새 캔들만 append
+- 감시 종목이 추가되면 다음 갱신 주기(5분)에 자동으로 캐시 생성
+
+---
+
+### 조건 충족 후 AI의 자율 판단
+
+watch 조건이 충족되면 AI에게 이벤트가 전달되고, AI는 툴을 사용해 스스로 판단한다.  
+사전에 정의된 규칙이 아니라 **그 시점의 시장 상황을 보고 매번 새롭게 결정**한다.
+
+```python
+# ai/agent.py — handle_event
+async def handle_event(self, event: MarketEvent):
+    # 이벤트 내용 + 오늘 계획 + 최근 결정 → LLM에게 전달
+    response = await self._provider.chat(messages=[
+        {"role": "user", "content": build_event_prompt(event, today_plan, recent_decisions)}
+    ], tools=TOOL_DEFINITIONS)
+
+    # LLM이 툴을 호출하며 스스로 판단
+    # → get_price, get_portfolio, place_order 또는 save_memo("관망")
+```
+
+같은 조건이 충족되더라도 포트폴리오 상태, 당일 손익, 뉴스 컨텍스트에 따라  
+AI가 매수 / 관망 / 손절 중 다른 결정을 내릴 수 있다.
+
+---
+
 ## 트러블슈팅 & 성과 (A → B → C 패턴)
 
 > AI에게 툴을 줬을 때 실제로 발생한 문제들.  
