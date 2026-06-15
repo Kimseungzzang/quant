@@ -199,147 +199,138 @@ AIAgent.handle_event(event)
 
 ## 트러블슈팅 & 성과 (A → B → C 패턴)
 
-### 1. 손절·익절이 전혀 작동하지 않는 문제
-
-**A — 문제**  
-포지션 보유 중 5% 이상 손실이 나도 자동 청산이 일어나지 않았다.  
-WebSocket 틱은 정상 수신 중이었고 로그에도 에러가 없었다.
-
-**B — 원인**  
-WebSocket 가격 콜백 `on_domestic_price`에서 `order_mgr.record_price(code, price)` 를 호출하고 있었다.  
-`record_price`는 내부 가격 dict만 갱신하는 메서드다.  
-손절·익절 평가는 `on_price_update(code, price, signal)` 에 들어 있었는데,  
-두 메서드가 이름이 비슷해 잘못된 것을 호출하고 있었다.
-
-**C — 해결 및 결과**  
-모든 WebSocket 가격 콜백에서 `record_price` → `on_price_update`로 교체.  
-이후 paper 모드에서 손절 -5% 조건이 틱 수신 즉시 트리거되는 것을 확인했다.
+> AI에게 툴을 줬을 때 실제로 발생한 문제들.  
+> LLM이 툴을 어떻게 잘못 사용하는지, 그걸 어떻게 시스템 레벨에서 막았는지를 중심으로 기록한다.
 
 ---
 
-### 2. 감시 종목 11개 중 6개의 기술 지표 캐시가 항상 비어 있는 문제
+### 1. AI가 watch 조건을 설정하고도 절대 트리거되지 않는 문제
 
 **A — 문제**  
-`get_indicators` 툴이 일부 종목에서 `{}` 빈 딕셔너리를 반환했다.  
-로그 버퍼를 조회해도 지표 계산 실패 로그가 보이지 않았다.
+AI가 `set_watch`로 감시 조건을 등록했는데, RSI가 실제로 27까지 내려가도 이벤트가 전혀 발생하지 않았다.  
+AI는 "조건을 설정했습니다"라고 응답했고 오류도 없었다.
 
 **B — 원인 (두 가지가 겹쳐 있었다)**  
-① `EventDetector`가 expr 수식 평가 실패 시 `logger.warning()`으로 기록했는데,  
-500개 항목짜리 로그 버퍼에 10초마다 감시 종목 수만큼 WARN이 쌓여  
-실제 에러(지표 계산 타임아웃)가 버퍼에서 밀려났다.  
-② `IndicatorCache._refresh_all()`에서 `run_in_executor()`에 타임아웃이 없어,  
-KIS API `ReadTimeoutError` 발생 시 해당 종목이 조용히 블로킹 상태로 남아 있었다.
+① AI가 `volume_ratio > 1.5` 조건을 watch 수식에 사용했다.  
+`volume_ratio = volume / baseline_volume` 인데, `baseline_volume`은 `set_watch` 호출 시점의 당일 누적 거래량이다.  
+다음 날 세션이 시작되면 `volume`이 0부터 다시 쌓이므로 `volume_ratio ≒ 0`이 되고,  
+조건이 항상 False가 됐다.  
+② AI가 `set_watch` 호출 전 `get_indicators`를 부르지 않고 현재 지표 상태를 확인하지 않았다.  
+RSI가 이미 68인 상태에서 `rsi < 60` 조건을 등록해, 현재 상태에서 이미 위반된 조건이 만들어졌다.
 
 **C — 해결 및 결과**  
-① expr 평가 실패 로그를 `WARNING` → `DEBUG`로 낮춰 로그 버퍼 오염 제거.  
-② `asyncio.wait_for(..., timeout=30)`를 각 종목 갱신 호출에 적용.  
-타임아웃 시 명확한 WARN 로그 출력 후 다음 5분 주기에 재시도.  
-이후 6개 종목의 지표 캐시가 다음 갱신 주기(5분) 내에 정상 채워졌다.
-
----
-
-### 3. 감시 조건이 절대 트리거되지 않는 문제
-
-**A — 문제**  
-"RSI < 30 진입 조건"을 watch로 등록했는데,  
-RSI가 실제로 27까지 내려가도 이벤트가 전혀 발생하지 않았다.
-
-**B — 원인 (구조적 문제 두 가지)**  
-① `set_watch` 시 `baseline_price`를 WebSocket Redis 캐시에서만 읽었다.  
-세션 초기이거나 해당 종목이 아직 WebSocket에 구독되지 않았으면 캐시가 없어  
-`baseline_price = 0.0`으로 저장됐다.  
-`change_pct = (price - 0) / 0 * 100` → 분모 0으로 `change_pct = 0.0`,  
-관련 조건이 항상 False였다.  
-② `volume_ratio = volume / baseline_volume` 구조적 한계.  
-`baseline_volume`은 감시 등록 시점의 당일 누적 거래량인데,  
-다음 날 세션 시작 시 `volume`이 0부터 다시 쌓이므로 `volume_ratio ≒ 0`이 됐다.
-
-**C — 해결 및 결과**  
-① `_resolve_watch_baseline`에 국내 종목 REST API 폴백 추가 —  
-WebSocket 캐시가 없으면 즉시 REST로 현재가를 조회해 `baseline_price`를 채운다.  
-② `volume_ratio`를 시스템 전체에서 금지 —  
-시스템 프롬프트와 툴 description에 `⚠️ volume_ratio 사용 금지` 경고와  
-올바른 대안(`volume > avg_volume * N`) 예시를 추가했다.  
-이후 AI가 모든 watch 조건에서 `avg_volume` 기반 패턴을 사용하게 됐다.
-
----
-
-### 4. AI가 달성 불가한 Watch 조건을 등록하는 문제
-
-**A — 문제**  
-RSI가 이미 68인 상태에서 AI가 `rsi < 60 and price > ma5` 조건을 등록했다.  
-현재 상태에서 이미 위반된 조건이라 영원히 트리거될 수 없었다.
-
-**B — 원인**  
-AI가 현재 지표 상태를 확인하지 않고 템플릿 조건을 그대로 사용했다.
-
-**C — 해결 및 결과**  
-시스템 프롬프트에 CRITICAL 검증 블록 추가:  
+① `volume_ratio`를 시스템 전체에서 금지.  
+시스템 프롬프트와 `set_watch` 툴 description에 `⚠️ volume_ratio 사용 금지` 경고와  
+올바른 대안(`volume > avg_volume * N`, 20봉 롤링 평균 대비) 예시를 명시.  
+② 시스템 프롬프트에 CRITICAL 검증 블록 추가 —  
 `set_watch` 호출 전 반드시 `get_indicators`를 먼저 호출하고,  
-현재 지표 값과 조건 방향의 정합성을 AI 스스로 검증하도록 강제.  
-이후 AI가 "현재 RSI 45 → 목표 30, 합리적 거리"처럼 근거를 명시하고 조건을 설정하게 됐다.
+현재 지표 값과 조건 방향이 정합한지 AI가 스스로 검증하도록 강제.
 
----
-
-### 5. TOCTOU 레이스 컨디션 — 동시 매수 중복 주문
-
-**A — 문제**  
-AI가 짧은 시간 내에 같은 종목에 매수 신호를 연속으로 보내면 중복 주문이 발생했다.
-
-**B — 원인**  
-`open_position`이 락 안에서 중복 체크 후 락을 해제하고 KIS API를 호출했다.  
-API 응답 대기 시간(~300ms) 동안 두 번째 호출이 중복 체크를 통과할 수 있었다 (TOCTOU).
-
-**C — 해결 및 결과**  
-API 호출 전 sentinel `PendingOrder`를 먼저 등록해 즉시 슬롯을 점유하고,  
-`finally` 블록에서 실제 주문번호로 교체하거나 실패 시 제거하는 패턴 적용.  
-이후 동시 매수 신호에 대해 두 번째 호출이 "이미 처리 중" 응답을 받고 차단됐다.
-
----
-
-### 6. Paper 모드 WebSocket 연결이 시작 직후 끊기는 문제
-
-**A — 문제**  
-paper 모드로 서버 시작 시 WebSocket이 수 초 내에 종료됐다.  
-체결 데이터도 수신되지 않았다.
-
-**B — 원인**  
-KIS paper 서버(port 31000)는 H0STCNI9(체결통보 TR) 구독을 지원하지 않아  
-구독 즉시 연결을 강제 종료했다.
-
-**C — 해결 및 결과**  
-`not self.auth.is_paper` 조건으로 paper에서 체결통보 구독 자체를 스킵.  
-대신 `_paper_fill_poll_loop`에서 30초마다 `get_daily_orders()` REST 폴링으로 체결을 감지해  
-`reconcile_order_rows()`로 포지션에 반영.  
-이후 paper 모드에서 WebSocket이 안정적으로 유지되고 체결도 정상 감지됐다.
-
----
-
-### 7. 동기 KIS API 호출이 asyncio 이벤트 루프를 블로킹하는 문제
-
-**A — 문제**  
-AI가 `get_price`, `get_portfolio` 같은 툴을 호출하는 동안  
-다른 WebSocket 수신, HTTP 요청이 모두 지연됐다.
-
-**B — 원인**  
-`tools.py`의 툴 실행 메서드들이 `requests` 라이브러리(동기 HTTP)를 사용하면서  
-`async def execute()` 안에서 직접 호출됐다.  
-동기 IO 호출은 이벤트 루프 전체를 블로킹한다.
-
-**C — 해결 및 결과**  
-`asyncio.to_thread()`로 스레드 풀에 위임해 이벤트 루프를 해방.
-
-```python
-# 수정 전 — 이벤트 루프 블로킹
-case "get_price":
-    return self._get_price(...)
-
-# 수정 후 — 스레드 풀에서 실행
-case "get_price":
-    return await asyncio.to_thread(self._get_price, ...)
+```
+# 수정 후 AI 동작
+set_watch 전: get_indicators("NVDA") 호출
+→ 현재 RSI 45, bb_pct 0.22, avg_volume 1,240,000
+→ "rsi < 30 and bb_pct < 0.1 and volume > avg_volume * 1.5" 등록
+→ 현재 RSI 45 → 목표 30, 달성 가능한 방향 확인 후 등록
 ```
 
-이후 AI 툴 호출 중에도 WebSocket 틱 수신이 끊기지 않았다.
+---
+
+### 2. AI가 툴을 호출하지 않고 JSON을 텍스트로 출력하는 문제
+
+**A — 문제**  
+AI가 watch 조건을 설정하거나 주문을 실행해야 하는 상황에서  
+실제 툴을 호출하는 대신 "이렇게 설정하면 됩니다: `{"name": "set_watch", ...}`" 식으로  
+raw JSON을 텍스트 응답에 포함시키는 경우가 발생했다.  
+채팅창에 JSON이 그대로 노출되고, 실제 감시 등록과 주문은 이뤄지지 않았다.
+
+**B — 원인**  
+LLM이 특정 패턴의 입력에서 "도구 사용 방법을 설명하는" 텍스트 모드로 전환됐다.  
+모델이 tool_use 블록 대신 텍스트로 응답을 완료해 루프가 종료됐다.
+
+**C — 해결 및 결과**  
+① `_looks_like_raw_tool_output()` — 응답 텍스트에 JSON 마커(`{`, `"name":`, `"formula":` 등) 감지.  
+② 감지 시 "JSON을 포함하지 말고 툴을 실제로 호출하라"는 retry prompt를 삽입해 LLM을 재호출.  
+③ 계획 수립 요청(`save_plan`, `set_watch` 등) 완료 후 필수 툴 누락 시,  
+`_retry_missing_plan_tools()`에서 시스템이 직접 해당 툴을 실행하는 fallback 추가.
+
+---
+
+### 3. AI가 재무 데이터를 환각(hallucination)으로 지어내는 문제
+
+**A — 문제**  
+"현재 잔고 얼마야?"라는 질문에 AI가 `get_portfolio` 툴을 호출하지 않고  
+"현재 잔고는 약 5,230,000원입니다"처럼 숫자를 임의로 생성해 답했다.  
+실제 잔고와 전혀 다른 수치였다.
+
+**B — 원인**  
+LLM은 non-deterministic하고, 학습 데이터에서 유사한 숫자 패턴을 생성할 수 있다.  
+Tool-Use 루프에서 툴을 호출하지 않아도 텍스트 응답으로 루프가 종료되면  
+시스템은 그 응답을 그대로 사용자에게 전달했다.
+
+**C — 해결 및 결과**  
+`agent.py`에서 재무 관련 키워드를 감지하고, 해당 툴 호출 여부를 확인 후 미호출 시 강제 재시도.
+
+```python
+def _requires_data_tool(self, user_input: str) -> str | None:
+    if any(k in user_input for k in ("잔고", "포지션", "보유")):
+        return "get_portfolio"
+    if any(k in user_input for k in ("현재가", "주가", "얼마")):
+        return "get_price"
+    return None
+
+# 재시도 prompt
+"get_portfolio를 먼저 호출하지 않고 잔고를 답했습니다. 반드시 툴을 호출하세요."
+```
+
+시스템 프롬프트에도 명시: "재무 수치는 반드시 툴 결과에서만 가져올 것. 수치를 지어내는 것은 엄격히 금지."
+
+---
+
+### 4. AI가 계획만 수립하고 set_watch를 빠뜨리는 문제
+
+**A — 문제**  
+모닝 브리핑 후 AI가 "삼성전자 RSI 과매도 구간 진입 시 매수 진행하겠습니다"라고 응답했지만  
+실제 `set_watch` 호출 없이 텍스트 응답으로 루프를 종료했다.  
+EventDetector에 감시 조건이 등록되지 않았으므로, 실제 조건이 충족돼도 알림이 오지 않았다.
+
+**B — 원인**  
+LLM이 "계획을 텍스트로 설명하는 것"과 "툴을 호출해 실제로 실행하는 것"을 혼동했다.  
+`save_plan`으로 계획을 저장한 뒤 루프를 종료하는 패턴이 반복됐다.
+
+**C — 해결 및 결과**  
+`agent.py`의 `_retry_missing_plan_tools()` — 계획 수립 응답 후 `set_watch` 누락 시  
+"계획에 감시 조건이 언급됐으나 set_watch가 호출되지 않았습니다. 지금 바로 등록하세요"  
+retry prompt를 삽입해 툴 호출을 강제.  
+시스템 프롬프트에도 명시: "WAIT_FOR_TRIGGER 전략 선택 시 set_watch 호출은 선택이 아니라 필수."
+
+---
+
+### 5. AI가 금지된 watch 조건 타입을 사용하려는 문제
+
+**A — 문제**  
+AI가 `set_watch` 툴을 호출할 때 `type: "price_change"`, `type: "volume_spike"` 같은  
+타입을 사용했다. 서버가 이 타입들을 거부하면서 감시 등록이 실패했다.
+
+**B — 원인**  
+툴 스키마에 허용 타입 목록이 있었지만 LLM이 학습 데이터의 패턴을 따라  
+더 직관적으로 보이는 타입명을 사용하려 했다.  
+`price_change: 5%` 같은 표현이 자연어로는 더 명확해 보이기 때문이다.
+
+**C — 해결 및 결과**  
+툴 description과 시스템 프롬프트를 강화해 `expr` 타입만 허용임을 명시하고,  
+서버 에러 응답에도 올바른 예시를 포함시켜 AI가 즉시 수정할 수 있게 했다.
+
+```python
+# 에러 응답 — AI가 읽고 바로 수정 가능한 구조
+return json.dumps({
+    "error": "price_change 타입은 사용 불가. 서버에서 거부됨.",
+    "instruction": "expr 타입을 사용하고 formula 필드에 파이썬 불리언 식을 작성하세요.",
+    "example": "rsi < 30 and bb_pct < 0.15 and change_pct < -2"
+})
+```
+
+이후 AI가 에러 응답을 받고 즉시 `expr` 타입으로 재시도하는 패턴이 정착됐다.
 
 ---
 
