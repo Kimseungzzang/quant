@@ -40,8 +40,9 @@
 │     Queue에서 이벤트 꺼내기
 │     → AI Agent.handle_event() 호출 → 자율 매매 판단
 │
-└── [Task] FastAPI HTTP / WebSocket
-      사용자 요청이 오면 깨어나 AI Agent.chat() 호출
+└── [Task] FastAPI
+      HTTP  POST /ai/chat → Agent.chat() 호출
+      WebSocket /ws/stream → Electron 앱에 실시간 가격·알림 push
 ```
 
 사용자가 자리를 비워도 WebSocket 수신·지표 갱신·조건 평가가 계속 돌아간다.  
@@ -197,6 +198,88 @@ AIAgent.handle_event(event)
 | `save_plan` / `save_memo` | 전략·판단 기록 (PostgreSQL) |
 | `get_history` / `get_chat_history` | 매매·대화 이력 조회 |
 | `get_system_status` / `get_logs` | 서버·Redis 상태 / 로그 조회 (자가 진단) |
+
+---
+
+### 툴 반환 형식
+
+모든 툴은 `json.dumps({...})` 형태의 문자열을 반환한다. 에러도 예외 없이 JSON으로 반환해 LLM이 읽고 판단할 수 있게 한다.
+
+**에러 공통 포맷 — instruction/example 포함으로 AI 자기수정 유도:**
+```json
+{
+  "error": "price_change 타입은 사용 불가",
+  "instruction": "expr 타입을 사용하고 formula에 파이썬 식을 작성하세요",
+  "example": "rsi < 30 and bb_pct < 0.15"
+}
+```
+
+**`screen_candidates` — 스크리닝 결과:**
+```json
+{
+  "strategy": "all", "screened": 20, "filtered": 5,
+  "candidates": [
+    { "code": "NVDA", "name": "NVIDIA", "price": "135.24",
+      "rsi_daily": 44.1, "ma20_daily": 128.0, "ma60_daily": 115.0,
+      "macd_daily": 3.21, "bb_pct_daily": 0.612, "trend": "상승" }
+  ]
+}
+```
+
+**`get_indicators` — 5분봉+일봉 지표 분리 + 전략 힌트:**
+```json
+{
+  "stock_code": "NVDA",
+  "intraday_indicators": {
+    "RSI(14) [5분봉]": 44.2, "볼린저 %B [5분봉]": 0.32,
+    "MA20 [5분봉]": 135.1, "평균거래량 [5분봉]": 1240000
+  },
+  "daily_indicators": {
+    "RSI(14) [일봉]": 52.1, "MA20 [일봉]": 128.0, "MA60 [일봉]": 115.0
+  },
+  "signals": ["일봉 MA20 > MA60 → 중기 상승 추세"],
+  "strategy_hint": ["일봉 추세 양호 — 스윙 or 장기 보유 전략 적합"]
+}
+```
+
+**`set_watch` — WebSocket 구독 성공 여부 포함:**
+```json
+{
+  "status": "감시 설정 완료",
+  "stock_code": "NVDA", "market": "overseas",
+  "baseline_price": 135.24, "baseline_volume": 2140000,
+  "ws_subscribed": true,
+  "ws_status": "WebSocket 실시간 구독 성공",
+  "conditions": [{"type": "expr", "formula": "rsi < 35 and bb_pct < 0.2 and volume > avg_volume * 1.3"}]
+}
+```
+
+**`place_order` — 실패 시 failure_reason 포함:**
+```json
+{
+  "status": "주문 요청 완료",
+  "side": "BUY", "stock_code": "NVDA",
+  "requested_quantity": 5, "order_price": 135.24,
+  "result": true,
+  "failure_reason": null,
+  "pending_orders": [...]
+}
+```
+
+**`get_portfolio` — 포지션 + 계좌 잔고:**
+```json
+{
+  "positions": [
+    { "stock_code": "005930", "stock_name": "삼성전자",
+      "quantity": 10, "avg_price": 70000, "current_price": 72000,
+      "pnl": 20000, "pnl_pct": 2.857 }
+  ],
+  "balance": {
+    "domestic": { "cash": 1000000, "totalAssets": 5000000 },
+    "overseas": { "cash": 12400.0, "totalAssets": 12400.0 }
+  }
+}
+```
 
 ---
 
