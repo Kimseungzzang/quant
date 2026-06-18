@@ -205,7 +205,12 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "save_plan",
-        "description": "오늘의 시장 전망과 매매 전략을 저장합니다. 아침 브리핑 시 사용. 기존 watches와 indicator 캐시를 전부 초기화하고 새 계획으로 시작합니다.",
+        "description": (
+            "오늘의 시장 전망과 매매 전략을 저장합니다. "
+            "반드시 하루 1회, 장 시작 전 브리핑 시점(첫 대화)에만 호출하세요. "
+            "주문 후 상태 저장, 종목 분석 중간 저장 등에는 절대 사용하지 마세요 — 그럴 때는 save_memo를 쓰세요. "
+            "이 툴은 기존 watches를 전부 초기화하므로 잘못 호출하면 감시 목록이 날아갑니다."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1121,11 +1126,9 @@ class ToolExecutor:
             "stock_code": stock_code,
             "market": market,
             "baseline_price": baseline_price,
-            "baseline_volume": baseline_volume,
-            "exchange": exchange,
             "ws_subscribed": ws_subscribed,
             "ws_status": ws_status,
-            "conditions": inp["conditions"],
+            "conditions_count": len(inp["conditions"]),
         }, ensure_ascii=False)
 
     async def _prefill_indicator_cache(self, stock_code: str, market: str, exchange: str | None) -> None:
