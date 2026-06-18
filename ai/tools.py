@@ -282,8 +282,9 @@ TOOL_DEFINITIONS = [
     {
         "name": "set_watch",
         "description": (
-            "특정 종목에 대한 감시 조건을 설정합니다. 조건 충족 시 AI가 다시 호출됩니다. "
-            "매수 후 손절/익절 조건 설정, 주목 종목 모니터링 등에 사용하세요."
+            "특정 종목에 대한 감시 조건을 설정하거나 기존 조건을 덮어씁니다. 조건 충족 시 AI가 다시 호출됩니다. "
+            "매수 후 손절/익절 조건 설정, 주목 종목 모니터링, 보유 중인 종목의 조건 갱신 모두 이 툴을 사용하세요. "
+            "같은 종목을 다시 호출하면 조건이 교체됩니다."
         ),
         "input_schema": {
             "type": "object",
@@ -1065,6 +1066,7 @@ class ToolExecutor:
                 "instruction": "현재 KRX 정규장이 아니므로 해외/미국 후보를 선택하거나 국내장은 장 시작 전 전용 계획으로만 다루세요.",
             }, ensure_ascii=False)
         cleared = self._reset_watches()
+        held_watches = [c for c in self._load_watches()]
         session_id = await self._memory.save_plan(
             market_outlook=inp["market_outlook"],
             watch_stocks=inp["watch_stocks"],
@@ -1074,6 +1076,7 @@ class ToolExecutor:
             "status": "계획 저장 완료",
             "session_id": session_id,
             "watches_cleared": cleared,
+            "watches_retained": held_watches,
         }, ensure_ascii=False)
 
     async def _save_memo(self, content: str) -> str:
@@ -1275,17 +1278,21 @@ class ToolExecutor:
             return False
 
     def _reset_watches(self) -> list[str]:
-        """기존 watches 전체 삭제 + 관련 indicator 캐시 삭제. 삭제된 종목 코드 반환."""
+        """포지션 없는 watches만 삭제. 보유 종목 watches는 유지. 삭제된 종목 코드 반환."""
         if not self._r:
             return []
         watches = self._load_watches()
-        codes = list(watches.keys())
-        if codes:
-            self._r.delete(_WATCHES_KEY)
-            keys_to_del = [f"ai:indicators:{c}" for c in codes]
+        if not watches:
+            return []
+        held_codes = {p["stock_code"] for p in self._account.get_positions()}
+        to_delete = [c for c in watches if c not in held_codes]
+        to_keep = {c: w for c, w in watches.items() if c in held_codes}
+        if to_delete:
+            self._r.set(_WATCHES_KEY, json.dumps(to_keep, ensure_ascii=False))
+            keys_to_del = [f"ai:indicators:{c}" for c in to_delete]
             self._r.delete(*keys_to_del)
-            logger.info("watches 초기화: %s", codes)
-        return codes
+            logger.info("watches 초기화 (보유 종목 제외): 삭제=%s 유지=%s", to_delete, list(held_codes))
+        return to_delete
 
     def _clear_watch(self, stock_code: str) -> str:
         if not self._r:
