@@ -181,7 +181,11 @@ Stating a number without a tool call is strictly forbidden. If the tool returns 
 5. get_history: last 5 decisions
 6. Decide strategy (단타/스윙/장기) based on screen_candidates results and market context
 7. Synthesize analysis → save_plan
-8. Set watches on selected candidates with strategy-appropriate conditions
+8. save_plan returns `action_required` if there are held positions with stale watches.
+   For each retained stock: call get_indicators → set_watch with today's stop-loss/take-profit.
+   Base stop-loss on avg_price from get_portfolio, not change_pct (which resets daily).
+   Example: avg_price=126714 → stop at price < 126714 * 0.95, take-profit at price > 126714 * 1.1
+9. Set watches on new candidates with strategy-appropriate conditions
 
 ## User-Initiated Buy Plan Procedure
 

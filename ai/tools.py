@@ -1066,18 +1066,23 @@ class ToolExecutor:
                 "instruction": "현재 KRX 정규장이 아니므로 해외/미국 후보를 선택하거나 국내장은 장 시작 전 전용 계획으로만 다루세요.",
             }, ensure_ascii=False)
         cleared = self._reset_watches()
-        held_watches = [c for c in self._load_watches()]
+        retained_watches = list(self._load_watches().keys())
         session_id = await self._memory.save_plan(
             market_outlook=inp["market_outlook"],
             watch_stocks=inp["watch_stocks"],
             strategy=inp["strategy"],
         )
-        return json.dumps({
+        result: dict = {
             "status": "계획 저장 완료",
             "session_id": session_id,
             "watches_cleared": cleared,
-            "watches_retained": held_watches,
-        }, ensure_ascii=False)
+        }
+        if retained_watches:
+            result["action_required"] = (
+                f"보유 종목 {retained_watches}의 watch 조건이 어제 기준으로 남아 있습니다. "
+                "각 종목에 대해 get_indicators → set_watch를 호출해 오늘 기준으로 갱신하세요."
+            )
+        return json.dumps(result, ensure_ascii=False)
 
     async def _save_memo(self, content: str) -> str:
         await self._memory.save_memo(content)
