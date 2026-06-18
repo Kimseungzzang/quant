@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime, time as dtime
@@ -204,7 +205,7 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "save_plan",
-        "description": "오늘의 시장 전망과 매매 전략을 저장합니다. 아침 브리핑 시 사용.",
+        "description": "오늘의 시장 전망과 매매 전략을 저장합니다. 아침 브리핑 시 사용. 기존 watches와 indicator 캐시를 전부 초기화하고 새 계획으로 시작합니다.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -372,6 +373,7 @@ class ToolExecutor:
         overseas_api: Any = None,
         config: dict | None = None,
         regime_fn: Any = None,
+        indicator_cache: Any = None,
     ):
         self._market = market_data
         self._account = account
@@ -382,6 +384,7 @@ class ToolExecutor:
         self._domestic = domestic_api
         self._overseas = overseas_api
         self._config = config or {}
+        self._indicator_cache = indicator_cache
         self._regime_fn = regime_fn
         self._overseas_exchange_by_code = self._build_overseas_exchange_map(self._config)
         self.executed_tools: list[str] = []
@@ -1056,12 +1059,17 @@ class ToolExecutor:
                 "blocked_symbols": blocked,
                 "instruction": "현재 KRX 정규장이 아니므로 해외/미국 후보를 선택하거나 국내장은 장 시작 전 전용 계획으로만 다루세요.",
             }, ensure_ascii=False)
+        cleared = self._reset_watches()
         session_id = await self._memory.save_plan(
             market_outlook=inp["market_outlook"],
             watch_stocks=inp["watch_stocks"],
             strategy=inp["strategy"],
         )
-        return json.dumps({"status": "계획 저장 완료", "session_id": session_id}, ensure_ascii=False)
+        return json.dumps({
+            "status": "계획 저장 완료",
+            "session_id": session_id,
+            "watches_cleared": cleared,
+        }, ensure_ascii=False)
 
     async def _save_memo(self, content: str) -> str:
         await self._memory.save_memo(content)
@@ -1106,6 +1114,7 @@ class ToolExecutor:
             stock_code, inp["stock_name"], market, exchange,
             baseline_price, baseline_volume, inp["conditions"],
         )
+        await self._prefill_indicator_cache(stock_code, market, inp.get("exchange"))
         ws_status = "WebSocket 실시간 구독 성공" if ws_subscribed else "WebSocket 구독 실패 — 실시간 가격 수신 불가, 감시 조건이 평가되지 않습니다"
         return json.dumps({
             "status": "감시 설정 완료",
@@ -1118,6 +1127,24 @@ class ToolExecutor:
             "ws_status": ws_status,
             "conditions": inp["conditions"],
         }, ensure_ascii=False)
+
+    async def _prefill_indicator_cache(self, stock_code: str, market: str, exchange: str | None) -> None:
+        if not self._indicator_cache:
+            return
+        loop = asyncio.get_event_loop()
+        try:
+            indicators = await loop.run_in_executor(
+                None, self._indicator_cache._update, stock_code, market, exchange
+            )
+            if indicators:
+                self._r.set(
+                    f"ai:indicators:{stock_code}",
+                    json.dumps(indicators, ensure_ascii=False),
+                    ex=1800,
+                )
+                logger.info("watch 등록 즉시 지표 채움: %s", stock_code)
+        except Exception:
+            logger.warning("watch 등록 즉시 지표 채움 실패: %s", stock_code, exc_info=True)
 
     def _validate_watch_conditions(self, conditions: list) -> str | None:
         """허용되지 않는 조건 타입이 있으면 에러 JSON 반환, 없으면 None."""
@@ -1243,6 +1270,19 @@ class ToolExecutor:
         except Exception:
             logger.exception("감시 종목 동적 구독 실패: %s", stock_code)
             return False
+
+    def _reset_watches(self) -> list[str]:
+        """기존 watches 전체 삭제 + 관련 indicator 캐시 삭제. 삭제된 종목 코드 반환."""
+        if not self._r:
+            return []
+        watches = self._load_watches()
+        codes = list(watches.keys())
+        if codes:
+            self._r.delete(_WATCHES_KEY)
+            keys_to_del = [f"ai:indicators:{c}" for c in codes]
+            self._r.delete(*keys_to_del)
+            logger.info("watches 초기화: %s", codes)
+        return codes
 
     def _clear_watch(self, stock_code: str) -> str:
         if not self._r:

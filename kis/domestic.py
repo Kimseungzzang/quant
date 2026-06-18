@@ -2,9 +2,9 @@ import logging
 import pickle
 import time
 from datetime import date, datetime, timedelta
-from pathlib import Path
 
 import pandas as pd
+import redis as redispy
 
 from .rest import KISRestClient
 from .constants import (
@@ -12,15 +12,17 @@ from .constants import (
     MarketCode, OrderDivision, PeriodCode,
 )
 
-_CACHE_DIR = Path("data/cache")
+_CANDLE_CACHE_PREFIX = "kis:candles:1min:"
+_CANDLE_CACHE_TTL = 86400  # 1일
 
 logger = logging.getLogger(__name__)
 
 
 class DomesticAPI:
-    def __init__(self, client: KISRestClient, config: dict):
+    def __init__(self, client: KISRestClient, config: dict, redis_client: redispy.Redis | None = None):
         self.client = client
         self.is_paper = config["mode"] in ("paper", "mock")
+        self._r = redis_client
         kis = config["kis"]
         if self.is_paper:
             self.account_no   = kis.get("paper_account_no") or kis.get("account_no", "")
@@ -130,33 +132,21 @@ class DomesticAPI:
         candle_minutes: int = 15,
         market: MarketCode = MarketCode.KRX,
     ) -> pd.DataFrame:
-        """
-        과거 분봉 데이터 수집 후 N분봉으로 집계.
-        캐시(data/cache/)를 사용해 당일 재호출 시 빠르게 반환.
-        """
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_file = _CACHE_DIR / f"{stock_code}_1min.pkl"
-
-        # ── 캐시 로드 ──────────────────────────────────────────────
-        cached_df = self._load_cache(cache_file)
+        """과거 분봉 데이터 수집 후 N분봉으로 집계. Redis 캐시 사용."""
+        cached_df = self._load_candle_cache(stock_code)
         if cached_df is not None and not cached_df.empty:
             cutoff = date.today() - timedelta(days=lookback_days)
             if cached_df["datetime"].dt.date.min() <= cutoff:
-                # 오늘치만 업데이트
                 last_dt = cached_df["datetime"].max()
                 try:
-                    new_df = self._fetch_minute_range(
-                        stock_code, market,
-                        from_date=last_dt.date(),
-                        from_hour=last_dt.strftime("%H%M%S"),
-                    )
+                    new_df = self._fetch_minute_range(stock_code, market, start_date=last_dt.date())
                 except Exception as e:
                     logger.warning("[%s] 분봉 캐시 업데이트 실패 → 기존 캐시 사용: %s", stock_code, e)
                     new_df = pd.DataFrame()
                 if not new_df.empty:
                     combined = pd.concat([cached_df, new_df]).drop_duplicates("datetime")
                     combined = combined.sort_values("datetime").reset_index(drop=True)
-                    self._save_cache(cache_file, combined)
+                    self._save_candle_cache(stock_code, combined)
                     cached_df = combined
 
                 cutoff_dt = pd.Timestamp(date.today() - timedelta(days=lookback_days))
@@ -165,15 +155,14 @@ class DomesticAPI:
 
         # ── 전체 수집 ──────────────────────────────────────────────
         logger.info("[%s] 과거 %d일 분봉 수집 시작 (캐시 없음)...", stock_code, lookback_days)
-        end_date = date.today()
-        start_date = end_date - timedelta(days=lookback_days)
+        start_date = date.today() - timedelta(days=lookback_days)
         try:
             df = self._fetch_minute_range(stock_code, market, start_date=start_date)
         except Exception as e:
-            logger.warning("[%s] 분봉 수집 실패 → 일봉 fallback 사용: %s", stock_code, e)
+            logger.warning("[%s] 분봉 수집 실패: %s", stock_code, e)
             return pd.DataFrame()
         if not df.empty:
-            self._save_cache(cache_file, df)
+            self._save_candle_cache(stock_code, df)
         return self._aggregate(df, candle_minutes)
 
     def _fetch_minute_range(
@@ -228,6 +217,8 @@ class DomesticAPI:
             if oldest_date <= cutoff:
                 break
 
+            time.sleep(0.4)  # 페이지 간 rate limit 방지
+
             try:
                 next_cursor = datetime.strptime(oldest_date + oldest_time, "%Y%m%d%H%M%S")
                 next_cursor -= timedelta(seconds=1)
@@ -278,20 +269,24 @@ class DomesticAPI:
         ).reset_index().rename(columns={"bucket": "datetime"})
         return result.sort_values("datetime").reset_index(drop=True)
 
-    @staticmethod
-    def _load_cache(path: Path) -> pd.DataFrame | None:
-        if not path.exists():
+    def _load_candle_cache(self, stock_code: str) -> pd.DataFrame | None:
+        if not self._r:
             return None
         try:
-            with path.open("rb") as f:
-                return pickle.load(f)
+            raw = self._r.get(f"{_CANDLE_CACHE_PREFIX}{stock_code}")
+            if not raw:
+                return None
+            return pickle.loads(raw)
         except Exception:
             return None
 
-    @staticmethod
-    def _save_cache(path: Path, df: pd.DataFrame):
-        with path.open("wb") as f:
-            pickle.dump(df, f)
+    def _save_candle_cache(self, stock_code: str, df: pd.DataFrame) -> None:
+        if not self._r:
+            return
+        try:
+            self._r.set(f"{_CANDLE_CACHE_PREFIX}{stock_code}", pickle.dumps(df), ex=_CANDLE_CACHE_TTL)
+        except Exception as e:
+            logger.warning("[%s] 분봉 캐시 저장 실패: %s", stock_code, e)
 
     def get_volume_ranking(self, market_code: str | None = None) -> list[dict]:
         """

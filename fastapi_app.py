@@ -103,7 +103,7 @@ def _build_sync_components(config: dict) -> dict:
     )
     auth = KISAuth(config, redis_client=redis_client)
     client = KISRestClient(auth)
-    domestic = DomesticAPI(client, config)
+    domestic = DomesticAPI(client, config, redis_client=redis_client)
     overseas = OverseasAPI(client, config)
     risk = RiskManager(config)
     pg_sync = PGWriterSync()
@@ -130,6 +130,12 @@ async def _build_async_components(config: dict, sync_comp: dict) -> dict:
         min_size=2, max_size=10,
     )
     memory = AgentMemory(pg_pool)
+    from events.indicator_cache import IndicatorCache
+    indicator_cache = IndicatorCache(
+        redis_client=sync_comp["redis"],
+        domestic=sync_comp.get("domestic"),
+        overseas=sync_comp.get("overseas"),
+    )
     tool_executor = ToolExecutor(
         market_data=sync_comp["market_data"],
         account=sync_comp["account"],
@@ -140,6 +146,7 @@ async def _build_async_components(config: dict, sync_comp: dict) -> dict:
         domestic_api=sync_comp["domestic"],
         overseas_api=sync_comp["overseas"],
         config=config,
+        indicator_cache=indicator_cache,
     )
     ai_cfg = config.get("ai", {})
     provider_name = ai_cfg.get("provider", "anthropic")
@@ -148,13 +155,6 @@ async def _build_async_components(config: dict, sync_comp: dict) -> dict:
     provider = create_provider(provider_name, api_key or "")
     agent = AIAgent(provider=provider, tool_executor=tool_executor, memory=memory, on_message=_on_ai_message)
     await agent.initialize()
-
-    from events.indicator_cache import IndicatorCache
-    indicator_cache = IndicatorCache(
-        redis_client=sync_comp["redis"],
-        domestic=sync_comp.get("domestic"),
-        overseas=sync_comp.get("overseas"),
-    )
     detector = EventDetector(sync_comp["market_data"], sync_comp["redis"], indicator_cache=indicator_cache)
     engine = EventEngine(detector, indicator_cache=indicator_cache)
     engine.register(agent.handle_event)

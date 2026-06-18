@@ -52,19 +52,19 @@ class IndicatorCache:
             await asyncio.sleep(_REFRESH_INTERVAL_SEC)
 
     async def _refresh_all(self) -> None:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._refresh_all_sync)
+
+    def _refresh_all_sync(self) -> None:
         watches = self._load_watches()
         if not watches:
             return
-        loop = asyncio.get_event_loop()
         for stock_code, watch in watches.items():
             market = watch.get("market", "domestic")
             exchange = watch.get("exchange")
             cached = self._r.exists(f"{_CACHE_KEY_PREFIX}{stock_code}")
             try:
-                indicators = await asyncio.wait_for(
-                    loop.run_in_executor(None, self._update, stock_code, market, exchange),
-                    timeout=30,
-                )
+                indicators = self._update(stock_code, market, exchange)
                 if indicators:
                     self._r.set(
                         f"{_CACHE_KEY_PREFIX}{stock_code}",
@@ -74,20 +74,19 @@ class IndicatorCache:
                     logger.info("지표 갱신: %s", stock_code)
                 elif not cached:
                     logger.warning("지표 계산 결과 없음 (데이터 부족): %s", stock_code)
-            except asyncio.TimeoutError:
-                logger.warning("지표 계산 타임아웃 (30s): %s — 다음 주기에 재시도", stock_code)
             except Exception:
                 logger.warning("지표 계산 실패: %s", stock_code, exc_info=True)
-            await asyncio.sleep(2)  # 종목 간 rate limit 방지
+            time.sleep(3)  # 종목 간 rate limit 방지
 
     def _update(self, stock_code: str, market: str, exchange: str | None) -> dict:
         # ── 5분봉 지표 ──────────────────────────────────────────────
         if stock_code not in self._candles:
             df = self._fetch_full(stock_code, market, exchange)
-            if df is None or df.empty:
-                return {}
-            self._candles[stock_code] = df.tail(_MAX_CANDLES).reset_index(drop=True)
-            logger.info("5분봉 최초 로드: %s %d개", stock_code, len(self._candles[stock_code]))
+            if df is not None and not df.empty:
+                self._candles[stock_code] = df.tail(_MAX_CANDLES).reset_index(drop=True)
+                logger.info("5분봉 최초 로드: %s %d개", stock_code, len(self._candles[stock_code]))
+            else:
+                logger.warning("5분봉 로드 실패: %s — 일봉 지표만 계산", stock_code)
         else:
             new_df = self._fetch_recent(stock_code, market, exchange)
             if new_df is not None and not new_df.empty:
@@ -100,18 +99,21 @@ class IndicatorCache:
                     ).tail(_MAX_CANDLES).reset_index(drop=True)
                     logger.debug("5분봉 append: %s +%d개", stock_code, len(added))
 
-        df5 = self._candles[stock_code]
-        indicators_5min = _compute_indicators(
-            df5["close"].tolist(),
-            df5["volume"].tolist() if "volume" in df5.columns else [],
-            highs=df5["high"].tolist() if "high" in df5.columns else None,
-            lows=df5["low"].tolist() if "low" in df5.columns else None,
-        )
+        indicators_5min = {}
+        if stock_code in self._candles:
+            df5 = self._candles[stock_code]
+            indicators_5min = _compute_indicators(
+                df5["close"].tolist(),
+                df5["volume"].tolist() if "volume" in df5.columns else [],
+                highs=df5["high"].tolist() if "high" in df5.columns else None,
+                lows=df5["low"].tolist() if "low" in df5.columns else None,
+            )
 
         # ── 일봉 지표 ──────────────────────────────────────────────
         indicators_daily = self._update_daily(stock_code, market, exchange)
 
-        return {**indicators_5min, **indicators_daily}
+        result = {**indicators_5min, **indicators_daily}
+        return result
 
     def _update_daily(self, stock_code: str, market: str, exchange: str | None) -> dict:
         now = time.monotonic()
