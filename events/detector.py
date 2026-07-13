@@ -215,12 +215,16 @@ class EventDetector:
 
         change_pct = ((price - baseline_price) / baseline_price * 100) if baseline_price > 0 else 0.0
         volume_ratio = (volume / baseline_volume) if baseline_volume > 0 else 0.0
+        avg_volume = indicators.get("avg_volume")
+        if avg_volume is None:
+            avg_volume = baseline_volume
 
         names = {
             "price": price,
             "volume": volume,
             "baseline_price": baseline_price,
             "baseline_volume": baseline_volume,
+            "avg_volume": avg_volume,
             "change_pct": round(change_pct, 4),
             "volume_ratio": round(volume_ratio, 4),
             **{k: v for k, v in indicators.items() if v is not None},
@@ -233,7 +237,7 @@ class EventDetector:
             detail = {"formula": formula, "variables": {k: round(v, 4) if isinstance(v, float) else v for k, v in names.items()}}
             return hit, detail
         except (FeatureNotAvailable, InvalidExpression, Exception) as e:
-            logger.debug("expr 평가 실패 '%s': %s", formula, e)
+            logger.warning("expr 평가 실패 '%s': %s", formula, e)
             return False, {}
 
     def _load_watches(self) -> dict:

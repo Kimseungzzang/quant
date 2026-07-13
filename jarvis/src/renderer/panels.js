@@ -126,6 +126,9 @@ export async function showIndicatorPanelDirect(code) {
 export async function showPnlPanelDirect() {
   return showPnlPanel();
 }
+export async function showRiskPanelDirect() {
+  return showRiskPanel();
+}
 
 export async function detectAndShowPanel(text) {
   const t = text.toLowerCase();
@@ -140,6 +143,8 @@ export async function detectAndShowPanel(text) {
     await showIndicatorPanel(text);
   } else if (t.includes('수익률') || t.includes('손익') || t.includes('pnl') || t.includes('승률')) {
     await showPnlPanel();
+  } else if (t.includes('한도') || t.includes('예수금') || t.includes('budget')) {
+    await showRiskPanel();
   }
 }
 
@@ -454,4 +459,76 @@ async function showIndicatorPanel(textOrCode) {
   } catch {
     showPanel('indicator', `◈ 기술 지표`, '<div style="color:var(--danger)">데이터 로드 실패</div>');
   }
+}
+
+// ── 리스크(해외 매수 한도) 패널 ────────────────────────────────────────────
+
+async function _loadRiskContent() {
+  const el = _getContent('risk');
+  if (!el) return;
+  const body = el.querySelector('#risk-body');
+  if (body) body.innerHTML = '<div style="color:var(--text-dim);font-size:12px">로딩 중...</div>';
+  try {
+    const res = await fetch(`${BASE}/trade/risk/overseas-budget`);
+    const d = await res.json();
+    const usd = (v) => `$${Number(v || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    const hasBudget = d.budget != null;
+    const overCap = hasBudget && d.remaining < 0;
+    if (body) {
+      body.innerHTML = `
+        <div class="panel-row" style="margin-bottom:8px">
+          <span class="panel-label">현재 예수금(USD)</span>
+          <span style="color:var(--accent);font-weight:700">${usd(d.cashUsd)}</span>
+        </div>
+        <hr style="border-color:var(--border);margin:8px 0">
+        <div class="panel-row" style="margin-bottom:6px">
+          <span class="panel-label">오늘 해외 매수 한도</span>
+          <span style="font-weight:700">${hasBudget ? usd(d.budget) : '제한 없음'}</span>
+        </div>
+        <div class="panel-row" style="margin-bottom:6px">
+          <span class="panel-label">오늘 사용액</span>
+          <span>${usd(d.spentToday)}</span>
+        </div>
+        ${hasBudget ? `
+        <div class="panel-row" style="margin-bottom:10px">
+          <span class="panel-label">남은 한도</span>
+          <span style="color:${overCap ? 'var(--danger)' : '#00ff99'};font-weight:700">${usd(d.remaining)}</span>
+        </div>` : '<div style="margin-bottom:10px"></div>'}
+        <div style="display:flex;gap:6px">
+          <input id="risk-budget-input" type="number" placeholder="예: 600" min="0" step="1"
+            style="flex:1;background:transparent;border:1px solid var(--border);border-radius:3px;
+                   color:var(--text);padding:4px 6px;font-size:12px" />
+          <button id="risk-budget-set" style="padding:4px 10px;font-size:11px;border-radius:3px;
+                   border:1px solid var(--accent);background:transparent;color:var(--accent);cursor:pointer">설정</button>
+          ${hasBudget ? `<button id="risk-budget-clear" style="padding:4px 10px;font-size:11px;border-radius:3px;
+                   border:1px solid var(--border);background:transparent;color:var(--text-dim);cursor:pointer">해제</button>` : ''}
+        </div>
+      `;
+      body.querySelector('#risk-budget-set')?.addEventListener('click', async () => {
+        const input = body.querySelector('#risk-budget-input');
+        const val = parseFloat(input.value);
+        if (!Number.isFinite(val) || val < 0) return;
+        await fetch(`${BASE}/trade/risk/overseas-budget`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount_usd: val }),
+        });
+        await _loadRiskContent();
+      });
+      body.querySelector('#risk-budget-clear')?.addEventListener('click', async () => {
+        await fetch(`${BASE}/trade/risk/overseas-budget`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ amount_usd: null }),
+        });
+        await _loadRiskContent();
+      });
+    }
+  } catch {
+    if (body) body.innerHTML = '<div style="color:var(--danger)">데이터 로드 실패</div>';
+  }
+}
+
+async function showRiskPanel() {
+  showPanel('risk', '◈ 해외 매수 한도', '<div id="risk-body" style="color:var(--text-dim);font-size:12px">로딩 중...</div>');
+  await _loadRiskContent();
+  _refreshTimers.set('risk', setInterval(_loadRiskContent, 15000));
 }

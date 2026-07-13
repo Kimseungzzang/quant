@@ -15,6 +15,20 @@ logger = logging.getLogger(__name__)
 
 _MSG_REALTIME = ("0", "1")
 
+
+def _to_float(value) -> float:
+    try:
+        return float(str(value or "0").replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(value) -> int:
+    try:
+        return int(float(str(value or "0").replace(",", "")))
+    except (TypeError, ValueError):
+        return 0
+
 # KIS WebSocket TR별 레코드당 필드 수 (공식 문서 기준)
 _KNOWN_FIELD_COUNTS: dict[str, int] = {
     "H0STCNT0": 46,   # 국내주식 실시간체결가
@@ -186,7 +200,7 @@ class KISWebSocket:
                 self._ws = None
                 await asyncio.sleep(5)
             except Exception as e:
-                logger.error("WebSocket 오류: %s", e)
+                logger.exception("WebSocket 오류")
                 self._ws = None
                 await asyncio.sleep(5)
 
@@ -341,19 +355,19 @@ def parse_domestic_price(fields: list[str]) -> dict:
     return {
         "stock_code":   get(0),
         "time":         get(1),
-        "price":        get(2),
+        "price":        _to_float(get(2)),
         "sign":         get(3),
-        "change":       get(4),
-        "change_pct":   get(5),
-        "weighted_avg": get(6),
-        "open":         get(7),
-        "high":         get(8),
-        "low":          get(9),
-        "ask":          get(10),
-        "bid":          get(11),
-        "vol":          get(12),
-        "acml_vol":     get(13),
-        "acml_val":     get(14),
+        "change":       _to_float(get(4)),
+        "change_pct":   _to_float(get(5)),
+        "weighted_avg": _to_float(get(6)),
+        "open":         _to_float(get(7)),
+        "high":         _to_float(get(8)),
+        "low":          _to_float(get(9)),
+        "ask":          _to_float(get(10)),
+        "bid":          _to_float(get(11)),
+        "vol":          _to_int(get(12)),
+        "acml_vol":     _to_int(get(13)),
+        "acml_val":     _to_float(get(14)),
     }
 
 
@@ -395,16 +409,16 @@ def parse_overseas_price(fields: list[str]) -> dict:
         "date":       get(3),
         "time":       get(5),
         "kst_time":   get(7),
-        "open":       get(8),
-        "high":       get(9),
-        "low":        get(10),
-        "price":      get(11),
+        "open":       _to_float(get(8)),
+        "high":       _to_float(get(9)),
+        "low":        _to_float(get(10)),
+        "price":      _to_float(get(11)),
         "sign":       get(12),
-        "change":     get(13),
-        "change_pct": get(14),
-        "vol":        get(17),
-        "acml_vol":   get(20),
-        "acml_val":   get(21),
+        "change":     _to_float(get(13)),
+        "change_pct": _to_float(get(14)),
+        "vol":        _to_int(get(17)),
+        "acml_vol":   _to_int(get(20)),
+        "acml_val":   _to_float(get(21)),
     }
 
 

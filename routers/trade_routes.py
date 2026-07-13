@@ -35,19 +35,30 @@ def account_balance(market: str = "domestic", mode: str | None = None):
         return cached["data"]
     try:
         if market == "overseas":
-            configured = config.get("universe", {}).get("overseas", {}).get("exchanges", ["NAS", "NYS"])
             positions, summaries, seen = [], [], set()
-            for exch in configured:
-                try:
-                    balance = state.components["overseas"].get_balance(ExchangeCode(exch))
-                except Exception:
-                    continue
+            if config.get("broker", "toss") == "toss":
+                # 토스는 거래소별로 잔고를 분리 조회하지 않고 계좌 전체를 한 번에 반환한다.
+                # KIS처럼 거래소마다 호출해서 합산하면 동일 데이터가 중복 합산된다.
+                balance = state.components["overseas"].get_balance()
                 summaries.append(balance.get("summary") or {})
                 for pos in balance.get("positions") or []:
                     key = (pos.get("ovrs_excg_cd"), pos.get("ovrs_pdno"))
                     if key not in seen:
                         seen.add(key)
                         positions.append(pos)
+            else:
+                configured = config.get("universe", {}).get("overseas", {}).get("exchanges", ["NAS", "NYS"])
+                for exch in configured:
+                    try:
+                        balance = state.components["overseas"].get_balance(ExchangeCode(exch))
+                    except Exception:
+                        continue
+                    summaries.append(balance.get("summary") or {})
+                    for pos in balance.get("positions") or []:
+                        key = (pos.get("ovrs_excg_cd"), pos.get("ovrs_pdno"))
+                        if key not in seen:
+                            seen.add(key)
+                            positions.append(pos)
             stock_value = sum(_to_float(p.get("ovrs_stck_evlu_amt")) for p in positions)
             purchase_amt = sum(_to_float(s.get("frcr_pchs_amt1")) for s in summaries)
             evlu_pfls = sum(_to_float(s.get("ovrs_tot_pfls")) for s in summaries)
@@ -189,6 +200,41 @@ def get_order_fills(market: str = "overseas"):
         return state.components["domestic"].get_daily_orders()
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/trade/risk/overseas-budget")
+def get_overseas_budget():
+    risk = state.components.get("risk")
+    if risk is None:
+        raise HTTPException(status_code=503, detail="초기화 중")
+    budget = risk.get_overseas_daily_budget_usd()
+    spent = risk.get_overseas_spend_today_usd()
+    cash_usd = 0.0
+    overseas = state.components.get("overseas")
+    if overseas:
+        try:
+            cash_usd = overseas.get_foreign_margin_usd()
+        except Exception as e:
+            logger.warning("예수금 조회 실패: %s", e)
+    return {
+        "budget": budget,
+        "spentToday": spent,
+        "remaining": (budget - spent) if budget is not None else None,
+        "cashUsd": cash_usd,
+    }
+
+
+class OverseasBudgetRequest(BaseModel):
+    amount_usd: float | None = None
+
+
+@router.post("/trade/risk/overseas-budget")
+def set_overseas_budget(req: OverseasBudgetRequest):
+    risk = state.components.get("risk")
+    if risk is None:
+        raise HTTPException(status_code=503, detail="초기화 중")
+    risk.set_overseas_daily_budget_usd(req.amount_usd)
+    return get_overseas_budget()
 
 
 @router.get("/signals")

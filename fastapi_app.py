@@ -29,6 +29,12 @@ from kis.websocket import (
 )
 from kis.constants import WebSocketTRID
 
+from toss.auth import TossAuth
+from toss.rest import TossRestClient
+from toss.api import TossBrokerAPI
+from toss.domestic import TossDomesticAPI
+from toss.overseas import TossOverseasAPI
+
 from trading.risk import RiskManager
 from trading.order_manager import OrderManager, TradeLogger
 
@@ -52,6 +58,20 @@ from routers.trade_routes import router as trade_router
 from routers.system_routes import router as system_router
 
 logger = logging.getLogger(__name__)
+
+
+def _to_float(value) -> float:
+    try:
+        return float(str(value or "0").replace(",", ""))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(value) -> int:
+    try:
+        return int(float(str(value or "0").replace(",", "")))
+    except (TypeError, ValueError):
+        return 0
 
 
 # ── 알림 큐 (HTTP polling용) ─────────────────────────────────────────────
@@ -101,17 +121,26 @@ def _build_sync_components(config: dict) -> dict:
         db=redis_cfg.get("db", 0),
         decode_responses=False,
     )
-    auth = KISAuth(config, redis_client=redis_client)
-    client = KISRestClient(auth)
-    domestic = DomesticAPI(client, config, redis_client=redis_client)
-    overseas = OverseasAPI(client, config)
-    risk = RiskManager(config)
+    broker_name = config.get("broker", "toss")
+    if broker_name == "toss":
+        auth = TossAuth(config, redis_client=redis_client)
+        client = TossRestClient(auth)
+        broker = TossBrokerAPI(client)
+        domestic = TossDomesticAPI(broker, config, redis_client=redis_client)
+        overseas = TossOverseasAPI(broker, config, redis_client=redis_client)
+    else:
+        # KIS 경로 — broker: kis 로 설정 시 롤백용으로 사용
+        auth = KISAuth(config, redis_client=redis_client)
+        client = KISRestClient(auth)
+        domestic = DomesticAPI(client, config, redis_client=redis_client)
+        overseas = OverseasAPI(client, config)
+    risk = RiskManager(config, redis_client=redis_client)
     pg_sync = PGWriterSync()
     order_mgr = OrderManager(domestic, overseas, risk, TradeLogger(), pg=pg_sync, mode=config["mode"])
     market_data = MarketDataCollector(redis_client)
     account = AccountCollector(redis_client)
     return dict(
-        config=config, auth=auth,
+        config=config, auth=auth, broker_name=broker_name,
         domestic=domestic, overseas=overseas,
         risk=risk, order_mgr=order_mgr,
         redis=redis_client,
@@ -322,13 +351,91 @@ async def _trading_loop(config: dict, comp: dict) -> None:
     )
 
 
+# ── 토스 REST 폴링 루프 (WebSocket 대체) ──────────────────────────────────
+
+_TOSS_POLL_BUDGET_PER_SEC = 8.0  # MARKET_DATA 그룹 한도(10/s) 중 여유를 둔 값
+
+
+async def _toss_polling_loop(config: dict, comp: dict) -> None:
+    """
+    토스는 WebSocket을 제공하지 않으므로(추후 지원 예정), 감시종목+유니버스 종목을
+    라운드로빈으로 REST 폴링해서 KIS WS 콜백과 동일한 3가지 사이드이펙트를 재현한다:
+    market_data.on_price_tick() / order_mgr.on_price_update() / price 브로드캐스트.
+    """
+    order_mgr: OrderManager = comp["order_mgr"]
+    market_data: MarketDataCollector = comp["market_data"]
+    domestic = comp["domestic"]
+    overseas = comp["overseas"]
+    redis_client = comp["redis"]
+    loop = asyncio.get_event_loop()
+
+    universe = config.get("universe", {})
+    universe_domestic = [s if isinstance(s, str) else s["code"]
+                         for s in universe.get("domestic", {}).get("stocks", [])]
+    universe_overseas = [s["code"] if isinstance(s, dict) else s
+                         for s in universe.get("overseas", {}).get("stocks", [])]
+
+    def _load_watches() -> dict:
+        try:
+            raw = redis_client.get("ai:watches")
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    async def _poll_one(code: str, market: str) -> None:
+        try:
+            if market == "domestic":
+                data = await loop.run_in_executor(None, domestic.get_price, code)
+            else:
+                data = await loop.run_in_executor(None, overseas.get_price, code)
+            price = float(data.get("current_price") or 0)
+            if price <= 0:
+                return
+            tick = {
+                "stock_code": code, "current_price": price,
+                "volume": 0, "acml_volume": 0,
+                "time": datetime.now().strftime("%H%M%S"),
+                "exchange": "KRX" if market == "domestic" else "US",
+                "price_source": "toss_poll",
+                "stock_name": code,
+                "received_at": datetime.now().isoformat(),
+            }
+            market_data.on_price_tick(code, tick)
+            order_mgr.on_price_update(code, price, signal=None)
+            await _broadcast({"type": "price", "code": code, "price": price, "ts": datetime.now().isoformat()})
+        except Exception:
+            logger.warning("토스 시세 폴링 실패: %s(%s)", code, market, exc_info=True)
+
+    logger.info("토스 REST 폴링 루프 시작 (WebSocket 미지원 — REST 폴링으로 대체)")
+    per_request_sleep = 1.0 / _TOSS_POLL_BUDGET_PER_SEC
+    while True:
+        watches = _load_watches()
+        watched_domestic = [c for c, w in watches.items() if str(w.get("market", "")).lower() == "domestic"]
+        watched_overseas = [c for c, w in watches.items() if str(w.get("market", "")).lower() == "overseas"]
+
+        codes = [("domestic", c) for c in dict.fromkeys(watched_domestic + universe_domestic)]
+        codes += [("overseas", c) for c in dict.fromkeys(watched_overseas + universe_overseas)]
+
+        if not codes:
+            await asyncio.sleep(5)
+            continue
+
+        for market, code in codes:
+            await _poll_one(code, market)
+            await asyncio.sleep(per_request_sleep)
+
+
 async def _trading_loop_supervisor(config: dict, comp: dict, stop: asyncio.Event) -> None:
+    broker_name = config.get("broker", "toss")
     while not stop.is_set():
         try:
             state.trading_last_error = None
-            await _trading_loop(config, comp)
+            if broker_name == "toss":
+                await _toss_polling_loop(config, comp)
+            else:
+                await _trading_loop(config, comp)
             if not stop.is_set():
-                state.trading_last_error = "KIS WebSocket loop exited unexpectedly"
+                state.trading_last_error = f"{broker_name} 시세 루프 예상치 못하게 종료됨"
                 logger.warning("%s — restarting in 5s", state.trading_last_error)
         except asyncio.CancelledError:
             raise
@@ -348,14 +455,23 @@ async def _morning_brief_loop(agent: AIAgent, config: dict, stop: asyncio.Event)
     ai_cfg = config.get("ai", {})
     brief_hour = int(ai_cfg.get("morning_brief_hour", 8))
     brief_min = int(ai_cfg.get("morning_brief_minute", 30))
+    attempted_dates: set[str] = set()
+    logger.info("아침 브리핑 스케줄 활성화: %02d:%02d", brief_hour, brief_min)
     while not stop.is_set():
         now = datetime.now()
-        if now.hour == brief_hour and now.minute == brief_min:
+        today = now.date().isoformat()
+        if today not in attempted_dates and (now.hour, now.minute) >= (brief_hour, brief_min):
+            attempted_dates.add(today)
             try:
+                memory = getattr(agent, "_memory", None)
+                if memory and await memory.get_today_plan():
+                    logger.info("오늘 아침 브리핑 이미 저장됨 — 스케줄 실행 생략: %s", today)
+                    await asyncio.sleep(30)
+                    continue
+                logger.info("아침 브리핑 스케줄 실행: %s %02d:%02d", today, brief_hour, brief_min)
                 await agent.morning_brief()
             except Exception:
                 logger.exception("아침 브리핑 실패")
-            await asyncio.sleep(61)
         await asyncio.sleep(30)
 
 
@@ -384,7 +500,7 @@ async def _auto_trading_schedule_loop(agent: AIAgent, config: dict, stop: asynci
             ran.add(run_key)
             try:
                 logger.info("자동매매 스케줄 실행: %s", key)
-                await agent.chat(prompt)
+                await agent.chat(prompt, source="schedule")
             except Exception:
                 logger.exception("자동매매 스케줄 실패: %s", key)
 
@@ -400,12 +516,9 @@ async def _auto_trading_schedule_loop(agent: AIAgent, config: dict, stop: asynci
              "portfolio cash, and candidate charts. If risk and setup are aligned, "
              "decide allocation percentage and place real orders automatically. "
              "Otherwise set concrete detecting/watch rules. Save the plan and memo. Respond in Korean only."),
-            (schedule_cfg.get("domestic_trading_end_time", "15:20"), "domestic-close",
-             "Korean domestic market trading window is ending. Review open domestic positions, "
-             "pending orders, and watches. Manage risk, save a memo, and respond in Korean only."),
-            (schedule_cfg.get("us_trading_end_time", "05:00"), "us-close",
-             "US market trading window is ending. Review open US positions, pending orders, "
-             "and watches. Manage risk, save a memo, and respond in Korean only."),
+            # domestic-close/us-close 제거됨: 장마감마다 강제로 포지션을 정리시키면
+            # 장투/데이트레이드를 유연하게 섞어 가져가려는 전략과 충돌해서 뺐다.
+            # 필요하면 watch 조건(set_watch)이나 AI 스스로의 판단으로 청산 타이밍을 정한다.
         ]
         for time_str, key, prompt in schedules:
             if hhmm == time_str:
@@ -421,19 +534,34 @@ def _start_pollers(comp: dict, stop: threading.Event) -> None:
             try:
                 dom = comp["domestic"].get_balance()
                 comp["account"].update_balance("domestic", dom)
-                last_prices = comp["order_mgr"].get_last_prices()
-                positions = [
-                    {
-                        "stock_code": p.stock_code, "stock_name": p.name,
-                        "market": "domestic" if p.is_domestic() else "overseas",
-                        "quantity": p.qty, "avg_price": p.entry_price,
-                        "current_price": last_prices.get(p.stock_code, p.entry_price),
-                        "unrealized_pct": round(
-                            (last_prices.get(p.stock_code, p.entry_price) - p.entry_price) / p.entry_price * 100, 2
-                        ) if p.entry_price else 0,
-                    }
-                    for p in comp["order_mgr"].get_open_positions().values()
-                ]
+                manager_positions = comp["order_mgr"].get_open_positions()
+                positions = []
+                for p in dom.get("positions") or []:
+                    stock_code = p.get("pdno")
+                    qty = _to_int(p.get("hldg_qty"))
+                    avg_price = _to_float(p.get("pchs_avg_pric"))
+                    current_price = _to_float(p.get("prpr")) or avg_price
+                    if not stock_code or qty <= 0:
+                        continue
+                    positions.append({
+                        "stock_code": stock_code,
+                        "stock_name": p.get("prdt_name"),
+                        "market": "domestic",
+                        "quantity": qty,
+                        "avg_price": avg_price,
+                        "current_price": current_price,
+                        "unrealized_pct": round((current_price - avg_price) / avg_price * 100, 2) if avg_price else 0,
+                    })
+                    if stock_code not in manager_positions and avg_price > 0:
+                        comp["order_mgr"].restore_position(
+                            stock_code=stock_code,
+                            name=p.get("prdt_name") or stock_code,
+                            exchange="KRX",
+                            qty=qty,
+                            entry_price=avg_price,
+                            current_price=current_price,
+                            strategy="account_restore",
+                        )
                 comp["account"].update_positions(positions)
             except Exception:
                 logger.exception("계좌 폴링 실패")
@@ -452,15 +580,18 @@ async def _paper_fill_poll_loop(comp: dict, stop: asyncio.Event) -> None:
     loop = asyncio.get_event_loop()
     while not stop.is_set():
         try:
-            if order_mgr.get_pending_order_rows():
+            pending_orders = order_mgr.get_pending_order_rows()
+            if pending_orders:
+                has_domestic_pending = any(o.get("market") == "domestic" for o in pending_orders)
+                has_overseas_pending = any(o.get("market") == "overseas" for o in pending_orders)
                 rows: list[dict] = []
-                if domestic:
+                if domestic and has_domestic_pending:
                     try:
                         rows += await loop.run_in_executor(None, domestic.get_daily_orders)
                     except Exception as e:
                         logger.warning("국내 체결 폴링 실패", exc_info=True)
                         await _broadcast({"type": "error_notice", "message": f"체결 조회 실패 (국내): {e}"})
-                if overseas:
+                if overseas and has_overseas_pending:
                     try:
                         rows += await loop.run_in_executor(None, overseas.get_daily_orders)
                     except Exception as e:
@@ -500,7 +631,8 @@ async def lifespan(app: FastAPI):
     await state.event_engine.run()
     asyncio.create_task(_morning_brief_loop(state.agent, config, async_stop))
     asyncio.create_task(_auto_trading_schedule_loop(state.agent, config, async_stop))
-    if config.get("mode") == "paper":
+    # paper 모드(KIS WS가 체결통보 미지원) 또는 토스(WebSocket 자체가 없어 항상 REST로 체결 확인)
+    if config.get("mode") == "paper" or config.get("broker", "toss") == "toss":
         asyncio.create_task(_paper_fill_poll_loop(state.components, async_stop))
     state.trading_task = asyncio.create_task(
         _trading_loop_supervisor(config, state.components, async_stop)

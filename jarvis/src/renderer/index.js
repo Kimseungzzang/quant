@@ -1,5 +1,5 @@
 import { JarvisSphere } from './sphere.js';
-import { detectAndShowPanel, hidePanel, showChartPanelDirect, showWatchPanelDirect, showIndicatorPanelDirect, showPnlPanelDirect, onPriceTick } from './panels.js';
+import { detectAndShowPanel, hidePanel, showChartPanelDirect, showWatchPanelDirect, showIndicatorPanelDirect, showPnlPanelDirect, showRiskPanelDirect, onPriceTick } from './panels.js';
 
 const BASE = window.api?.baseUrl || 'http://127.0.0.1:8000';
 
@@ -92,6 +92,7 @@ const SLASH_HELP = `사용 가능한 명령어:
 /watch          — 감시 종목 목록
 /ind [CODE]     — 기술 지표  (예: /ind NVDA)
 /pnl            — 수익률 패널
+/budget         — 해외 매수 한도 / 예수금
 /help           — 이 목록`;
 
 async function handleSlashCommand(text) {
@@ -126,6 +127,10 @@ async function handleSlashCommand(text) {
     case '/pnl':
       await showPnlPanelDirect();
       addMessage('ai', '수익률 패널을 표시합니다.');
+      return true;
+    case '/budget':
+      await showRiskPanelDirect();
+      addMessage('ai', '해외 매수 한도 / 예수금 패널을 표시합니다.');
       return true;
     case '/mode': {
       const mode = args[0] || 'paper';
@@ -196,6 +201,7 @@ const COMMANDS = [
   { cmd: '/watch',  arg: '',         desc: '감시 종목 목록' },
   { cmd: '/ind',    arg: '[종목]',   desc: '기술 지표 표시' },
   { cmd: '/pnl',    arg: '',         desc: '수익률 패널' },
+  { cmd: '/budget', arg: '',         desc: '해외 매수 한도 / 예수금' },
   { cmd: '/clear',  arg: '',         desc: '채팅 초기화' },
   { cmd: '/help',   arg: '',         desc: '명령어 목록' },
 ];

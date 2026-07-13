@@ -1,9 +1,7 @@
 import asyncio
 import json
 import logging
-import pickle
-from datetime import date, datetime, timedelta
-from pathlib import Path
+from datetime import date, timedelta
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException
@@ -13,8 +11,6 @@ from routers import state
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-_CHART_CACHE_DIR = Path("data/cache")
 
 
 def _live_price(stock_code: str) -> float | None:
@@ -62,92 +58,6 @@ def _merge_live_price(df: pd.DataFrame, stock_code: str, candle_type: str) -> pd
     df.at[last_idx, "low"] = min(float(df.at[last_idx, "low"] or live_price), live_price)
     df.at[last_idx, "close"] = live_price
     return df
-
-
-async def _fetch_today_minute_candles(domestic, stock_code: str) -> pd.DataFrame:
-    """오늘 1분봉을 캐시 + delta 방식으로 반환.
-
-    캐시 없음 → 오늘 전체 페이지네이션 후 저장.
-    캐시 있음 → 로드 후 마지막 시각 이후 1회 delta 호출만.
-    """
-    _CHART_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = _CHART_CACHE_DIR / f"{stock_code}_chart_1min.pkl"
-
-    today = date.today()
-    now_str = datetime.now().strftime("%H%M%S")
-    cap_hour = "180000" if now_str > "180000" else now_str
-
-    # 오늘 캐시 로드
-    cached: pd.DataFrame = pd.DataFrame()
-    if cache_file.exists():
-        try:
-            with cache_file.open("rb") as f:
-                loaded: pd.DataFrame = pickle.load(f)
-            if not loaded.empty and loaded["datetime"].dt.date.max() == today:
-                cached = loaded
-        except Exception:
-            cache_file.unlink(missing_ok=True)
-
-    loop = asyncio.get_event_loop()
-
-    async def _call_minute_ohlcv(hour: str) -> pd.DataFrame:
-        """sync KIS 호출을 스레드풀로 격리. no-retry fast session → 4초 내 성공/실패."""
-        try:
-            return await asyncio.wait_for(
-                loop.run_in_executor(None, domestic.get_minute_ohlcv, stock_code, hour),
-                timeout=6.0,
-            )
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.warning("분봉 조회 실패/타임아웃(%s@%s): %s", stock_code, hour, e)
-            return pd.DataFrame()
-
-    if not cached.empty:
-        last_hour = cached["datetime"].max().strftime("%H%M%S")
-        if last_hour >= cap_hour:
-            return cached  # 이미 최신
-        # delta: 마지막 캐시 이후 새 1분봉 1회 호출
-        delta = await _call_minute_ohlcv(cap_hour)
-        if not delta.empty:
-            new_rows = delta[delta["datetime"] > cached["datetime"].max()]
-            if not new_rows.empty:
-                cached = (
-                    pd.concat([cached, new_rows])
-                    .drop_duplicates("datetime")
-                    .sort_values("datetime")
-                    .reset_index(drop=True)
-                )
-                with cache_file.open("wb") as f:
-                    pickle.dump(cached, f)
-        return cached
-
-    # 캐시 없음: 오늘 전체 페이지네이션
-    cur_hour = cap_hour
-    dfs: list[pd.DataFrame] = []
-    for _ in range(20):
-        chunk = await _call_minute_ohlcv(cur_hour)
-        if chunk.empty:
-            break
-        today_chunk = chunk[chunk["datetime"].dt.date == today]
-        if not today_chunk.empty:
-            dfs.append(today_chunk)
-        earliest = chunk["datetime"].min()
-        if earliest.date() < today or earliest.strftime("%H%M%S") <= "090500":
-            break
-        cur_hour = (earliest - pd.Timedelta(minutes=1)).strftime("%H%M%S")
-        await asyncio.sleep(0.15)
-
-    if not dfs:
-        return pd.DataFrame()
-
-    result = (
-        pd.concat(dfs)
-        .drop_duplicates("datetime")
-        .sort_values("datetime")
-        .reset_index(drop=True)
-    )
-    with cache_file.open("wb") as f:
-        pickle.dump(result, f)
-    return result
 
 
 class ChatRequest(BaseModel):
@@ -217,29 +127,25 @@ async def get_candles_for_chart(stock_code: str, candle_type: str = "daily", cou
     if not overseas and not domestic:
         return {"stock_code": stock_code, "candles": []}
     try:
-        from kis.constants import ExchangeCode
         is_domestic = stock_code.isdigit()
         if is_domestic and domestic:
             if candle_type == "minute":
-                df_1min = await _fetch_today_minute_candles(domestic, stock_code)
-                if not df_1min.empty:
-                    df = domestic._aggregate(df_1min, 5)
+                df = domestic.get_historical_minute_ohlcv(stock_code, lookback_days=1, candle_minutes=5)
+                if not df.empty:
                     df = df[df["volume"] > 0].reset_index(drop=True)
-                else:
-                    df = pd.DataFrame()
             else:
                 end = date.today()
                 start = end - timedelta(days=max(count * 2, 60))
                 df = domestic.get_daily_ohlcv(stock_code, start, end)
             df = _merge_live_price(df, stock_code, candle_type)
         elif overseas:
-            exch = ExchangeCode.NASDAQ
             if candle_type == "minute":
-                df = overseas.get_historical_minute_ohlcv(stock_code, exch, lookback_days=2, candle_minutes=5)
+                df = overseas.get_historical_minute_ohlcv(stock_code, lookback_days=2, candle_minutes=5)
             else:
                 end = date.today()
                 start = end - timedelta(days=max(count * 2, 60))
-                df = overseas.get_daily_ohlcv(stock_code, exch, start_date=start, end_date=end)
+                df = overseas.get_daily_ohlcv(stock_code, start_date=start, end_date=end)
+            df = _merge_live_price(df, stock_code, candle_type)
         else:
             return {"stock_code": stock_code, "candles": []}
         df = df.tail(count)

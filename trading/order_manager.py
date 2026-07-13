@@ -15,8 +15,22 @@ class TradeLogger:
     def log_buy(self, stock_code: str, name: str, exchange: str, qty: int, price: float, order_no: str) -> None:
         logger.info("BUY | %s(%s) %s주 @%.2f order=%s", name, stock_code, qty, price, order_no)
 
-    def log_sell(self, stock_code: str, name: str, exchange: str, qty: int, price: float, pnl_pct: float, reason: str, order_no: str) -> None:
-        logger.info("SELL | %s(%s) %s주 @%.2f pnl=%.2f%% reason=%s order=%s", name, stock_code, qty, price, pnl_pct, reason, order_no)
+    def log_sell(
+        self,
+        stock_code: str,
+        name: str,
+        exchange: str,
+        qty: int,
+        entry_price: float,
+        price: float,
+        pnl_pct: float,
+        reason: str,
+        order_no: str,
+    ) -> None:
+        logger.info(
+            "SELL | %s(%s) %s주 entry=%.2f sell=%.2f pnl=%.2f%% reason=%s order=%s",
+            name, stock_code, qty, entry_price, price, pnl_pct, reason, order_no,
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +209,22 @@ class OrderManager:
             if qty <= 0:
                 return self._fail_order("매수 수량 0 (자금 부족): %s", stock_code)
 
+            if exchange != _KRX:
+                remaining = self.risk.get_overseas_remaining_budget_usd()
+                if remaining is not None:
+                    max_affordable_qty = int(remaining / price) if price > 0 else 0
+                    if max_affordable_qty <= 0:
+                        return self._fail_order(
+                            "해외 매수 일일 한도 부족: 1주 가격 $%.2f > 남은 한도 $%.2f",
+                            price, remaining,
+                        )
+                    if max_affordable_qty < qty:
+                        logger.info(
+                            "[매수] 해외 한도 내로 수량 축소: %s 요청 %d주 → %d주 (남은 한도 $%.2f, 단가 $%.2f)",
+                            stock_code, qty, max_affordable_qty, remaining, price,
+                        )
+                        qty = max_affordable_qty
+
             if exchange == _KRX:
                 result = self.domestic.buy(stock_code, qty)
             else:
@@ -284,6 +314,12 @@ class OrderManager:
     # ── 실시간 모니터링 ──────────────────────────────────────────────────
 
     def on_price_update(self, stock_code: str, current_price: float, signal: TradeSignal | None):
+        try:
+            current_price = float(str(current_price or "0").replace(",", ""))
+        except (TypeError, ValueError):
+            logger.warning("실시간 가격 값 이상: %s current_price=%r", stock_code, current_price)
+            return
+
         close_reason: CloseReason | None = None
         has_pos = False
         with self._lock:
@@ -593,6 +629,8 @@ class OrderManager:
             pos.strategy = strategy
             self._positions[stock_code] = pos
         self._last_prices[stock_code] = price
+        if exchange != _KRX:
+            self.risk.record_overseas_spend(qty * price)
         self.trade_logger.log_buy(stock_code, name, exchange, qty, price, order_no)
         logger.info("[매수체결] %s(%s) %d주 @ %.2f", name, stock_code, qty, price)
 

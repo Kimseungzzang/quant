@@ -214,7 +214,7 @@ _PROVIDERS = {
     "gemini":    lambda key: OpenAICompatibleProvider(
         key,
         "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "gemini-2.5-flash",
+        "gemini-flash-latest",  # 고정 버전(gemini-2.5-flash 등)은 구글이 폐기하면 404가 남 — latest alias 사용
     ),
     "groq":      lambda key: OpenAICompatibleProvider(
         key,

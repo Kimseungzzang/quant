@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import json
 import logging
@@ -108,7 +109,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "market":   {"type": "string", "enum": ["domestic", "overseas"], "default": "domestic"},
                 "strategy": {"type": "string", "enum": ["intraday", "swing", "longterm", "all"], "default": "all"},
-                "top_n":    {"type": "integer", "description": "스크리닝할 거래량 상위 종목 수 (기본 20)", "default": 20},
+                "top_n":    {"type": "integer", "description": "스크리닝할 거래대금 상위 종목 수 (기본 85 — 레버리지/인버스 제외한 랭킹 전체를 커버)", "default": 85},
             },
             "required": [],
         },
@@ -173,6 +174,23 @@ TOOL_DEFINITIONS = [
                 "max_results": {"type": "integer", "default": 5, "description": "결과 수 (최대 10)"},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "set_risk_params",
+        "description": (
+            "손절%, 익절%, 최대 동시 보유 종목수, 종목당 기본 투자비율(%)을 직접 설정합니다. "
+            "지정하지 않은 항목은 기존 값을 유지합니다. "
+            "상한/하한 검증을 하지 않으므로 시장 상황과 계좌 리스크를 스스로 판단해서 신중하게 설정하세요."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "stop_loss_pct": {"type": "number", "description": "손절 기준 %. 예: 5 → -5% 손실 시 자동 손절"},
+                "take_profit_pct": {"type": "number", "description": "익절 기준 %. 예: 5 → +5% 수익 시 자동 익절"},
+                "max_positions": {"type": "integer", "description": "최대 동시 보유 종목수"},
+                "position_size_pct": {"type": "number", "description": "신규 진입 시 종목당 기본 투자비율 (계좌 총자산 대비 %). place_order에서 quantity/position_pct를 직접 지정하지 않았을 때 적용됨"},
+            },
         },
     },
     {
@@ -309,8 +327,8 @@ TOOL_DEFINITIONS = [
                                     "bb_pct(볼린저 %B: 0=하단,1=상단), bb_upper, bb_lower, stoch_k, stoch_d. "
                                     "⚠️ volume_ratio 사용 금지: 세션 시작 시 0으로 리셋되어 조건이 영원히 안 걸림. "
                                     "거래량 조건은 반드시 'volume > avg_volume * N' 형식으로 작성. "
-                                    "과매도: rsi<30 or stoch_k<20 or bb_pct<0.1 | 과매수: rsi>70 or stoch_k>80 or bb_pct>0.9. "
-                                    "예시: 'rsi < 30 and bb_pct < 0.1', 'rsi < 40 and volume > avg_volume * 1.5'"
+                                    "AI가 현재 데이터에 맞춰 매수/매도 논리, 수치, 조건 조합을 직접 정하세요. "
+                                    "고정 예시식을 복사하지 말고, 조건마다 이유를 note에 남기세요."
                                 ),
                             },
                             "threshold": {"type": "number", "description": "expr 타입에서는 불필요 (생략 가능)"},
@@ -367,6 +385,18 @@ TOOL_DEFINITIONS = [
 
 
 class ToolExecutor:
+    _MAX_WATCHES = 20  # 감시 종목 최대 개수 — 늘어날수록 폴링/지표갱신 주기가 밀림
+
+    # events/detector.py::_eval_expr()가 실제로 채워주는 변수명과 정확히 일치해야 한다.
+    # 여기 없는 이름(예: ma50)을 쓰면 조건이 영원히 평가 실패하는데 침묵하고 넘어가므로
+    # set_watch 시점에 미리 걸러낸다.
+    _ALLOWED_WATCH_VARS = {
+        "price", "volume", "baseline_price", "baseline_volume", "avg_volume",
+        "change_pct", "volume_ratio",
+        "ma5", "ma10", "ma20", "ma60", "rsi", "macd",
+        "bb_lower", "bb_upper", "bb_pct", "stoch_k", "stoch_d",
+    }
+
     def __init__(
         self,
         market_data: MarketDataCollector,
@@ -431,7 +461,7 @@ class ToolExecutor:
                         self._screen_candidates,
                         tool_input.get("market", "domestic"),
                         tool_input.get("strategy", "all"),
-                        tool_input.get("top_n", 20),
+                        tool_input.get("top_n", 85),
                     )
                 case "get_candles":
                     stock_code = tool_input["stock_code"]
@@ -451,6 +481,8 @@ class ToolExecutor:
                     return await _asyncio.to_thread(
                         self._search_web, tool_input["query"], tool_input.get("max_results", 5)
                     )
+                case "set_risk_params":
+                    return self._set_risk_params(tool_input)
                 case "place_order":
                     if not self.allow_orders:
                         return json.dumps({"error": "주문 실행 차단: 명시적 주문 실행 요청이 없어서 계획/감시만 설정합니다."}, ensure_ascii=False)
@@ -633,8 +665,66 @@ class ToolExecutor:
             except Exception as e:
                 errors["domestic"] = str(e)
                 positions.extend(self._account.get_positions())
-        else:
-            positions.extend(self._account.get_positions())
+
+        if market in ("overseas", "both") and self._overseas:
+            try:
+                balance = self._overseas.get_balance()
+                summary = balance.get("summary") or {}
+                overseas_positions = balance.get("positions") or []
+                risk = getattr(self._order_manager, "risk", None)
+                daily_budget = risk.get_overseas_daily_budget_usd() if risk else None
+                remaining_budget = risk.get_overseas_remaining_budget_usd() if risk else None
+                overseas_balance = {
+                    "cash": _to_float(summary.get("frcr_dncl_amt1") or summary.get("ord_psbl_cash")),
+                    "totalAssets": _to_float(summary.get("tot_asst_amt")),
+                    "positionValue": sum(_to_float(p.get("ovrs_stck_evlu_amt")) for p in overseas_positions),
+                    "positionCount": len(overseas_positions),
+                    "dailyBuyBudgetUsd": daily_budget,
+                    "remainingBuyBudgetUsd": remaining_budget,
+                    "budgetNote": (
+                        f"오늘 해외 신규 매수에 쓸 수 있는 금액은 최대 ${remaining_budget:.2f}입니다. "
+                        "감시/매수 후보 종목을 고를 때 1주 가격이 이 금액을 넘지 않는 종목 위주로 선별하세요."
+                        if remaining_budget is not None else "해외 매수 일일 한도 없음."
+                    ),
+                    "raw": summary,
+                }
+                for p in overseas_positions:
+                    qty = _to_int(p.get("ovrs_cblc_qty"))
+                    if qty <= 0:
+                        continue
+                    balance_price = _to_float(p.get("now_pric2"))
+                    market_price = balance_price
+                    price_source = "balance"
+                    try:
+                        quote = self._overseas.get_price(p.get("ovrs_pdno"))
+                        quoted_price = _to_float(quote.get("current_price") or quote.get("last"))
+                        if quoted_price > 0:
+                            market_price = quoted_price
+                            price_source = "unified_rest"
+                    except Exception as e:
+                        errors[f"price:{p.get('ovrs_pdno')}"] = str(e)
+                    avg_price = _to_float(p.get("pchs_avg_pric"))
+                    eval_amount = market_price * qty
+                    pnl = (market_price - avg_price) * qty
+                    cost = avg_price * qty
+                    positions.append({
+                        "market": "overseas",
+                        "stock_code": p.get("ovrs_pdno"),
+                        "stock_name": p.get("prdt_name"),
+                        "quantity": qty,
+                        "avg_price": avg_price,
+                        "current_price": market_price,
+                        "balance_price": balance_price,
+                        "price_source": price_source,
+                        "eval_amount": eval_amount,
+                        "pnl": pnl,
+                        "pnl_pct": round(pnl / cost * 100, 4) if cost > 0 else 0,
+                        "balance_eval_amount": _to_float(p.get("ovrs_stck_evlu_amt")),
+                        "balance_pnl": _to_float(p.get("evlu_pfls_amt")),
+                        "balance_pnl_pct": _to_float(p.get("evlu_pfls_rt")),
+                    })
+            except Exception as e:
+                errors["overseas"] = str(e)
 
         result = {
             "positions": positions,
@@ -679,11 +769,22 @@ class ToolExecutor:
         end = date.today()
         start = end - timedelta(days=180)
         results = []
+        excluded_over_budget = 0
+
+        remaining_budget = None
+        if market == "overseas":
+            risk = getattr(self._order_manager, "risk", None)
+            remaining_budget = risk.get_overseas_remaining_budget_usd() if risk else None
 
         for item in raw[:top_n]:
             code = item.get("mksc_shrn_iscd", "")
             name = item.get("hts_kor_isnm", code)
             if not code:
+                continue
+            price_val = _to_float(item.get("stck_prpr"))
+            if remaining_budget is not None and price_val > 0 and price_val > remaining_budget:
+                # 1주 가격이 오늘 남은 해외 매수 한도보다 비싸면 애초에 살 수 없으므로 후보에서 제외
+                excluded_over_budget += 1
                 continue
             try:
                 if market == "domestic" and self._domestic:
@@ -735,6 +836,8 @@ class ToolExecutor:
             "strategy": strategy,
             "screened": len(raw[:top_n]),
             "filtered": len(results),
+            "excludedOverBudget": excluded_over_budget,
+            "remainingBuyBudgetUsd": remaining_budget,
             "candidates": results,
         }, ensure_ascii=False)
 
@@ -886,6 +989,18 @@ class ToolExecutor:
         except Exception as e:
             return json.dumps({"error": f"웹 검색 실패: {e}"})
 
+    def _set_risk_params(self, inp: dict) -> str:
+        try:
+            current = self._order_manager.risk.set_params(
+                stop_loss_pct=inp.get("stop_loss_pct"),
+                take_profit_pct=inp.get("take_profit_pct"),
+                max_positions=inp.get("max_positions"),
+                position_size_pct=inp.get("position_size_pct"),
+            )
+            return json.dumps({"status": "리스크 파라미터 변경 완료", "current": current}, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
+
     async def _place_order(self, inp: dict) -> str:
         stock_code = inp["stock_code"]
         stock_name = inp["stock_name"]
@@ -916,6 +1031,9 @@ class ToolExecutor:
             )
         else:
             if stock_code not in positions:
+                self._restore_position_for_sell(stock_code, stock_name, reason)
+                positions = self._order_manager.get_open_positions()
+            if stock_code not in positions:
                 return json.dumps({"error": f"{stock_code} 보유 포지션 없음"})
             exchange = positions[stock_code].exchange
             price = price or self._resolve_order_price(stock_code, exchange)
@@ -938,6 +1056,35 @@ class ToolExecutor:
             "failure_reason": None if result else self._order_manager.last_order_error,
             "pending_orders": self._order_manager.get_pending_order_rows(),
         }, ensure_ascii=False, default=str)
+
+    def _restore_position_for_sell(self, stock_code: str, stock_name: str, reason: str) -> None:
+        if not self._is_domestic_code(stock_code) or not self._domestic:
+            return
+        try:
+            balance = self._domestic.get_balance()
+        except Exception:
+            logger.exception("매도 전 계좌 포지션 복원 실패: %s", stock_code)
+            return
+
+        for p in balance.get("positions") or []:
+            if p.get("pdno") != stock_code:
+                continue
+            qty = _to_int(p.get("hldg_qty"))
+            avg_price = _to_float(p.get("pchs_avg_pric"))
+            if qty <= 0 or avg_price <= 0:
+                return
+            current_price = _to_float(p.get("prpr")) or avg_price
+            self._order_manager.restore_position(
+                stock_code=stock_code,
+                name=p.get("prdt_name") or stock_name,
+                exchange="KRX",
+                qty=qty,
+                entry_price=avg_price,
+                current_price=current_price,
+                strategy=reason[:80],
+            )
+            logger.info("매도 전 계좌 잔고로 포지션 복원: %s %d주", stock_code, qty)
+            return
 
     def _resolve_order_price(self, stock_code: str, exchange: str) -> float:
         cached = self._market.get_price(stock_code)
@@ -1120,6 +1267,14 @@ class ToolExecutor:
         if err:
             return err
 
+        existing_watches = self._load_watches()
+        if stock_code not in existing_watches and len(existing_watches) >= self._MAX_WATCHES:
+            return json.dumps({
+                "error": f"감시 종목 최대 개수({self._MAX_WATCHES}개) 초과",
+                "current_count": len(existing_watches),
+                "instruction": "기존 감시 중 덜 중요한 종목을 clear_watch로 해제한 뒤 다시 시도하세요.",
+            }, ensure_ascii=False)
+
         exchange, baseline_price, baseline_volume = await self._resolve_watch_baseline(
             stock_code, market, inp.get("exchange")
         )
@@ -1128,14 +1283,22 @@ class ToolExecutor:
             baseline_price, baseline_volume, inp["conditions"],
         )
         await self._prefill_indicator_cache(stock_code, market, inp.get("exchange"))
-        ws_status = "WebSocket 실시간 구독 성공" if ws_subscribed else "WebSocket 구독 실패 — 실시간 가격 수신 불가, 감시 조건이 평가되지 않습니다"
+        broker_name = self._config.get("broker", "toss")
+        if broker_name != "toss":
+            monitoring_status = (
+                "WebSocket 실시간 구독 성공" if ws_subscribed
+                else "WebSocket 구독 실패 — 실시간 가격 수신 불가, 감시 조건이 평가되지 않습니다"
+            )
+        else:
+            # 토스는 WebSocket이 없어 REST 폴링으로 감시를 평가한다 — ws_subscribed=False가 정상이며 실패가 아니다.
+            monitoring_status = "REST 폴링 등록 완료 — 다음 폴링 주기부터 조건 평가 시작 (실시간 대비 최대 수 초~수십 초 지연 가능)"
         return json.dumps({
             "status": "감시 설정 완료",
             "stock_code": stock_code,
             "market": market,
             "baseline_price": baseline_price,
             "ws_subscribed": ws_subscribed,
-            "ws_status": ws_status,
+            "ws_status": monitoring_status,
             "conditions_count": len(inp["conditions"]),
         }, ensure_ascii=False)
 
@@ -1158,20 +1321,42 @@ class ToolExecutor:
             logger.warning("watch 등록 즉시 지표 채움 실패: %s", stock_code, exc_info=True)
 
     def _validate_watch_conditions(self, conditions: list) -> str | None:
-        """허용되지 않는 조건 타입이 있으면 에러 JSON 반환, 없으면 None."""
+        """허용되지 않는 조건 타입/변수가 있으면 에러 JSON 반환, 없으면 None."""
         bad = [c.get("type") for c in conditions if c.get("type") not in ("expr", "price_above", "price_below")]
-        if not bad:
-            return None
-        return json.dumps({
-            "error": f"조건 타입 거부: {bad}. price_change/volume_spike는 사용 불가.",
-            "instruction": (
-                "반드시 expr 타입을 사용하고 formula 필드에 파이썬 비교식을 작성하세요. "
-                "2개 이상 지표를 조합해야 합니다. "
-                "예시: 'rsi < 30 and bb_pct < 0.15 and change_pct < -2' "
-                "사용 가능 변수: price, volume, change_pct, volume_ratio, "
-                "rsi, macd, ma5, ma10, ma20, ma60, bb_pct, bb_upper, bb_lower, stoch_k, stoch_d"
-            ),
-        }, ensure_ascii=False)
+        if bad:
+            return json.dumps({
+                "error": f"조건 타입 거부: {bad}. price_change/volume_spike는 사용 불가.",
+                "instruction": (
+                    "반드시 expr 타입을 사용하고 formula 필드에 파이썬 비교식을 작성하세요. "
+                    "AI가 현재 데이터와 전략에 맞는 조건 조합을 직접 정해야 합니다. "
+                    f"사용 가능 변수: {sorted(self._ALLOWED_WATCH_VARS)}"
+                ),
+            }, ensure_ascii=False)
+
+        for c in conditions:
+            if c.get("type") != "expr":
+                continue
+            formula = c.get("formula", "")
+            if not formula:
+                continue
+            try:
+                tree = ast.parse(formula, mode="eval")
+            except SyntaxError as e:
+                return json.dumps({
+                    "error": f"조건식 문법 오류: {formula!r} ({e})",
+                    "instruction": "파이썬 비교식 문법으로 다시 작성하세요.",
+                }, ensure_ascii=False)
+            used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+            unknown = used_names - self._ALLOWED_WATCH_VARS
+            if unknown:
+                return json.dumps({
+                    "error": f"조건식에 존재하지 않는 변수 사용: {sorted(unknown)} (formula={formula!r})",
+                    "instruction": (
+                        f"사용 가능한 변수만 쓰세요: {sorted(self._ALLOWED_WATCH_VARS)}. "
+                        "이 조건은 저장되지 않았으니 올바른 변수명으로 다시 set_watch를 호출하세요."
+                    ),
+                }, ensure_ascii=False)
+        return None
 
     async def _resolve_watch_baseline(
         self, stock_code: str, market: str, exchange_hint: str | None

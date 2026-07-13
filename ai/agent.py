@@ -99,14 +99,17 @@ Respond in Korean only.
         self._executor.allow_orders = True
         await self._run_loop(source="morning_brief", past_history=past, current_message=prompt)
 
-    async def chat(self, user_input: str) -> str:
+    async def chat(self, user_input: str, source: str = "chat") -> str:
+        """source="chat"(기본)은 HTTP 응답으로 바로 렌더링되므로 브로드캐스트에서 제외된다.
+        스케줄러 등 HTTP 요청자가 없는 호출은 source="schedule" 등으로 넘겨야
+        응답이 어디에도 안 뜨고 증발하지 않는다."""
         past = list(self._chat_history)
         is_planning = self._is_planning_request(user_input)
         prompt = self._build_chat_prompt(user_input, is_planning)
         self._push_history("user", "chat", user_input)
         self._executor.reset_executed_tools()
         self._executor.allow_orders = is_planning or self._is_order_execution_request(user_input)
-        final_text = await self._run_loop(source="chat", past_history=past, current_message=prompt)
+        final_text = await self._run_loop(source=source, past_history=past, current_message=prompt)
         if self._looks_like_raw_tool_output(final_text):
             logger.warning("원시 도구 출력 형태 응답 감지, 최종 답변 재작성")
             final_text = await self._rewrite_raw_response(user_input, final_text, past)
@@ -132,7 +135,7 @@ Respond in Korean only.
                 retry_missing = self._missing_plan_tools()
                 if retry_missing:
                     logger.warning("계획 요청 필수 도구 재시도 후에도 누락: %s", retry_missing)
-                    final_text = await self._apply_plan_tool_fallback(user_input, retry_text or final_text, retry_missing)
+                    final_text = await self._record_plan_tool_failure(user_input, retry_text or final_text, retry_missing)
                 else:
                     final_text = retry_text or final_text
 
@@ -248,59 +251,23 @@ JSON, 검색 결과 원문, 툴 페이로드를 포함하지 마세요.
 """.strip()
         return await self._run_loop(source="chat", past_history=past_history or [], current_message=prompt)
 
-    async def _apply_plan_tool_fallback(self, user_input: str, final_text: str, missing: list[str]) -> str:
-        candidate = self._pick_fallback_candidate(user_input, final_text)
-        stock_code = candidate["code"]
-        stock_name = candidate["name"]
-        strategy = f"WAIT_FOR_TRIGGER ({stock_name})"
-        outlook = (final_text or user_input).replace("\n", " ")[:500]
+    async def _record_plan_tool_failure(self, user_input: str, final_text: str, missing: list[str]) -> str:
+        """계획 요청 필수 도구를 재시도 후에도 호출하지 않은 경우.
+        예전엔 하드코딩된 3종목(NVDA/AAPL/MSFT) 중 하나로 임의 감시를 걸어 땜빵했는데,
+        AI가 실제로 판단한 적 없는 종목에 감시가 걸리는 문제가 있어 제거했다.
+        지금은 실패 사실만 정직하게 메모로 남기고, 사용자가 다시 요청하도록 안내한다."""
         memo = (
-            f"계획 요청 보정: 모델 응답에서 필수 도구 호출이 누락되어 {stock_name}({stock_code}) "
-            f"WAIT_FOR_TRIGGER 계획, 메모, 감시 규칙을 시스템이 직접 저장했다. 원문 요청: {user_input}"
+            f"계획 요청 실패: 모델이 필수 도구({', '.join(missing)})를 호출하지 않아 "
+            f"계획/감시가 저장되지 않았습니다. 원문 요청: {user_input}"
         )
-        watch_conditions = candidate["conditions"]
-
-        if "save_plan" in missing:
-            await self._executor.execute("save_plan", {
-                "market_outlook": outlook or "미국 시장 기준 매수 계획",
-                "watch_stocks": [{"code": stock_code, "name": stock_name, "reason": "매수 후보 감시"}],
-                "strategy": strategy,
-            })
-        if "save_memo" in missing:
-            await self._executor.execute("save_memo", {"content": memo})
-        if "set_watch" in missing:
-            await self._executor.execute("set_watch", {
-                "stock_code": stock_code,
-                "stock_name": stock_name,
-                "market": "overseas",
-                "conditions": watch_conditions,
-            })
-
+        await self._executor.execute("save_memo", {"content": memo})
+        logger.error("계획 요청 처리 실패 — 필수 도구 미호출로 계획/감시 저장 안 됨: %s", missing)
         return (
-            "실제 저장/설정 보정 완료:\n"
-            f"- 계획: {strategy}\n"
-            f"- 감시 종목: {stock_name} ({stock_code})\n"
-            f"- detecting 규칙: {watch_conditions}\n"
-            "- 실제 주문은 실행하지 않았습니다. 이 요청은 계획/감시 설정으로 처리했습니다."
+            (final_text or "").strip()
+            + "\n\n⚠️ 계획/감시 설정이 저장되지 않았습니다 (필수 도구 호출 누락: "
+            + ", ".join(missing)
+            + "). 다시 요청해주세요."
         )
-
-    _FALLBACK_WATCH_CONDITIONS = [
-        {"type": "expr", "formula": "rsi < 32 and bb_pct < 0.15 and change_pct < -2", "note": "과매도 + 하락 진입 신호"},
-        {"type": "expr", "formula": "rsi > 70 and bb_pct > 0.85", "note": "과매수 익절 신호"},
-    ]
-    _FALLBACK_CANDIDATES = [
-        ("NVDA", "NVIDIA"),
-        ("AAPL", "Apple"),
-        ("MSFT", "Microsoft"),
-    ]
-
-    def _pick_fallback_candidate(self, user_input: str, final_text: str) -> dict:
-        text = f"{user_input}\n{final_text}".upper()
-        for code, name in self._FALLBACK_CANDIDATES:
-            if code in text:
-                return {"code": code, "name": name, "conditions": self._FALLBACK_WATCH_CONDITIONS}
-        code, name = self._FALLBACK_CANDIDATES[0]
-        return {"code": code, "name": name, "conditions": self._FALLBACK_WATCH_CONDITIONS}
 
     def _build_chat_prompt(self, user_input: str, is_planning: bool | None = None) -> str:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S KST")
@@ -314,12 +281,11 @@ User request: {user_input}
 This is an autonomous trading plan or briefing request.
 Infer the market from recent context. If the recent conversation is about US stocks or US market, analyze overseas/US candidates unless the user explicitly asks for Korea.
 Do not ask which information to check first. Call the required tools yourself and build the plan.
-The plan must include candidate symbols, BUY_NOW / WAIT_FOR_TRIGGER / NO_TRADE, concrete detecting/watch rules,
-risk controls, the AI-decided allocation percentage, the AI-decided number of watched/subscribed symbols,
-and the items actually saved or configured.
-You must call save_plan, save_memo, and set_watch as real tool calls. Printing JSON examples is not enough.
+The plan must include the AI's chosen thesis, candidate symbols if any, action decision, concrete detecting/watch rules if any,
+risk controls chosen by the AI, allocation or cash-hold rationale, and the items actually saved or configured.
+You must call save_plan and save_memo as real tool calls. Printing JSON examples is not enough.
 If you decide BUY_NOW, call place_order as a real tool call and include position_pct or quantity.
-If you decide WAIT_FOR_TRIGGER, choose how many symbols deserve active watches and call set_watch only for those symbols.
+If you decide to wait, choose how many symbols deserve active watches and call set_watch only for those symbols.
 Never output raw JSON, search result arrays, or tool payloads. Summarize tool results in Korean.
 Respond to the user in Korean only.
 """.strip()
