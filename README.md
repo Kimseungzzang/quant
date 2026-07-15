@@ -1,6 +1,6 @@
 # Jarvis — AI 자율 트레이딩 시스템
 
-> KIS Open API + LLM Tool-Use 기반 국내/미국 주식 자동매매 에이전트
+> Toss Open API + LLM Tool-Use 기반 국내/미국 주식 자동매매 에이전트
 
 ---
 
