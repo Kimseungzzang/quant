@@ -27,7 +27,7 @@ from kis.websocket import (
     parse_domestic_fill_notice,
     parse_overseas_fill_notice,
 )
-from kis.constants import WebSocketTRID
+from kis.constants import WebSocketTRID, CloseReason
 
 from toss.auth import TossAuth
 from toss.rest import TossRestClient
@@ -45,6 +45,7 @@ from collector.account import AccountCollector
 
 from events.detector import EventDetector
 from events.engine import EventEngine
+from events.types import EventKind, Market, MarketEvent
 
 from ai.memory import AgentMemory
 from ai.tools import ToolExecutor
@@ -509,13 +510,19 @@ async def _auto_trading_schedule_loop(agent: AIAgent, config: dict, stop: asynci
              "Run the autonomous Korean domestic market trading process now. "
              "Analyze KOSPI/KRX conditions, portfolio, candidates, and charts. "
              "If risk and setup are aligned, decide allocation percentage and place real orders automatically. "
-             "Otherwise set concrete detecting/watch rules. Save the plan and memo. Respond in Korean only."),
+             "Otherwise adjust concrete detecting/watch rules directly with set_watch/clear_watch. "
+             "save_plan clears every non-position watch (including ones set earlier today) — only call it if "
+             "you are resetting today's overall market thesis, not as a routine end-of-run step. "
+             "Always record your reasoning with save_memo. Respond in Korean only."),
             (schedule_cfg.get("us_analysis_time", "22:30"), "us-analysis",
              "Run the autonomous US market trading process now. "
              "Analyze Nasdaq/S&P 500/Dow, US megacap and AI/semiconductor candidates, "
              "portfolio cash, and candidate charts. If risk and setup are aligned, "
              "decide allocation percentage and place real orders automatically. "
-             "Otherwise set concrete detecting/watch rules. Save the plan and memo. Respond in Korean only."),
+             "Otherwise adjust concrete detecting/watch rules directly with set_watch/clear_watch. "
+             "save_plan clears every non-position watch (including ones set earlier today) — only call it if "
+             "you are resetting today's overall market thesis, not as a routine end-of-run step. "
+             "Always record your reasoning with save_memo. Respond in Korean only."),
             # domestic-close/us-close 제거됨: 장마감마다 강제로 포지션을 정리시키면
             # 장투/데이트레이드를 유연하게 섞어 가져가려는 전략과 충돌해서 뺐다.
             # 필요하면 watch 조건(set_watch)이나 AI 스스로의 판단으로 청산 타이밍을 정한다.
@@ -623,6 +630,33 @@ async def lifespan(app: FastAPI):
     state.components = {**sync_comp, **async_comp}
     state.agent = async_comp["agent"]
     state.event_engine = async_comp["engine"]
+
+    def _on_risk_trigger(stock_code: str, reason: CloseReason, current_price: float, entry_price: float) -> None:
+        # 손절/익절 조건 충족 — 자동 청산하지 않고 AI 이벤트로 넘겨 SELL/HOLD/추가매수를 직접 판단하게 한다.
+        pnl_pct = (current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0.0
+        label = "손절" if reason == CloseReason.STOP_LOSS else "익절"
+        logger.warning(
+            "%s 조건 충족(AI 판단 위임): %s @ %.2f (진입가 %.2f, %.2f%%)",
+            label, stock_code, current_price, entry_price, pnl_pct,
+        )
+        pos = sync_comp["order_mgr"].get_open_positions().get(stock_code)
+        event = MarketEvent(
+            kind=EventKind.RISK_TRIGGERED,
+            market=Market.DOMESTIC if (pos and pos.is_domestic()) else Market.OVERSEAS,
+            stock_code=stock_code,
+            stock_name=pos.name if pos else stock_code,
+            payload={
+                "reason": str(reason),
+                "current_price": current_price,
+                "entry_price": entry_price,
+                "pnl_pct": round(pnl_pct, 2),
+            },
+        )
+        asyncio.get_event_loop().call_soon_threadsafe(
+            lambda: asyncio.create_task(async_comp["engine"].emit(event))
+        )
+
+    sync_comp["order_mgr"].on_risk_trigger_callback = _on_risk_trigger
 
     stop_event = threading.Event()
     async_stop = asyncio.Event()

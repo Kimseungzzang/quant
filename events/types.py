@@ -5,6 +5,7 @@ from enum import Enum
 
 class EventKind(str, Enum):
     WATCH_TRIGGERED = "watch_triggered"
+    RISK_TRIGGERED = "risk_triggered"
     MORNING_BRIEF = "morning_brief"
     CHAT = "chat"
 

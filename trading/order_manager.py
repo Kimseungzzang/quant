@@ -83,10 +83,12 @@ class OrderManager:
         self._positions: dict[str, Position] = {}
         self._last_prices: dict[str, float] = {}
         self._pending_orders: dict[str, PendingOrder] = {}
+        self._risk_notified: dict[str, CloseReason] = {}  # 손절/익절 알림 중복 방지 (edge-trigger)
         self.last_order_error: str = ""
         self._lock = threading.Lock()  # positions/pending_orders 동시 접근 보호
-        self.on_fill_callback = None   # Callable[[dict], None] — 체결 시 호출
-        self.on_error_callback = None  # Callable[[str], None] — 주문 실패 시 호출
+        self.on_fill_callback = None        # Callable[[dict], None] — 체결 시 호출
+        self.on_error_callback = None       # Callable[[str], None] — 주문 실패 시 호출
+        self.on_risk_trigger_callback = None  # Callable[[str, CloseReason, float, float], None] — 손절/익절 조건 충족 시 호출 (자동 청산 안 함, AI 판단에 위임)
 
     _FILL_TIMEOUT_SEC = 30  # 이 시간 내 WebSocket 체결통보 없으면 접수가로 확정
 
@@ -321,6 +323,7 @@ class OrderManager:
             return
 
         close_reason: CloseReason | None = None
+        risk_event: tuple[str, CloseReason, float, float] | None = None
         has_pos = False
         with self._lock:
             pos = self._positions.get(stock_code)
@@ -329,21 +332,33 @@ class OrderManager:
                 self._last_prices[stock_code] = current_price
                 if not self._has_pending(stock_code, "SELL"):
                     if self.risk.is_stop_loss(pos.entry_price, current_price):
-                        close_reason = CloseReason.STOP_LOSS
+                        breach = CloseReason.STOP_LOSS
                     elif self.risk.is_take_profit(pos.entry_price, current_price):
-                        close_reason = CloseReason.TAKE_PROFIT
-                    elif signal == TradeSignal.SELL:
+                        breach = CloseReason.TAKE_PROFIT
+                    else:
+                        breach = None
+
+                    # 손절/익절은 자동 청산하지 않고 AI에게 판단을 위임한다.
+                    # 조건이 처음 충족된 순간에만 1회 알리고(edge-trigger), 이후 같은 상태가 유지되는
+                    # 동안은 재알림하지 않는다 — 그렇지 않으면 매 틱마다 AI 이벤트가 쏟아진다.
+                    if breach and self._risk_notified.get(stock_code) != breach:
+                        self._risk_notified[stock_code] = breach
+                        risk_event = (stock_code, breach, current_price, pos.entry_price)
+                    elif not breach:
+                        self._risk_notified.pop(stock_code, None)
+
+                    if not breach and signal == TradeSignal.SELL:
                         close_reason = CloseReason.SIGNAL
             else:
                 self._last_prices[stock_code] = current_price
 
-        if close_reason == CloseReason.STOP_LOSS:
-            logger.warning("손절: %s @ %.2f", stock_code, current_price)
-            self.close_position(stock_code, current_price, CloseReason.STOP_LOSS)
-        elif close_reason == CloseReason.TAKE_PROFIT:
-            logger.info("익절: %s @ %.2f", stock_code, current_price)
-            self.close_position(stock_code, current_price, CloseReason.TAKE_PROFIT)
-        elif close_reason == CloseReason.SIGNAL:
+        if risk_event and self.on_risk_trigger_callback:
+            try:
+                self.on_risk_trigger_callback(*risk_event)
+            except Exception:
+                logger.exception("리스크 트리거 콜백 실패: %s", stock_code)
+
+        if close_reason == CloseReason.SIGNAL:
             self.close_position(stock_code, current_price, CloseReason.SIGNAL)
         elif not has_pos and signal == TradeSignal.BUY:
             logger.info("매수 신호: %s @ %.2f", stock_code, current_price)
@@ -662,6 +677,7 @@ class OrderManager:
                     pos.name, stock_code, sell_qty, price, pnl, reason)
         if sell_qty >= pos.qty:
             del self._positions[stock_code]
+            self._risk_notified.pop(stock_code, None)
         else:
             pos.qty -= sell_qty
             self._last_prices[stock_code] = price

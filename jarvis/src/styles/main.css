@@ -262,6 +262,8 @@ body {
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
+  user-select: text;   /* body { user-select: none } 전역 차단 해제 — 채팅 내용은 복사 가능해야 함 */
+  cursor: text;
 }
 .msg.user .msg-bubble {
   background: rgba(0, 100, 200, 0.3);

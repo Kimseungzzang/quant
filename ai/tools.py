@@ -186,8 +186,8 @@ TOOL_DEFINITIONS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "stop_loss_pct": {"type": "number", "description": "손절 기준 %. 예: 5 → -5% 손실 시 자동 손절"},
-                "take_profit_pct": {"type": "number", "description": "익절 기준 %. 예: 5 → +5% 수익 시 자동 익절"},
+                "stop_loss_pct": {"type": "number", "description": "손절 기준 %. 예: 5 → -5% 손실 시 risk_triggered 이벤트 발생 (자동 매도 아님, 이 이벤트에서 당신이 직접 SELL/HOLD/추가매수를 판단)"},
+                "take_profit_pct": {"type": "number", "description": "익절 기준 %. 예: 5 → +5% 수익 시 risk_triggered 이벤트 발생 (자동 매도 아님, 이 이벤트에서 당신이 직접 SELL/HOLD/추가매수를 판단)"},
                 "max_positions": {"type": "integer", "description": "최대 동시 보유 종목수"},
                 "position_size_pct": {"type": "number", "description": "신규 진입 시 종목당 기본 투자비율 (계좌 총자산 대비 %). place_order에서 quantity/position_pct를 직접 지정하지 않았을 때 적용됨"},
             },
@@ -225,9 +225,11 @@ TOOL_DEFINITIONS = [
         "name": "save_plan",
         "description": (
             "오늘의 시장 전망과 매매 전략을 저장합니다. "
-            "반드시 하루 1회, 장 시작 전 브리핑 시점(첫 대화)에만 호출하세요. "
+            "기본은 하루 1회, 장 시작 전 브리핑 시점(첫 대화)에만 호출하세요. "
+            "저녁/야간에 다시 호출하는 것은 '오늘 하루 전체 시황 판단을 완전히 갈아엎을 때'만 예외적으로 허용됩니다 — "
+            "그 외 저녁 점검/재평가는 set_watch·clear_watch로 감시 조건만 직접 조정하고 save_memo로 기록하세요. "
             "주문 후 상태 저장, 종목 분석 중간 저장 등에는 절대 사용하지 마세요 — 그럴 때는 save_memo를 쓰세요. "
-            "이 툴은 기존 watches를 전부 초기화하므로 잘못 호출하면 감시 목록이 날아갑니다."
+            "이 툴은 기존 watches를 전부 초기화하므로 잘못 호출하면 오늘 낮에 걸어둔 감시 목록이 다 날아갑니다."
         ),
         "input_schema": {
             "type": "object",
