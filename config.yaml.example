@@ -17,6 +17,15 @@ ai:
   morning_brief_hour: 8
   morning_brief_minute: 30
 
+telegram:
+  bot_token: ""              # @BotFather에서 발급받은 봇 토큰. 비워두면 텔레그램 연동 비활성화
+  chat_id: ""                # 기존 단일 사용자 설정(allowed_chat_ids가 비어도 이 chat_id는 허용)
+  allowed_chat_ids: []        # 단타 스캐너 허용 사용자 목록. 예: ["123456789", "987654321"]
+
+scalp:
+  symbol: "005930"           # 텔레그램 /long, /short 기본 판정 종목
+  market: "domestic"         # domestic | overseas
+
 kis:
   paper_app_key: ""          # KIS Developers 모의투자 앱키
   paper_app_secret: ""       # KIS Developers 모의투자 앱시크릿

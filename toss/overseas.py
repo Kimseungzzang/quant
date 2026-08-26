@@ -79,21 +79,22 @@ class TossOverseasAPI:
         cached_df = self._load_candle_cache(stock_code)
         if cached_df is not None and not cached_df.empty:
             cutoff = date.today() - timedelta(days=lookback_days)
-            if cached_df["datetime"].dt.date.min() <= cutoff:
-                try:
-                    new_df = self._fetch_minute_range(stock_code, since=cached_df["datetime"].max())
-                except Exception as e:
-                    logger.warning("[%s] 토스 해외 분봉 캐시 업데이트 실패 → 기존 캐시 사용: %s", stock_code, e)
-                    new_df = pd.DataFrame()
-                if not new_df.empty:
-                    combined = pd.concat([cached_df, new_df]).drop_duplicates("datetime")
-                    combined = combined.sort_values("datetime").reset_index(drop=True)
-                    self._save_candle_cache(stock_code, combined)
-                    cached_df = combined
+            try:
+                new_df = self._fetch_minute_range(stock_code, since=cached_df["datetime"].max())
+            except Exception as e:
+                logger.warning("[%s] 토스 해외 분봉 캐시 업데이트 실패 → 기존 캐시 사용: %s", stock_code, e)
+                new_df = pd.DataFrame()
+            if not new_df.empty:
+                combined = pd.concat([cached_df, new_df]).drop_duplicates("datetime")
+                combined = combined.sort_values("datetime").reset_index(drop=True)
+                self._save_candle_cache(stock_code, combined)
+                cached_df = combined
 
-                cutoff_dt = pd.Timestamp(date.today() - timedelta(days=lookback_days))
-                result = cached_df[cached_df["datetime"] >= cutoff_dt]
-                return self._aggregate(result, candle_minutes)
+            cutoff_dt = pd.Timestamp(cutoff)
+            result = cached_df[cached_df["datetime"] >= cutoff_dt]
+            if result.empty:
+                result = cached_df
+            return self._aggregate(result, candle_minutes)
 
         logger.info("[%s] 토스 해외 과거 %d일 분봉 수집 시작 (캐시 없음)...", stock_code, lookback_days)
         try:
